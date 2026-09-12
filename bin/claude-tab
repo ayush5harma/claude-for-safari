@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Send Safari tab content to Claude Code.
+#
+# Captures the current Safari tab (or every tab with --all) — URL, title, and
+# the RENDERED page text — into a context file, then starts `claude` with a
+# prompt pointing at it. The capture rides Safari's AppleScript `text of tab`
+# property, so it sees pages exactly as rendered (logged-in state included)
+# and needs NO Safari extension, no "Allow JavaScript from Apple Events", and
+# no TCC grant beyond the one Automation consent macOS asks the terminal for
+# the first time. The pull direction (a running Claude session reading and
+# driving tabs) is the extension bridge's job; this is the push direction: you
+# are looking at a page and want Claude on it now.
+#
+# Profile note: this runs `claude` with whatever profile the environment
+# selects. CLAUDE_CONFIG_DIR picks another one:
+#   CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude-tab ...
+#
+# Usage:
+#   claude-tab [--all] [--print] [--dry-run] [prompt ...]
+#     --all      capture every tab of every Safari window (default: current tab)
+#     --print    one-shot headless answer to stdout (claude -p) instead of an
+#                interactive session
+#     --dry-run  capture only; print the context file path and a preview
+#     prompt     what to do with the tab(s); default is an open-ended assist
+
+set -uo pipefail
+
+# Seed PATH rather than assume one. Launched from a Dock item, a launchd job or
+# an editor, this script can inherit a PATH with neither the Claude CLI's
+# install dir nor /usr/bin on it — and osascript lives in /usr/bin. The
+# incoming PATH still wins; these are appended as fallbacks.
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$PATH:$HOME/.local/bin" ;; esac
+case ":$PATH:" in *":/usr/bin:"*) ;; *) PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin" ;; esac
+export PATH
+
+ALL=0
+PRINT=0
+DRY_RUN=0
+PROMPT_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --all)     ALL=1; shift ;;
+    --print)   PRINT=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --help|-h) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
+    --*)       echo "Unknown flag: $1" >&2; exit 2 ;;
+    *)         PROMPT_ARGS+=("$1"); shift ;;
+  esac
+done
+
+pgrep -xq Safari || { echo "claude-tab: Safari is not running" >&2; exit 1; }
+
+# One osascript call emits every tab in a marker format Claude reads natively —
+# no prettifying pipeline. Per-tab text is truncated in AppleScript with a text
+# range (fast, unlike `characters ... as string`) so one giant page cannot
+# swamp the context. A tab whose text is unreadable (PDF viewer, crashed page)
+# degrades to URL+title instead of failing the capture.
+capture() {
+  /usr/bin/osascript <<EOS
+set maxLen to 120000
+tell application "Safari"
+  if (count of windows) is 0 then error "no Safari windows"
+  set out to ""
+  set tabList to {}
+  if ${ALL} is 1 then
+    repeat with w in windows
+      repeat with t in tabs of w
+        set end of tabList to t
+      end repeat
+    end repeat
+  else
+    set end of tabList to current tab of front window
+  end if
+  repeat with t in tabList
+    set body to ""
+    try
+      set body to text of t
+      if length of body > maxLen then set body to (text 1 thru maxLen of body) & linefeed & "[truncated]"
+    on error
+      set body to "[tab text unreadable — URL and title only]"
+    end try
+    set out to out & "===TAB===" & linefeed & "URL: " & (URL of t) & linefeed & "TITLE: " & (name of t) & linefeed & "===RENDERED TEXT===" & linefeed & body & linefeed
+  end repeat
+  return out
+end tell
+EOS
+}
+
+CTX_DIR="${TMPDIR:-/tmp}/claude-tab"
+mkdir -p "$CTX_DIR"
+CTX="$CTX_DIR/tabs-$(date +%Y%m%d-%H%M%S)-$$.md"
+
+if ! capture > "$CTX" || [ ! -s "$CTX" ]; then
+  rm -f "$CTX"
+  echo "claude-tab: could not read Safari tabs (grant Automation consent if macOS just asked)" >&2
+  exit 1
+fi
+
+TAB_COUNT=$(grep -c '^===TAB===$' "$CTX")
+echo "claude-tab: captured $TAB_COUNT tab(s) -> $CTX" >&2
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  head -20 "$CTX"
+  exit 0
+fi
+
+TASK="Then help me with it — start by telling me briefly what the page is about."
+[ "${#PROMPT_ARGS[@]}" -gt 0 ] && TASK="${PROMPT_ARGS[*]}"
+PROMPT="Read $CTX — it contains $TAB_COUNT Safari tab(s) I captured just now (each tab: URL, TITLE, then its rendered text, separated by ===TAB=== markers). $TASK"
+
+if [ "$PRINT" -eq 1 ]; then
+  exec claude -p "$PROMPT"
+fi
+exec claude "$PROMPT"
