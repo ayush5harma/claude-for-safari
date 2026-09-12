@@ -1,0 +1,70 @@
+{
+  "manifest_version": 2,
+  "name": "Claude for Safari",
+  "version": "0.34",
+  "description": "Bridges Safari to Claude Code: a Claude chat panel on any page, plus tab read/click/fill/navigate/eval/screenshot tools for Claude sessions via a local MCP bridge.",
+  "icons": {
+    "16": "images/icon-16.png",
+    "32": "images/icon-32.png",
+    "48": "images/icon-48.png",
+    "64": "images/icon-64.png",
+    "96": "images/icon-96.png",
+    "128": "images/icon-128.png",
+    "256": "images/icon-256.png",
+    "512": "images/icon-512.png"
+  },
+  "background": {
+    "scripts": [
+      "ua-chrome.js",
+      "ua-chrome-sites.js",
+      "background.js"
+    ],
+    "persistent": true
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "ua-chrome.js",
+        "ua-chrome-sites.js",
+        "ua-consistency.js",
+        "webrtc-legacy-compat.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_action": {
+    "default_title": "Claude \u2014 open chat panel",
+    "default_icon": {
+      "16": "images/icon-16.png",
+      "19": "images/icon-19.png",
+      "32": "images/icon-32.png",
+      "38": "images/icon-38.png",
+      "48": "images/icon-48.png"
+    }
+  },
+  "web_accessible_resources": [
+    "images/*"
+  ],
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "storage",
+    "<all_urls>",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess"
+  ]
+}
