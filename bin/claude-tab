@@ -86,12 +86,15 @@ end tell
 EOS
 }
 
-CTX_DIR="${TMPDIR:-/tmp}/claude-tab"
-mkdir -p "$CTX_DIR"
-CTX="$CTX_DIR/tabs-$(date +%Y%m%d-%H%M%S)-$$.md"
+# mktemp -d, not a fixed directory. The capture is the rendered text of
+# logged-in pages, and a predictable path under a shared /tmp is readable by
+# every user on the machine and squattable besides; mktemp gives a fresh 0700
+# directory per run. Removed on exit, after claude has read it.
+CTX_DIR="$(mktemp -d -t claude-tab)"
+trap 'rm -rf "$CTX_DIR"' EXIT
+CTX="$CTX_DIR/tabs-$(date +%Y%m%d-%H%M%S).md"
 
 if ! capture > "$CTX" || [ ! -s "$CTX" ]; then
-  rm -f "$CTX"
   echo "claude-tab: could not read Safari tabs (grant Automation consent if macOS just asked)" >&2
   exit 1
 fi
@@ -108,7 +111,12 @@ TASK="Then help me with it — start by telling me briefly what the page is abou
 [ "${#PROMPT_ARGS[@]}" -gt 0 ] && TASK="${PROMPT_ARGS[*]}"
 PROMPT="Read $CTX — it contains $TAB_COUNT Safari tab(s) I captured just now (each tab: URL, TITLE, then its rendered text, separated by ===TAB=== markers). $TASK"
 
+# Run claude as a CHILD rather than exec'ing it, so the EXIT trap above can
+# remove the capture when the session ends. exec would replace this shell and
+# leave the page text on disk for as long as the temp directory survives.
 if [ "$PRINT" -eq 1 ]; then
-  exec claude -p "$PROMPT"
+  claude -p "$PROMPT"
+else
+  claude "$PROMPT"
 fi
-exec claude "$PROMPT"
+exit $?

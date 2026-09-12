@@ -338,7 +338,11 @@ xcodebuild -project "$PROJ" -scheme "$SCHEME" -configuration Release \
 
 APP="$(find "$APP_DIR/build/Build/Products/Release" -maxdepth 1 -name '*.app' -print -quit)"
 [ -n "$APP" ] || { echo "ERROR: build produced no .app" >&2; exit 1; }
-codesign -v --deep --strict "$APP" && echo "Signature OK: $APP"
+# `cmd && echo` is NOT an abort: at the top level a failing left-hand side of an
+# && list is exempt from set -e (measured), so a broken signature printed
+# nothing and the script installed the bundle anyway.
+codesign -v --deep --strict "$APP" || { echo "ERROR: signature verification failed for $APP" >&2; exit 1; }
+echo "Signature OK: $APP"
 
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
 # ALWAYS deregister the DerivedData copy, on every exit path. Two registered

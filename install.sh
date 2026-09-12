@@ -98,9 +98,41 @@ if [ "$DO_BRIDGE" -eq 1 ]; then
   [ -f "$TEMPLATE" ] || { echo "ERROR: $TEMPLATE missing" >&2; exit 1; }
 
   mkdir -p "$LOG_DIR" "$HOME/Library/LaunchAgents" "$BINDIR"
-  # `|` as the sed delimiter: every replacement is a path.
+
+  # Carry the hub's settings from THIS environment into the agent. launchd
+  # agents inherit nothing useful, so a hand-edited plist was the only way to
+  # expose the hub -- and every re-run of this script overwrote those edits.
+  # Now the exposure is the command line:
+  #   BRIDGE_BIND=<mesh ip> BRIDGE_TOKEN=$(openssl rand -hex 24) \
+  #     bash install.sh --bridge-only
+  # A variable that is unset here is simply left out, so the hub keeps its own
+  # defaults. XML-escape the values: a token is random hex, but BRIDGE_BIND and
+  # CLAUDE_BIN are free text.
+  xml_escape() { printf '%s' "$1" | LC_ALL=C sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+  ENV_XML=""
+  for _v in BRIDGE_BIND BRIDGE_PORT BRIDGE_TOKEN BRIDGE_PANEL_TOOLS CLAUDE_BIN; do
+    _val="$(eval "printf '%s' \"\${$_v-}\"")"
+    [ -n "$_val" ] || continue
+    ENV_XML="$ENV_XML
+    <key>$_v</key><string>$(xml_escape "$_val")</string>"
+  done
+  if [ -n "$ENV_XML" ]; then
+    ENV_XML="<key>EnvironmentVariables</key>
+  <dict>$ENV_XML
+  </dict>"
+    echo "agent environment: $(for _v in BRIDGE_BIND BRIDGE_PORT BRIDGE_TOKEN BRIDGE_PANEL_TOOLS CLAUDE_BIN; do
+      _val="$(eval "printf '%s' \"\${$_v-}\"")"
+      [ -n "$_val" ] && printf '%s ' "$_v"; done)"
+  fi
+
+  # `|` as the sed delimiter: every replacement is a path. __ENV__ is replaced
+  # with a here-doc-free multi-line block, so it goes through a file rather than
+  # an -e expression.
+  printf '%s' "$ENV_XML" > "$PLIST.env"
   sed -e "s|__NODE__|$NODE|g" -e "s|__BRIDGE__|$BRIDGE_SRC|g" -e "s|__LOG__|$LOG|g" \
+    -e "/__ENV__/r $PLIST.env" -e "/__ENV__/d" \
     "$TEMPLATE" > "$PLIST.tmp"
+  rm -f "$PLIST.env"
   plutil -lint "$PLIST.tmp" >/dev/null || { rm -f "$PLIST.tmp"; echo "ERROR: rendered plist is not valid" >&2; exit 1; }
   mv "$PLIST.tmp" "$PLIST"
 
@@ -112,14 +144,21 @@ if [ "$DO_BRIDGE" -eq 1 ]; then
   echo "linked $BINDIR/claude-tab"
 
   # Verify by effect, not by launchctl's exit status: the agent can bootstrap
-  # cleanly and then die on the first line.
+  # cleanly and then die on the first line. Probe whatever the hub was told to
+  # bind, with the token when one was configured -- /health is token-gated like
+  # every other endpoint.
+  HOST="${BRIDGE_BIND:-127.0.0.1}"
+  CURL_AUTH=()
+  [ -n "${BRIDGE_TOKEN:-}" ] && CURL_AUTH=(-H "Authorization: Bearer $BRIDGE_TOKEN")
   ok=0
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then ok=1; break; fi
+    if curl -fsS "${CURL_AUTH[@]}" "http://$HOST:$PORT/health" >/dev/null 2>&1; then ok=1; break; fi
     sleep 0.5
   done
   if [ "$ok" -eq 1 ]; then
-    echo "bridge hub answering on http://127.0.0.1:$PORT/health"
+    MODE="$(curl -fsS "${CURL_AUTH[@]}" "http://$HOST:$PORT/health" 2>/dev/null \
+      | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("panelTools","?"))' 2>/dev/null || echo "?")"
+    echo "bridge hub answering on http://$HOST:$PORT/health (panel tool grant: $MODE)"
   else
     echo "WARNING: the hub did not answer /health. Check: tail -20 $LOG" >&2
   fi

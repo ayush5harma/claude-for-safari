@@ -20,18 +20,23 @@
   the Background band's I/O throttling and nice 5 are for batch jobs nobody is
   waiting on.
 
-  To expose the hub off-loopback (HOSTING.md Path 0), add here:
-    <key>EnvironmentVariables</key>
-    <dict>
-      <key>BRIDGE_BIND</key><string>100.x.y.z</string>
-      <key>BRIDGE_TOKEN</key><string>...openssl rand -hex 24...</string>
-    </dict>
-  The bridge refuses to bind off-loopback without a token.
+  The __ENV__ token below is replaced with an EnvironmentVariables dict built
+  from whatever of BRIDGE_BIND / BRIDGE_TOKEN / BRIDGE_PANEL_TOOLS / BRIDGE_PORT
+  / CLAUDE_BIN was set in install.sh's own environment, so exposing the hub
+  (HOSTING.md Path 0) is one command:
+
+    BRIDGE_BIND=100.x.y.z BRIDGE_TOKEN=$(openssl rand -hex 24) \
+      bash install.sh --bridge-only
+
+  Do NOT hand-edit the rendered plist: every install.sh run re-renders it and
+  hand edits are lost. Re-run the command instead. The bridge refuses to bind
+  off-loopback without a token.
 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.ayushsharma.claude-safari-bridge</string>
+  __ENV__
   <key>ProgramArguments</key>
   <array>
     <string>__NODE__</string>

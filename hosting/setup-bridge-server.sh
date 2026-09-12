@@ -4,11 +4,14 @@
 # systemd service, fronted by Caddy for automatic TLS.
 #
 # Run AS ROOT on the VM, with the two secrets and the domain in the
-# environment — nothing is baked into this file:
+# environment — nothing is baked into this file. Read the secrets rather than
+# typing them on the command line: a command line is world-readable through
+# `ps` for as long as it runs, and lands verbatim in the shell history file.
 #
-#   BRIDGE_TOKEN=$(openssl rand -hex 24) \
-#   CLAUDE_CODE_OAUTH_TOKEN=<from `claude setup-token` on the Mac> \
-#   BRIDGE_DOMAIN=bridge.example.tech \
+#   read -rs CLAUDE_CODE_OAUTH_TOKEN   # paste from `claude setup-token`, Enter
+#   export CLAUDE_CODE_OAUTH_TOKEN
+#   export BRIDGE_TOKEN=$(openssl rand -hex 24)
+#   export BRIDGE_DOMAIN=bridge.example.com
 #   bash setup-bridge-server.sh
 #
 # BRIDGE_DOMAIN must already resolve to this VM (A record) or Caddy cannot
@@ -67,9 +70,14 @@ Wants=network-online.target
 
 [Service]
 User=bridge
+# systemd starts a unit in / unless told otherwise, and the hub spawns `claude`
+# as a child: without this the CLI's working directory is the filesystem root,
+# which is where it then looks for project state and writes anything relative.
+WorkingDirectory=/home/bridge
 EnvironmentFile=/etc/claude-bridge.env
 Environment=BRIDGE_BIND=127.0.0.1
 Environment=BRIDGE_PORT=29170
+Environment=BRIDGE_PANEL_TOOLS=read
 Environment=PATH=/home/bridge/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CLAUDE_BIN=/home/bridge/.npm-global/bin/claude
 ExecStart=/usr/bin/node /home/bridge/claude-safari-bridge.js --serve
