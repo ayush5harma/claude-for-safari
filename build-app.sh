@@ -340,6 +340,17 @@ APP="$(find "$APP_DIR/build/Build/Products/Release" -maxdepth 1 -name '*.app' -p
 [ -n "$APP" ] || { echo "ERROR: build produced no .app" >&2; exit 1; }
 codesign -v --deep --strict "$APP" && echo "Signature OK: $APP"
 
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
+# ALWAYS deregister the DerivedData copy, on every exit path. Two registered
+# apps with one bundle id shadow each other nondeterministically (an Xcode
+# Debug copy once won over /Applications and the extension "vanished"), and
+# xcodebuild registers the build-dir app ITSELF: its RegisterWithLaunchServices
+# phase runs `lsregister -f -R -trusted` on the product, measured 2026-09-12, so
+# even a --build-only or scratch-directory build silently takes the bundle id
+# away from whatever is installed unless this undoes it. One id, one registered
+# path, always.
+"$LSREGISTER" -u "$APP" 2>/dev/null || true
+
 if [ "$BUILD_ONLY" -eq 1 ]; then
   echo "Built (not installed): $APP"
   exit 0
@@ -355,20 +366,13 @@ echo "Installed: $DEST"
 if [ "$REGISTER" -eq 0 ]; then
   cat <<EOF
 
-Not registered with LaunchServices (install dir is not /Applications). Two
-registered copies of one bundle id shadow each other nondeterministically, so a
-scratch build deliberately leaves the installed app alone. Pass --register to
-override.
+Not registered with LaunchServices (install dir is not /Applications), and the
+build-dir copy xcodebuild registered has been deregistered again, so whatever is
+installed keeps the bundle id. Pass --register to register this build instead.
 EOF
   exit 0
 fi
 
-LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
-# Deregister the build-dir copy BEFORE registering the destination: two
-# registered apps with one bundle id shadow each other nondeterministically
-# (an Xcode DerivedData Debug copy once won over /Applications and the
-# extension "vanished"). One id, one registered path, always.
-"$LSREGISTER" -u "$APP" 2>/dev/null || true
 "$LSREGISTER" -f "$DEST"
 open "$DEST"       # launching once is what makes Safari discover the extension
 sleep 3
