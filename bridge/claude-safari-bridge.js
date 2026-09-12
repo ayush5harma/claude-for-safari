@@ -1,0 +1,450 @@
+#!/usr/bin/env node
+// Claude for Safari — the bridge between Claude Code and the Safari extension.
+//
+// ONE file, two modes:
+//   default        MCP stdio server. Spawned by Claude Code (register it with
+//                  `claude mcp add claude-safari -- node <this file>`); exposes
+//                  the claude_safari_* tools and forwards each call to the hub
+//                  over localhost HTTP. Ensures the hub is running (spawns it
+//                  detached if not), so a session with no resident agent still
+//                  works.
+//   --serve        The hub: an HTTP long-poll rendezvous on 127.0.0.1:29170.
+//                  The extension's background page GETs /pull (tool calls out)
+//                  and POSTs /result (results back); MCP servers POST /call.
+//
+// Zero npm dependencies by design: node's http + fetch cover both transports,
+// so this never needs an install step and cannot rot in node_modules.
+//
+// Security model (loopback by default; token-gated when exposed):
+//   - The hub binds BRIDGE_BIND (default 127.0.0.1). Binding anything else
+//     REQUIRES BRIDGE_TOKEN — every request must then carry
+//     "Authorization: Bearer <token>" (the extension sends it from its hub
+//     settings) — and the hub refuses to start exposed without one. TLS is
+//     the reverse proxy's job (see HOSTING.md).
+//   - /pull and /result accept only requests with NO Origin header or a
+//     safari-web-extension:// origin — a web page's fetch always carries its
+//     page origin, so page JavaScript can neither drain calls nor forge
+//     results.
+//   - /call and /status accept only requests with NO Origin header (CLI-side
+//     node/curl), so a web page cannot invoke browser-control tools at all.
+
+"use strict";
+const http = require("node:http");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const { spawn, execFile } = require("node:child_process");
+
+// BRIDGE_PORT wins; bare PORT is what a PaaS (Heroku) injects for its router.
+const PORT = Number(process.env.BRIDGE_PORT || process.env.PORT) || 29170;
+const BIND = process.env.BRIDGE_BIND || "127.0.0.1";
+const TOKEN = process.env.BRIDGE_TOKEN || "";
+const HUB = `http://127.0.0.1:${PORT}`;
+const PULL_HOLD_MS = 25000;    // long-poll park time
+const CALL_TIMEOUT_MS = 90000; // extension must answer within this
+const CHAT_TIMEOUT_MS = 300000; // a headless claude turn can legitimately take minutes
+
+// The in-panel chat spawns the REAL claude CLI headless (-p). Resolve the
+// binary defensively: the hub may have been spawned with a sparse env.
+function claudeBin() {
+  if (process.env.CLAUDE_BIN && fs.existsSync(process.env.CLAUDE_BIN)) return process.env.CLAUDE_BIN;
+  const local = `${process.env.HOME}/.local/bin/claude`;
+  return fs.existsSync(local) ? local : "claude";
+}
+
+function which(bin) {
+  for (const d of (process.env.PATH || "").split(":")) {
+    try { if (d && fs.existsSync(`${d}/${bin}`)) return `${d}/${bin}`; } catch {}
+  }
+  return null;
+}
+const execFileP = (bin, args, opts) => new Promise((resolve, reject) =>
+  execFile(bin, args, opts, (err, stdout, stderr) =>
+    err ? reject(Object.assign(err, { stdout, stderr })) : resolve({ stdout, stderr })));
+
+// ── Attachment handling (image + video inputs from the chat panel) ───────────
+// Files arrive as data URLs and are written under ATTACH_DIR; the composed
+// prompt then points claude at the PATHS — Claude Code's file reading is
+// natively multimodal, so images are genuinely seen. HEIC is converted with
+// macOS's own `sips`. Video gets true understanding by extracting keyframes
+// with ffmpeg (whatever is on PATH) and attaching those as images plus
+// duration metadata; without ffmpeg the video is saved and said so.
+const ATTACH_DIR = `${process.env.HOME}/.cache/claude-safari/attachments`;
+
+// Panel chats run with an ISOLATED MCP config: only the claude-safari server,
+// via --strict-mcp-config. Without this every panel message spawned a fresh
+// claude that booted ALL user-scope MCP servers — including any mcp-remote
+// OAuth proxies, whose concurrent spawns race the shared token cache and pop
+// an auth page per message. Isolation also makes panel replies start seconds
+// faster. Written at hub start; points at THIS file.
+const CHAT_MCP_CFG = `${process.env.HOME}/.cache/claude-safari/chat-mcp.json`;
+function writeChatMcpConfig() {
+  try {
+    fs.mkdirSync(`${process.env.HOME}/.cache/claude-safari`, { recursive: true });
+    fs.writeFileSync(CHAT_MCP_CFG, JSON.stringify({
+      mcpServers: { "claude-safari": { command: process.execPath, args: [__filename] } },
+    }, null, 2));
+  } catch {}
+}
+
+function pruneAttachments() {
+  try {
+    const cutoff = Date.now() - 2 * 24 * 3600 * 1000;
+    for (const d of fs.readdirSync(ATTACH_DIR)) {
+      const p = `${ATTACH_DIR}/${d}`;
+      try { if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { recursive: true, force: true }); } catch {}
+    }
+  } catch {}
+}
+
+// Returns lines describing what was saved, for the prompt.
+async function saveAttachments(list) {
+  if (!Array.isArray(list) || !list.length) return [];
+  const dir = `${ATTACH_DIR}/${crypto.randomUUID()}`;
+  fs.mkdirSync(dir, { recursive: true });
+  const lines = [];
+  let i = 0;
+  for (const a of list.slice(0, 4)) {
+    i += 1;
+    const m = /^data:([^;]+);base64,(.*)$/s.exec(String(a.dataUrl || ""));
+    if (!m) { lines.push(`- attachment ${i} (${a.name || "?"}): unreadable data`); continue; }
+    const mime = m[1];
+    const safe = String(a.name || `file${i}`).replace(/[^A-Za-z0-9._-]/g, "_").slice(-80) || `file${i}`;
+    let file = `${dir}/${i}-${safe}`;
+    fs.writeFileSync(file, Buffer.from(m[2], "base64"));
+
+    if (/heic|heif/i.test(mime) || /\.hei[cf]$/i.test(file)) {
+      const jpg = file.replace(/\.[^.]*$/, "") + ".jpg";
+      try { await execFileP("/usr/bin/sips", ["-s", "format", "jpeg", file, "--out", jpg], { timeout: 30000 }); file = jpg; }
+      catch { /* leave original; claude may still cope */ }
+    }
+
+    if (mime.startsWith("video/")) {
+      const ffmpeg = which("ffmpeg"), ffprobe = which("ffprobe");
+      if (!ffmpeg) {
+        lines.push(`- video "${safe}" saved at ${file} — ffmpeg not on this host, so no frames could be extracted; reason about it from the user's description.`);
+        continue;
+      }
+      let dur = 0;
+      try {
+        const { stdout } = await execFileP(ffprobe || ffmpeg, ffprobe
+          ? ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file]
+          : ["-i", file], { timeout: 30000 });
+        dur = parseFloat(stdout) || 0;
+      } catch {}
+      const n = Math.min(6, Math.max(2, Math.round(dur || 4)));
+      const frames = [];
+      for (let f = 0; f < n; f++) {
+        const t = dur > 0 ? (dur * (f + 0.5)) / n : f;
+        const out = `${dir}/${i}-frame${f + 1}.jpg`;
+        try {
+          await execFileP(ffmpeg, ["-y", "-ss", t.toFixed(2), "-i", file,
+            "-frames:v", "1", "-vf", "scale='min(1024,iw)':-2", out], { timeout: 60000 });
+          if (fs.existsSync(out)) frames.push(out);
+        } catch {}
+      }
+      lines.push(frames.length
+        ? `- video "${safe}" (${dur ? dur.toFixed(1) + "s" : "unknown length"}): ${frames.length} evenly-spaced frames were extracted — VIEW these image files to see the video: ${frames.join(" , ")}`
+        : `- video "${safe}" saved at ${file} — frame extraction failed.`);
+    } else if (mime.startsWith("image/")) {
+      lines.push(`- image "${safe}": VIEW this file: ${file}`);
+    } else {
+      lines.push(`- file "${safe}" (${mime}): READ this file: ${file}`);
+    }
+  }
+  return lines;
+}
+
+// ── Hub mode ──────────────────────────────────────────────────────────────────
+function runHub() {
+  pruneAttachments();
+  writeChatMcpConfig();
+  const queue = [];               // calls not yet handed to the extension
+  const waiters = new Map();      // id -> { respond, timer }
+  let parkedPull = null;          // the extension's waiting /pull response
+  let lastPullAt = 0;
+
+  const json = (res, code, obj) => {
+    const body = JSON.stringify(obj);
+    res.writeHead(code, { "content-type": "application/json" });
+    res.end(body);
+  };
+
+  const extensionOriginOk = (req) => {
+    const o = req.headers.origin;
+    return !o || String(o).startsWith("safari-web-extension://");
+  };
+  const cliOriginOk = (req) => !req.headers.origin;
+  // Bearer gate, on EVERY endpoint when a token is configured. Constant-time
+  // compare: an equality that short-circuits leaks the prefix by timing.
+  const tokenOk = (req) => {
+    if (!TOKEN) return true;
+    const h = String(req.headers.authorization || "");
+    const want = Buffer.from("Bearer " + TOKEN);
+    const got = Buffer.from(h);
+    return got.length === want.length && crypto.timingSafeEqual(got, want);
+  };
+
+  const handToExtension = (call) => {
+    if (parkedPull) {
+      const res = parkedPull; parkedPull = null;
+      clearTimeout(res._holdTimer);
+      json(res, 200, call);
+    } else {
+      queue.push(call);
+    }
+  };
+
+  const readBody = (req) => new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (c) => { data += c; if (data.length > 90e6) req.destroy(); });
+    req.on("end", () => { try { resolve(JSON.parse(data || "{}")); } catch (e) { reject(e); } });
+    req.on("error", reject);
+  });
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      if (!tokenOk(req)) return json(res, 401, { error: "unauthorized" });
+      // Cheap reachability probe for the panel's hub-settings status line;
+      // token-gated like everything, allowed from any origin (it leaks
+      // nothing and performs nothing).
+      if (req.method === "GET" && req.url === "/health") {
+        return json(res, 200, { ok: true, port: PORT });
+      }
+      if (req.method === "GET" && req.url === "/pull") {
+        if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
+        lastPullAt = Date.now();
+        if (queue.length) return json(res, 200, queue.shift());
+        if (parkedPull) { clearTimeout(parkedPull._holdTimer); parkedPull.writeHead(204); parkedPull.end(); }
+        parkedPull = res;
+        res._holdTimer = setTimeout(() => {
+          if (parkedPull === res) { parkedPull = null; res.writeHead(204); res.end(); }
+        }, PULL_HOLD_MS);
+        req.on("close", () => { if (parkedPull === res) parkedPull = null; });
+        return;
+      }
+      if (req.method === "POST" && req.url === "/result") {
+        if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
+        const body = await readBody(req);
+        const w = waiters.get(body.id);
+        if (w) { waiters.delete(body.id); clearTimeout(w.timer); w.respond(body); }
+        return json(res, 200, { ok: true });
+      }
+      if (req.method === "POST" && req.url === "/call") {
+        if (!cliOriginOk(req)) return json(res, 403, { error: "forbidden" });
+        const body = await readBody(req);
+        const id = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          waiters.delete(id);
+          json(res, 504, { error: "Safari extension did not respond — is 'Claude for Safari' enabled in Safari Settings > Extensions, with Safari running?" });
+        }, CALL_TIMEOUT_MS);
+        waiters.set(id, { respond: (r) => json(res, 200, r), timer });
+        handToExtension({ id, tool: body.tool, args: body.args || {} });
+        return;
+      }
+      if (req.method === "POST" && req.url === "/chat") {
+        // The extension's in-page chat panel. Each turn runs `claude -p`; the
+        // panel threads sessionId back so --resume gives real multi-turn
+        // memory. Auto page context rides only the FIRST turn of a session
+        // (resume keeps it in history); @-mentioned tabs and attachments are
+        // explicit per-turn acts and ride ANY turn. Extension-origin gated.
+        if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
+        const body = await readBody(req);
+        const prompt = String(body.prompt || "").slice(0, 32000);
+        if (!prompt.trim()) return json(res, 400, { error: "empty prompt" });
+
+        const parts = [];
+        if (!body.sessionId) {
+          parts.push("You are Claude, chatting inside Safari via the 'Claude for Safari' extension's side panel. Keep answers concise for a narrow panel; markdown is rendered.");
+        }
+        if (body.page && !body.sessionId) {
+          parts.push("The user is looking at this page right now:\n" +
+            `URL: ${body.page.url || "?"}\nTITLE: ${body.page.title || "?"}\n` +
+            `PAGE TEXT (rendered, truncated):\n${String(body.page.text || "").slice(0, 60000)}`);
+        }
+        if (Array.isArray(body.tabs) && body.tabs.length) {
+          parts.push("The user @-attached these open Safari tabs as context for THIS message:\n" +
+            body.tabs.slice(0, 10).map((t) =>
+              `--- TAB: ${t.title || "?"} (${t.url || "?"})\n${String(t.text || "").slice(0, 20000)}`).join("\n"));
+        }
+        const attachLines = await saveAttachments(body.attachments);
+        if (attachLines.length) {
+          parts.push("The user attached files with this message. View/read every referenced file path before answering:\n" +
+            attachLines.join("\n"));
+        }
+        parts.push(parts.length ? "User message:\n" + prompt : prompt);
+
+        const args = ["-p", "--output-format", "json",
+          // Only the claude-safari MCP server loads — see writeChatMcpConfig.
+          "--strict-mcp-config", "--mcp-config", CHAT_MCP_CFG];
+        if (body.sessionId) args.push("--resume", String(body.sessionId));
+        if (body.model && /^[a-z0-9][a-z0-9.-]{1,40}$/i.test(String(body.model))) {
+          args.push("--model", String(body.model));
+        }
+        // Headless -p can't answer permission prompts: pre-authorize the
+        // browser tools and (when present) reads of OUR attachments dir only
+        // (the "//" prefix = absolute path in permission-rule syntax).
+        // --allowedTools is variadic; the "--" before the prompt ends it.
+        args.push("--allowedTools", "mcp__claude-safari");
+        if (attachLines.length) args.push(`Read(/${ATTACH_DIR}/**)`);
+        // "--" terminates flag parsing: --allowedTools is VARIADIC and would
+        // otherwise swallow the prompt as another rule, leaving no input.
+        args.push("--", parts.join("\n\n"));
+        execFile(claudeBin(), args,
+          { timeout: CHAT_TIMEOUT_MS, maxBuffer: 32e6, env: process.env },
+          (err, stdout) => {
+            if (err && !stdout) {
+              return json(res, 500, { error: "claude failed: " + String(err.message || err).slice(0, 400) });
+            }
+            try {
+              const out = JSON.parse(stdout);
+              json(res, 200, { reply: out.result ?? "(no result)", sessionId: out.session_id || body.sessionId || null });
+            } catch {
+              // Non-JSON output still beats losing the reply.
+              json(res, 200, { reply: String(stdout).slice(0, 32000), sessionId: body.sessionId || null });
+            }
+          });
+        return;
+      }
+      if (req.method === "GET" && req.url === "/status") {
+        if (!cliOriginOk(req)) return json(res, 403, { error: "forbidden" });
+        return json(res, 200, {
+          ok: true,
+          extensionSeenMsAgo: lastPullAt ? Date.now() - lastPullAt : null,
+        });
+      }
+      json(res, 404, { error: "not found" });
+    } catch (e) {
+      json(res, 400, { error: String((e && e.message) || e) });
+    }
+  });
+
+  server.on("error", (e) => {
+    // Another hub already listening is the expected race — defer to it.
+    process.exit(e.code === "EADDRINUSE" ? 0 : 1);
+  });
+  // Never expose an unauthenticated hub: it spawns claude with the host's
+  // credentials, so off-loopback without a token is refused outright rather
+  // than warned about.
+  if (BIND !== "127.0.0.1" && BIND !== "localhost" && !TOKEN) {
+    process.stderr.write("claude-safari-bridge: refusing BRIDGE_BIND=" + BIND + " without BRIDGE_TOKEN\n");
+    process.exit(1);
+  }
+  server.listen(PORT, BIND);
+}
+
+// ── MCP mode ──────────────────────────────────────────────────────────────────
+const TOOLS = [
+  { name: "claude_safari_tabs", description: "List every open Safari tab (tabId, url, title, active). Use a tabId to target other tools at a specific tab.",
+    inputSchema: { type: "object", properties: {} } },
+  { name: "claude_safari_read", description: "Read a Safari tab: url, title, rendered text (truncated), current selection, and the first links on the page. Defaults to the active tab.",
+    inputSchema: { type: "object", properties: {
+      tabId: { type: "number" }, maxChars: { type: "number", description: "truncate rendered text (default 120000)" } } } },
+  { name: "claude_safari_click", description: "Click an element in a Safari tab, by CSS selector or by visible text (links, buttons).",
+    inputSchema: { type: "object", properties: {
+      selector: { type: "string" }, text: { type: "string" }, tabId: { type: "number" } } } },
+  { name: "claude_safari_fill", description: "Fill an input or textarea (fires input/change events so frameworks notice).",
+    inputSchema: { type: "object", properties: {
+      selector: { type: "string" }, value: { type: "string" }, tabId: { type: "number" } }, required: ["selector", "value"] } },
+  { name: "claude_safari_navigate", description: "Navigate the current tab (or open a new one) to a URL.",
+    inputSchema: { type: "object", properties: {
+      url: { type: "string" }, newTab: { type: "boolean" }, tabId: { type: "number" } }, required: ["url"] } },
+  { name: "claude_safari_eval", description: "Evaluate JavaScript in the tab's content world (full DOM access; result must be JSON-serializable).",
+    inputSchema: { type: "object", properties: {
+      code: { type: "string" }, tabId: { type: "number" } }, required: ["code"] } },
+  { name: "claude_safari_screenshot", description: "Screenshot the visible viewport of a Safari tab (activates it first).",
+    inputSchema: { type: "object", properties: { tabId: { type: "number" } } } },
+];
+
+// The MCP child talks to its own hub over loopback, and the hub gates EVERY
+// request on BRIDGE_TOKEN when one is set — including these. Without the
+// header a hosted hub (Heroku, BRIDGE_TOKEN mandatory) answered the panel
+// Claude's every tool call with 401, so "click this / read that tab" failed
+// on the phone while the chat itself worked (found 2026-09-02). The child
+// inherits the hub's environment, so the token is right here.
+const hubHeaders = (extra = {}) =>
+  TOKEN ? { ...extra, authorization: "Bearer " + TOKEN } : extra;
+
+async function hubUp() {
+  try {
+    const r = await fetch(`${HUB}/status`, { headers: hubHeaders(), signal: AbortSignal.timeout(400) });
+    return r.ok;
+  } catch { return false; }
+}
+
+async function ensureHub() {
+  if (await hubUp()) return;
+  spawn(process.execPath, [__filename, "--serve"], { detached: true, stdio: "ignore" }).unref();
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    if (await hubUp()) return;
+  }
+}
+
+async function callTool(name, args) {
+  const tool = name.replace(/^claude_safari_/, "");
+  const r = await fetch(`${HUB}/call`, {
+    method: "POST",
+    headers: hubHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ tool, args }),
+    signal: AbortSignal.timeout(CALL_TIMEOUT_MS + 5000),
+  });
+  const body = await r.json();
+  if (body.error) return { content: [{ type: "text", text: "Error: " + body.error }], isError: true };
+  const result = body.result;
+  if (tool === "screenshot" && result && result.dataUrl) {
+    const [head, data] = String(result.dataUrl).split(",", 2);
+    const mime = (head.match(/^data:([^;]+)/) || [])[1] || "image/png";
+    return { content: [{ type: "image", data, mimeType: mime }] };
+  }
+  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+}
+
+function runMcp() {
+  const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
+  let buf = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line) handleLine(line);
+    }
+  });
+  process.stdin.on("end", () => process.exit(0));
+
+  async function handleLine(line) {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+    const { id, method, params } = msg;
+    try {
+      if (method === "initialize") {
+        await ensureHub();
+        send({ jsonrpc: "2.0", id, result: {
+          protocolVersion: (params && params.protocolVersion) || "2024-11-05",
+          capabilities: { tools: {} },
+          serverInfo: { name: "claude-safari", version: "0.1.0" },
+        } });
+      } else if (method === "notifications/initialized" || String(method).startsWith("notifications/")) {
+        // notifications carry no id and expect no response
+      } else if (method === "ping") {
+        send({ jsonrpc: "2.0", id, result: {} });
+      } else if (method === "tools/list") {
+        send({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
+      } else if (method === "tools/call") {
+        const result = await callTool(params.name, params.arguments || {});
+        send({ jsonrpc: "2.0", id, result });
+      } else if (id !== undefined) {
+        send({ jsonrpc: "2.0", id, error: { code: -32601, message: "method not found: " + method } });
+      }
+    } catch (e) {
+      if (id !== undefined) {
+        send({ jsonrpc: "2.0", id, error: { code: -32603, message: String((e && e.message) || e) } });
+      }
+    }
+  }
+}
+
+if (process.argv.includes("--serve")) runHub();
+else runMcp();
