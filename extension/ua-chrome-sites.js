@@ -83,6 +83,11 @@ const MAX_UA_SITES = 200;
 // comes out, because the result goes straight into a declarativeNetRequest
 // condition, and ONE invalid entry makes updateDynamicRules reject the whole
 // call — the spoof would silently vanish for every site, not just the bad one.
+//
+// ASCII ONLY, which means an international domain has to be entered in its
+// punycode form (xn--...): the label check below refuses non-ASCII outright
+// rather than guessing at an encoding, because what reaches requestDomains has
+// to be exactly what the browser will compare against.
 function normaliseHost(line) {
   let h = String(line == null ? "" : line).trim().toLowerCase();
   if (!h || h.startsWith("#") || h.startsWith("//")) return "";   // blank line or comment
@@ -91,6 +96,16 @@ function normaliseHost(line) {
   h = h.replace(/^\*\./, "").replace(/^\.+/, "").replace(/\.+$/, "");  // *. and stray dots
   h = h.replace(/:\d+$/, "");                                     // port
   if (!h || h.length > 253) return "";
+  // A SINGLE LABEL IS REFUSED, and this is the important one. "*.com", ".com"
+  // and "com" all normalise to "com", which as a requestDomains entry matches
+  // every .com domain and as a match pattern becomes *://*.com/* -- the global
+  // spoof this file's header exists to explain the absence of, arrived at by
+  // typing three characters into a settings box. It also drops "localhost",
+  // which is fine: a UA spoof against a local dev server is not what this is
+  // for. (It does NOT stop a deliberately broad two-label entry like "co.uk";
+  // ruling that out needs the public-suffix list, which is not worth shipping
+  // for a hand-edited list.)
+  if (!h.includes(".")) return "";
   if (h.includes(":")) return "";                                 // IPv6 literal
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return "";               // IPv4 literal
   // Labels: letters, digits and inner hyphens, at most 63 characters each.

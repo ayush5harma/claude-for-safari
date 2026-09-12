@@ -263,6 +263,17 @@ strict about what it stores, because one invalid entry would make
 site rather than for the bad one. Lines it could not use are listed back to you
 under the box; the box is redrawn with exactly what is now in effect.
 
+Two rules worth knowing before you type:
+
+- **A bare top-level domain is refused.** `com`, `.com` and `*.com` all reduce
+  to a single label, which as a rule would match every `.com` domain — the
+  global spoof this design exists to avoid, three keystrokes away. Anything
+  without a dot is rejected, `localhost` included.
+- **International domains must be in punycode** (`xn--…`). The list is ASCII
+  only, because what goes into the rule has to be exactly the string the
+  browser compares against, and guessing at an encoding is how that stops being
+  true.
+
 How the two layers get scoped, since it is not obvious: the MAIN world has no
 extension APIs and `browser.storage` has no synchronous read, so a statically
 injected `document_start` script cannot learn a runtime list before the page

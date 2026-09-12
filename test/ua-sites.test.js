@@ -22,8 +22,21 @@ const CHROME_UA =
 test("normaliseHost accepts a bare hostname", () => {
   assert.equal(normaliseHost("example.com"), "example.com");
   assert.equal(normaliseHost("app.slack.com"), "app.slack.com");
-  assert.equal(normaliseHost("localhost"), "localhost");
   assert.equal(normaliseHost("a-b.example.co.uk"), "a-b.example.co.uk");
+  assert.equal(normaliseHost("xn--80ak6aa92e.com"), "xn--80ak6aa92e.com");  // punycode
+});
+
+test("normaliseHost refuses a single-label host, TLD spoofs included", () => {
+  // The one that matters: all three reduce to "com", which as a requestDomains
+  // entry matches every .com domain and as a match pattern is *://*.com/* --
+  // the global spoof the whole design exists to avoid.
+  for (const bad of ["com", ".com", "*.com", "*.COM", "https://*.com/", "co", "localhost", "localhost:3000"]) {
+    assert.equal(normaliseHost(bad), "", "should reject single-label: " + JSON.stringify(bad));
+  }
+  // And nothing derived from them survives into either builder.
+  assert.deepEqual(siteMatchPatterns(["com", "*.com"]), []);
+  assert.equal(buildUaHeaderRule(["com"], CHROME_UA), null);
+  assert.deepEqual(parseSiteList("com\n*.com\n.com\nexample.com").sites, ["example.com"]);
 });
 
 test("normaliseHost forgives what people actually paste", () => {
@@ -43,6 +56,7 @@ test("normaliseHost rejects everything that would break a DNR rule", () => {
     "-example.com", "example-.com", "example..com",
     "127.0.0.1", "10.0.0.1",              // IPv4 literals
     "[::1]", "::1",                        // IPv6 literals
+    "münchen.de", "例え.テスト",            // non-ASCII: punycode is required
     "a".repeat(64) + ".com",               // label over 63
     "a".repeat(250) + ".example.com",      // host over 253
     null, undefined,
@@ -143,7 +157,14 @@ test("isChromeUASite matches subdomains but not a suffix collision", () => {
 
 test("the built-in default list is itself valid", () => {
   assert.ok(UA_CHROME_SITES.length > 0);
-  for (const h of UA_CHROME_SITES) assert.equal(normaliseHost(h), h, h + " is not already normalised");
+  // Every default must survive the parser unchanged -- including the
+  // single-label rule, so a default can never be the thing that widens the
+  // spoof to a whole TLD.
+  for (const h of UA_CHROME_SITES) {
+    assert.equal(normaliseHost(h), h, h + " is not already normalised");
+    assert.ok(h.includes("."), h + " is a single label");
+  }
+  assert.deepEqual(parseSiteList(UA_CHROME_SITES.join("\n")).sites, UA_CHROME_SITES);
   const rule = buildUaHeaderRule(UA_CHROME_SITES, CHROME_UA);
   assert.deepEqual(rule.condition.requestDomains, UA_CHROME_SITES);
   assert.equal(siteMatchPatterns(UA_CHROME_SITES).length, UA_CHROME_SITES.length * 2);

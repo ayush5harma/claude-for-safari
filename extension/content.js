@@ -741,8 +741,10 @@ function buildPanel() {
         <div class="sep"></div>
         <div class="lede2">Sites served a Chrome user agent, for the few that
           refuse Safari. One hostname per line; a bare hostname also covers its
-          subdomains. Everywhere else Safari stays honest. Saving applies at
-          once — reload a page that is already open.</div>
+          subdomains. A bare top-level domain is refused, and an international
+          domain must be written in its punycode (xn--) form. Everywhere else
+          Safari stays honest. Saving applies at once — reload a page that is
+          already open.</div>
         <label>Sites served as Chrome
           <textarea id="uasites" rows="6" spellcheck="false" autocapitalize="off"
             autocorrect="off" autocomplete="off" placeholder="example.com"></textarea>

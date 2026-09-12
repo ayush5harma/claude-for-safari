@@ -191,10 +191,16 @@ let hubUp = false;
 // The toolbar badge, written only when it CHANGES: the poll loop runs
 // continuously, and setBadgeText on every iteration would be a needless call
 // per long-poll. The click handler writes the same badge for its own errors.
-let pollBadgeText = null;
+//
+// The dedupe key is text AND title. On text alone a second "!" carrying a
+// different reason was dropped, so the hover text kept naming the first problem
+// after the hub had started failing for another one — the badge would say
+// "unauthorized" while the hub was actually refusing the extension's version.
+let pollBadgeKey = null;
 function pollBadge(text, title) {
-  if (pollBadgeText === text) return;
-  pollBadgeText = text;
+  const key = text + " " + (title || "");
+  if (pollBadgeKey === key) return;
+  pollBadgeKey = key;
   try {
     browser.browserAction.setBadgeText({ text });
     browser.browserAction.setTitle({ title: text ? (title || "Claude") : "Claude — open chat panel" });
@@ -498,15 +504,46 @@ async function applyUaMainWorldScripts(sites) {
 
 // Applying is idempotent, and both a direct save and the storage listener call
 // it; the key guard keeps the second call from churning a registration.
+//
+// TWO THINGS THE OBVIOUS VERSION GETS WRONG, both fixed here. (1) Recording the
+// key BEFORE doing the work makes a transient failure permanent: if
+// updateDynamicRules rejects once, the guard says "already applied" from then
+// on and nothing retries until the user opens the gear and saves again. The key
+// is therefore recorded only when BOTH layers came back without a "failed:"
+// status, and cleared otherwise so the next trigger really re-applies.
+// (2) These are async and can be triggered twice in a row (a save writes
+// storage AND calls this, so the listener fires too): two applies for different
+// lists could interleave and leave the rule from one list beside the
+// registration from the other. Every call therefore goes through one in-flight
+// chain, so they run strictly in order.
 let uaLastApplied = null;
-async function applyUaSites() {
-  const sites = await effectiveUaSites();
-  const key = JSON.stringify(sites);
-  if (key === uaLastApplied) return sites;
-  uaLastApplied = key;
-  await applyUaHeaderRule(sites);
-  await applyUaMainWorldScripts(sites);
+let uaApplyChain = Promise.resolve();
+
+async function applyUaSitesNow() {
+  let sites = [];
+  try {
+    sites = await effectiveUaSites();
+    const key = JSON.stringify(sites);
+    if (key === uaLastApplied) return sites;
+    await applyUaHeaderRule(sites);
+    await applyUaMainWorldScripts(sites);
+    const failed = String(uaStatus.dnr).startsWith("failed:") ||
+      String(uaStatus.scope).startsWith("failed:");
+    uaLastApplied = failed ? null : key;
+  } catch (e) {
+    uaLastApplied = null;
+    noteUaStatus("dnr", "failed: " + String((e && e.message) || e));
+  }
   return sites;
+}
+
+function applyUaSites() {
+  // Both slots run the same work: the next apply must happen whether or not the
+  // previous one settled cleanly, and a rejected chain would otherwise stall
+  // every later call.
+  const run = () => applyUaSitesNow();
+  uaApplyChain = uaApplyChain.then(run, run);
+  return uaApplyChain;
 }
 
 uaApi.storage.onChanged.addListener((ch, area) => {
