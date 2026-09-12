@@ -232,11 +232,48 @@ with an extension Safari cannot see.
 ## The per-site Chrome user agent
 
 Some sites refuse Safari outright. The extension serves a Chrome user agent to
-**only the hosts listed in `extension/ua-chrome-sites.js`** — edit that list, or
-empty it to turn the feature off — at both layers that matter: a
+**only the hosts on its site list**, at both layers that matter: a
 declarativeNetRequest header rule (`background.js`) and a MAIN-world
 `navigator.userAgent` patch (`ua-consistency.js`), reading one generated string
 (`ua-chrome.js`) so they cannot disagree. Everywhere else Safari stays honest.
+
+### The site list is a setting
+
+Open the panel, click the **gear**, and edit **Sites served as Chrome** — one
+hostname per line. A bare hostname also covers its subdomains, so `example.com`
+matches `app.example.com`. **Restore defaults** puts back the built-in list;
+emptying the box turns the feature off entirely. The same pane is on Mac,
+iPhone and iPad.
+
+The list is stored in the extension's own storage (`browser.storage.local`,
+key `uaChromeSites`). `extension/ua-chrome-sites.js` holds the **default**
+list, which is what applies until you save something — two hosts, both
+commented in that file with the measurement that put them there.
+
+**A save applies immediately — no rebuild, no Safari restart.** The background
+page rebuilds the declarativeNetRequest rule and re-registers the MAIN-world
+scripts on the spot. **A page that is already open keeps whatever it loaded
+with: reload it.** That is the same rule as the launch race below, for the same
+reason — the treatment is decided when the request goes out.
+
+The pane is forgiving about what you paste (a full URL, a `*.` prefix, a port
+and surrounding space all normalise to the hostname; `#` starts a comment) and
+strict about what it stores, because one invalid entry would make
+`updateDynamicRules` reject the whole call and the spoof would vanish for every
+site rather than for the bad one. Lines it could not use are listed back to you
+under the box; the box is redrawn with exactly what is now in effect.
+
+How the two layers get scoped, since it is not obvious: the MAIN world has no
+extension APIs and `browser.storage` has no synchronous read, so a statically
+injected `document_start` script cannot learn a runtime list before the page
+reads `navigator.userAgent`. Instead the background page registers the scripts
+through `scripting.registerContentScripts` with `matches` built from the list
+(`world: "MAIN"`, `document_start`) — running at all *is* the gate, so no list
+travels into web pages. Per MDN's compatibility data the `scripting` namespace
+is Safari 15.4+ and, unlike Chrome, "available for use in Manifest V2 or
+later", with `registerContentScripts` and the `world` property both Safari
+16.4+; this project's macOS 14 floor means Safari 17+. If the API were missing,
+the header layer would still apply and the gear would say "header only".
 
 This is deliberately inverted from the obvious design (global Chrome UA,
 extension reverts listed sites to Safari), because that direction cannot be
@@ -339,6 +376,16 @@ committed default carrying a pinned Chrome major; a build that has neither
 `SAFARI_USER_AGENT` nor a cache ships exactly that. (The earlier design wrote
 it in place, so every build that saw a new Chrome major dirtied the checkout.)
 
+**`ua-chrome.js` still carries the UA string; the site list no longer lives in
+a file.** Since 0.36 the list is a runtime setting in `browser.storage.local`
+(`uaChromeSites`), edited in the panel's gear, and
+`extension/ua-chrome-sites.js` is its **default and fallback** plus the parser
+and the two builders (the declarativeNetRequest rule, the
+`registerContentScripts` match patterns). A packaging system that wants a
+different default edits `UA_CHROME_SITES` in that file; nothing needs to
+regenerate it, and a user's saved list wins over it. `node --test
+"test/*.test.js"` covers the parser and both builders.
+
 Identifiers, and how to change them:
 
 - Bundle id `com.ayushsharma.claude-safari` — set `SAFARI_APP_ID`, or edit the
@@ -440,6 +487,14 @@ The hub binds `127.0.0.1` only by default.
   Safari 27, and byte-identical to the extension's own fetch, which is why the
   Origin check alone was not enough), but it cannot make a cross-origin POST
   without its Origin, which the hub rejects.
+- The literal Origin `null` is rejected too, and **that line matters for the
+  whole web, not just for sandboxed iframes**: per Fetch, a non-cors request
+  serialises its origin as `null` when the referrer policy says so, and under
+  the default (`strict-origin-when-cross-origin`, and likewise `no-referrer`)
+  an **HTTPS page's cross-origin POST to an HTTP url sends `Origin: null`**.
+  The hub is `http://127.0.0.1`, so every https page on the internet gets that
+  treatment — without the check they would all land in the permissive "no
+  Origin" branch.
 - `/call` and `/status` — the CLI side — require **both** no Origin and no
   `Sec-Fetch-Site`. Every browser stamps `Sec-Fetch-Site` on every request;
   curl and node never do.
