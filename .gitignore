@@ -1,0 +1,12 @@
+# Generated Xcode wrapper projects (rebuilt from extension/ by build-app.sh
+# and build-ios.sh). Machine-specific signing and derived data; regenerate
+# rather than commit.
+app/
+app-ios/
+
+# build-ios.sh hand-off staging (the signable project zip and the .ipa), and
+# anything else a build drops.
+dist/
+build/
+
+.DS_Store
