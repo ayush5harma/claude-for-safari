@@ -125,14 +125,22 @@ if [ "$DO_BRIDGE" -eq 1 ]; then
       [ -n "$_val" ] && printf '%s ' "$_v"; done)"
   fi
 
+  # Both files below can carry BRIDGE_TOKEN, so neither may exist at the
+  # default umask even briefly: ~/Library/LaunchAgents is world-readable and a
+  # 0644 plist hands the hub's token to every user on the machine. umask around
+  # the staging write (it is created by a redirect, so chmod would be too late)
+  # and an explicit chmod on the rendered plist before it is moved into place.
+  #
   # `|` as the sed delimiter: every replacement is a path. __ENV__ is replaced
-  # with a here-doc-free multi-line block, so it goes through a file rather than
-  # an -e expression.
-  printf '%s' "$ENV_XML" > "$PLIST.env"
-  sed -e "s|__NODE__|$NODE|g" -e "s|__BRIDGE__|$BRIDGE_SRC|g" -e "s|__LOG__|$LOG|g" \
-    -e "/__ENV__/r $PLIST.env" -e "/__ENV__/d" \
-    "$TEMPLATE" > "$PLIST.tmp"
+  # with a multi-line block, so it goes through a file rather than an -e
+  # expression.
+  ( umask 077; printf '%s' "$ENV_XML" > "$PLIST.env" )
+  ( umask 077
+    sed -e "s|__NODE__|$NODE|g" -e "s|__BRIDGE__|$BRIDGE_SRC|g" -e "s|__LOG__|$LOG|g" \
+      -e "/__ENV__/r $PLIST.env" -e "/__ENV__/d" \
+      "$TEMPLATE" > "$PLIST.tmp" )
   rm -f "$PLIST.env"
+  chmod 600 "$PLIST.tmp"
   plutil -lint "$PLIST.tmp" >/dev/null || { rm -f "$PLIST.tmp"; echo "ERROR: rendered plist is not valid" >&2; exit 1; }
   mv "$PLIST.tmp" "$PLIST"
 

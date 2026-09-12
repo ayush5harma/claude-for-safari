@@ -219,9 +219,18 @@ function runHub() {
   //     unmeasured behaviour.
   //
   // Hence /pull is POST-only (it was a GET until 0.35), and /result and /chat
-  // were already POST. A sandboxed iframe is the one page context that sends
-  // the literal string "null" as its Origin, so that spelling is rejected
-  // explicitly rather than falling into the "no Origin" branch.
+  // were already POST.
+  //
+  // THE `o !== "null"` LINE BELOW IS LOAD-BEARING FOR THE WHOLE WEB, not just
+  // for the sandboxed iframes that are the usual reason to reject that
+  // spelling. Per the Fetch standard, a non-cors request serialises its origin
+  // as "null" when the referrer policy says so, and the policy that applies is
+  // the default: under strict-origin-when-cross-origin (and under
+  // no-referrer), an HTTPS page's cross-origin POST to an HTTP url sends
+  // `Origin: null`. This hub is http://127.0.0.1, so EVERY https page on the
+  // internet gets that treatment -- without this line they would all land in
+  // the permissive "no Origin" branch and could drain /pull. Do not simplify it
+  // back to `!o || startsWith(...)`.
   const extensionOriginOk = (req) => {
     const o = req.headers.origin;
     if (!o) return true;
@@ -352,12 +361,28 @@ function runHub() {
         const body = await readBody(req);
         const prompt = String(body.prompt || "").slice(0, 32000);
         if (!prompt.trim()) return json(res, 400, { error: "empty prompt" });
+        // Shape-check the session id ONCE and use the checked value
+        // everywhere below: it reaches a child process's argv, and it also
+        // decides whether this is a session's first turn. Checking it only at
+        // the --resume site would have made a malformed id a turn with no
+        // --resume AND no system prompt.
+        //
+        // THE FIRST CHARACTER MUST BE ALPHANUMERIC, not merely in the allowed
+        // set. A plain [A-Za-z0-9-]{8,64} admits "--dangerously-skip-
+        // permissions" -- 30 characters of letters and hyphens -- which
+        // execFile would hand to the CLI as the token after --resume, where an
+        // option parser that rejects a hyphen-leading value reads it as the
+        // next FLAG instead. Measured 2026-09-12 against this endpoint: the
+        // looser pattern put that exact string into the child's argv. Real ids
+        // are UUIDs, so nothing legitimate is lost.
+        const sessionId = /^[A-Za-z0-9][A-Za-z0-9-]{7,63}$/.test(String(body.sessionId || ""))
+          ? String(body.sessionId) : null;
 
         const parts = [];
-        if (!body.sessionId) {
+        if (!sessionId) {
           parts.push("You are Claude, chatting inside Safari via the 'Claude for Safari' extension's side panel. Keep answers concise for a narrow panel; markdown is rendered.");
         }
-        if (body.page && !body.sessionId) {
+        if (body.page && !sessionId) {
           parts.push("The user is looking at this page right now:\n" +
             `URL: ${body.page.url || "?"}\nTITLE: ${body.page.title || "?"}\n` +
             `PAGE TEXT (rendered, truncated):\n${String(body.page.text || "").slice(0, 60000)}`);
@@ -377,7 +402,10 @@ function runHub() {
         const args = ["-p", "--output-format", "json",
           // Only the claude-safari MCP server loads — see writeChatMcpConfig.
           "--strict-mcp-config", "--mcp-config", CHAT_MCP_CFG];
-        if (body.sessionId) args.push("--resume", String(body.sessionId));
+        // Both of these reach a child process's argv, so both are shape-checked
+        // rather than trusted: the panel is the only writer today, but it is a
+        // content script in a web page and the endpoint takes JSON.
+        if (sessionId) args.push("--resume", sessionId);
         if (body.model && /^[a-z0-9][a-z0-9.-]{1,40}$/i.test(String(body.model))) {
           args.push("--model", String(body.model));
         }
@@ -405,10 +433,10 @@ function runHub() {
             }
             try {
               const out = JSON.parse(stdout);
-              json(res, 200, { reply: out.result ?? "(no result)", sessionId: out.session_id || body.sessionId || null });
+              json(res, 200, { reply: out.result ?? "(no result)", sessionId: out.session_id || sessionId || null });
             } catch {
               // Non-JSON output still beats losing the reply.
-              json(res, 200, { reply: String(stdout).slice(0, 32000), sessionId: body.sessionId || null });
+              json(res, 200, { reply: String(stdout).slice(0, 32000), sessionId });
             }
           });
         return;
