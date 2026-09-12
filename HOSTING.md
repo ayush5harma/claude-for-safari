@@ -32,15 +32,27 @@ awake.
 
 1. On the phone/iPad: install the VPN client, sign into the same account, and
    note the Mac's mesh IP.
-2. On the Mac, run the bridge agent with the two envs. Edit the installed
-   `~/Library/LaunchAgents/com.ayushsharma.claude-safari-bridge.plist` (or the
-   `BRIDGE_ENV` block in `install.sh` before running it) to add an
-   `EnvironmentVariables` dict with `BRIDGE_BIND` = the mesh IP — NOT
-   `0.0.0.0`, which would also answer the LAN — and `BRIDGE_TOKEN` from
-   `openssl rand -hex 24`; then
-   `launchctl kickstart -k gui/$UID/com.ayushsharma.claude-safari-bridge`.
+2. On the Mac, re-install the agent with the two envs set. `install.sh` copies
+   `BRIDGE_BIND`, `BRIDGE_PORT`, `BRIDGE_TOKEN`, `BRIDGE_PANEL_TOOLS` and
+   `CLAUDE_BIN` out of its own environment into the plist it renders:
+
+   ```sh
+   BRIDGE_BIND=<mesh-ip> BRIDGE_TOKEN=$(openssl rand -hex 24) \
+     bash install.sh --bridge-only
+   ```
+
+   Use the mesh IP, **not** `0.0.0.0`, which would also answer the LAN. The
+   bridge refuses to bind off-loopback without a token. Do not hand-edit
+   `~/Library/LaunchAgents/com.ayushsharma.claude-safari-bridge.plist`: every
+   `install.sh` run re-renders it and the edits are lost — re-run the command
+   above instead.
 3. In the panel on each device: gear > Hub URL `http://<mesh-ip>:29170` +
    the token > Save. The status line should read "hub reachable".
+
+Decide `BRIDGE_PANEL_TOOLS` here too. It defaults to `read`, which is what you
+want for a hub reachable from more than one device; `all` lets a panel turn
+drive the browser, and the prompt of a panel turn contains page text nobody
+vetted (README, "Security").
 
 Plain http is acceptable here only because WireGuard already encrypts the mesh
 path end to end.

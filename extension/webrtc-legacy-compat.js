@@ -19,8 +19,8 @@
 //       which wires the callbacks ONLY when the error callback is also given
 //       — the 2-arg form falls through the `: e` branch and drops successCb.
 //
-// The silent drop is the worst failure mode of the three: a live-device
-// streaming viewer (ReplayKit, iOS >= 13.4) chains createAnswer inside
+// The silent drop is the worst failure mode of the three: some WebRTC
+// streaming viewers (ReplayKit, iOS >= 13.4) chain createAnswer inside
 // exactly such a success callback, so the device's SDP offer applied, nothing
 // errored, and no answer was ever created — a black stream with every health
 // flag green. The matching 2-arg setLocalDescription drops the client's

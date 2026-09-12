@@ -42,7 +42,7 @@
 // relaunch Safari — an extension-bundle change needs a fresh process (check
 // `ps lstart`).
 const UA_CHROME_SITES = [
-  // Live-app-testing consoles refuse Safari outright (measured above).
+  // Some consoles refuse Safari outright (measured above).
   "browserstack.com",
   // Slack's web client keys feature support (huddles, calls) off the browser
   // and points Safari at Chrome or the desktop app; that gate reads
