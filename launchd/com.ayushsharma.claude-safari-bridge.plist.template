@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Resident hub for the Claude for Safari extension's chat panel.
+
+  install.sh renders this template into
+  ~/Library/LaunchAgents/com.ayushsharma.claude-safari-bridge.plist, replacing
+  the three placeholder tokens below with the node binary, this checkout's
+  bridge source and a log path. Rename the file and the Label together to
+  change the label; the only other place that string appears is the "bridge
+  unreachable" hint in extension/background.js.
+
+  ProgramArguments[0] is the ABSOLUTE node binary, not the script. The bridge's
+  `#!/usr/bin/env node` shebang finds nothing on launchd's PATH: as
+  ProgramArguments[0] the agent died at once with "env: node: No such file or
+  directory" (exit 127, respawned forever). Measured 2026-09-02 — the panel's
+  "bridge unreachable" was this, not the extension.
+
+  ProcessType Interactive, not Background: a person is typing at this one, and
+  the Background band's I/O throttling and nice 5 are for batch jobs nobody is
+  waiting on.
+
+  To expose the hub off-loopback (HOSTING.md Path 0), add here:
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>BRIDGE_BIND</key><string>100.x.y.z</string>
+      <key>BRIDGE_TOKEN</key><string>...openssl rand -hex 24...</string>
+    </dict>
+  The bridge refuses to bind off-loopback without a token.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ayushsharma.claude-safari-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__BRIDGE__</string>
+    <string>--serve</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <!-- stdout to /dev/null: the hub logs nothing there in normal operation, and
+       an unrotated copy of every line is unbounded growth for no information.
+       stderr is kept because that is where the things a process cannot log
+       about itself land - a missing binary, a crash before startup. -->
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG__</string>
+</dict>
+</plist>
