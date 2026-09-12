@@ -91,6 +91,12 @@ const handlers = {
     return tabs.map((t) => ({
       tabId: t.id, windowId: t.windowId, active: t.active,
       url: t.url, title: t.title,
+      // The tab's OWN icon, which Safari has already fetched. The panel used to
+      // build a google.com/s2/favicons URL from each hostname instead, which
+      // told a third party every host the user had open, every time the picker
+      // was drawn. May be absent (a tab Safari has not loaded, a site with no
+      // icon); the panel then draws no icon.
+      favIconUrl: t.favIconUrl || "",
     }));
   },
 
@@ -185,7 +191,12 @@ let hubUp = false;
 async function loop() {
   for (;;) {
     try {
-      const r = await hubFetch("/pull");
+      // POST, not GET, since 0.35. The hub answers /pull to POST only because a
+      // web page can reach any GET with <img>, <script> or a no-cors fetch and
+      // send no Origin at all -- byte-identical to this extension's own fetch,
+      // measured on Safari 27 -- while a cross-origin POST always carries the
+      // page's Origin, which the hub rejects. Nothing is sent in the body.
+      const r = await hubFetch("/pull", { method: "POST" });
       hubUp = true;
       if (r.status === 200) {
         const call = await r.json();

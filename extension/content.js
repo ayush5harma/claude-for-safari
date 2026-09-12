@@ -198,9 +198,20 @@ function md(src) {
 function hostOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; }
 }
-function favicon(url) {
-  const h = hostOf(url);
-  return h ? `https://www.google.com/s2/favicons?sz=32&domain=${h}` : "";
+// The icon comes from the tab itself (tabs.favIconUrl, forwarded by
+// background.js) — the panel must not tell a third party which hosts are open,
+// which a google.com/s2/favicons URL per tab did on every draw. Only the two
+// shapes Safari actually reports are accepted, and the value is set as a
+// PROPERTY on an <img> rather than interpolated into innerHTML: a page chooses
+// its own favicon href, so it is attacker-controlled text.
+function faviconImg(favIconUrl, cls) {
+  const u = String(favIconUrl || "");
+  if (!/^(https?:|data:image\/)/i.test(u)) return null;
+  const img = document.createElement("img");
+  if (cls) img.className = cls;
+  img.src = u;
+  img.onerror = () => img.remove();
+  return img;
 }
 
 function buildPanel() {
@@ -765,12 +776,11 @@ function buildPanel() {
     for (const c of tabChips) {
       const el = document.createElement("span");
       el.className = "chip" + (c.bad ? " bad" : "");
-      const f = favicon(c.url);
-      el.innerHTML = (f ? `<img class="fav" src="${f}">` : "") +
-        `<span class="t">${c.title ? "" : hostOf(c.url)}</span><span class="h">${hostOf(c.url)}</span><button title="Remove">${SVG.x}</button>`;
+      el.innerHTML = `<span class="t"></span><span class="h"></span><button title="Remove">${SVG.x}</button>`;
       el.querySelector(".t").textContent = c.title || hostOf(c.url);
-      const img = el.querySelector("img.fav");
-      if (img) img.onerror = () => img.remove();
+      el.querySelector(".h").textContent = hostOf(c.url);
+      const img = faviconImg(c.fav, "fav");
+      if (img) el.insertBefore(img, el.firstChild);
       el.querySelector("button").onclick = () => { tabChips = tabChips.filter((x) => x !== c); drawChips(); };
       chips.appendChild(el);
     }
@@ -1078,11 +1088,11 @@ function buildPanel() {
     menuItems.forEach((t, i) => {
       const d = document.createElement("div");
       d.className = "mi" + (i === menuSel ? " sel" : "");
-      const f = favicon(t.url);
-      d.innerHTML = (f ? `<img src="${f}">` : "") + `<span class="col"><span class="ti"></span><br><span class="ho">${hostOf(t.url)}${t.active ? " · current" : ""}</span></span>`;
+      d.innerHTML = '<span class="col"><span class="ti"></span><br><span class="ho"></span></span>';
       d.querySelector(".ti").textContent = t.title || t.url;
-      const img = d.querySelector("img");
-      if (img) img.onerror = () => img.remove();
+      d.querySelector(".ho").textContent = hostOf(t.url) + (t.active ? " · current" : "");
+      const img = faviconImg(t.favIconUrl);
+      if (img) d.insertBefore(img, d.firstChild);
       d.onmousedown = (e) => { e.preventDefault(); selectMention(t); };
       onTap(d, () => selectMention(t));
       menu.appendChild(d);
@@ -1101,7 +1111,7 @@ function buildPanel() {
     menu.classList.add("open");
   }
   function selectMention(t) {
-    if (!tabChips.some((c) => c.tabId === t.tabId)) tabChips.push({ tabId: t.tabId, title: t.title, url: t.url });
+    if (!tabChips.some((c) => c.tabId === t.tabId)) tabChips.push({ tabId: t.tabId, title: t.title, url: t.url, fav: t.favIconUrl });
     if (mentionStart >= 0) {
       const end = input.selectionStart;
       input.value = input.value.slice(0, mentionStart) + input.value.slice(end);
@@ -1333,7 +1343,7 @@ function buildPanel() {
     for (const t of tabs) {
       if (!/^https?:/i.test(t.url || "")) continue;
       if (!tabChips.some((c) => c.tabId === t.tabId)) {
-        tabChips.push({ tabId: t.tabId, title: t.title, url: t.url });
+        tabChips.push({ tabId: t.tabId, title: t.title, url: t.url, fav: t.favIconUrl });
       }
     }
     drawChips(); focusInput();
