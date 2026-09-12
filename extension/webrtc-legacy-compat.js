@@ -42,10 +42,12 @@
 //
 // Scope: self-gated on navigator.userAgent actually claiming Chrome. Since
 // the 2026-09-01 inversion that is true exactly where this shim is needed —
-// the ua-chrome-sites.js hosts, whose navigator ua-consistency.js has already
-// patched by the time this runs — i.e. precisely the sites served Chrome code
-// paths. Every honest-Safari page keeps native semantics untouched, with no
-// site list to consult. `length`, `name`, and a native-shaped toString are
+// the hosts on the effective site list, whose navigator ua-consistency.js has
+// already patched by the time this runs (same registration, listed before this
+// file) — i.e. precisely the sites served Chrome code paths. Since 0.36 the
+// registration's `matches` already scopes this file to those hosts, so the
+// check is a second, independent gate rather than the only one, and it is what
+// keeps the shim off a page whose UA patch did not take. `length`, `name`, and a native-shaped toString are
 // mirrored on the wrappers: adapters sniff arity to pick an API generation,
 // and Function.prototype.toString is the cheapest integrity tell.
 (function () {

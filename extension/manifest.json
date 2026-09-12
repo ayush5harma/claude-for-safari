@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Claude for Safari",
-  "version": "0.35",
+  "version": "0.36",
   "description": "Bridges Safari to Claude Code: a Claude chat panel on any page, plus tab read/click/fill/navigate/eval/screenshot tools for Claude sessions via a local MCP bridge.",
   "icons": {
     "16": "images/icon-16.png",
@@ -22,20 +22,6 @@
     "persistent": true
   },
   "content_scripts": [
-    {
-      "matches": [
-        "<all_urls>"
-      ],
-      "js": [
-        "ua-chrome.js",
-        "ua-chrome-sites.js",
-        "ua-consistency.js",
-        "webrtc-legacy-compat.js"
-      ],
-      "run_at": "document_start",
-      "all_frames": true,
-      "world": "MAIN"
-    },
     {
       "matches": [
         "<all_urls>"
@@ -63,6 +49,7 @@
     "tabs",
     "activeTab",
     "storage",
+    "scripting",
     "<all_urls>",
     "declarativeNetRequest",
     "declarativeNetRequestWithHostAccess"

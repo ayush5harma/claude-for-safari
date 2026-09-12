@@ -188,6 +188,19 @@ async function postResult(id, payload) {
 }
 
 let hubUp = false;
+// The toolbar badge, written only when it CHANGES: the poll loop runs
+// continuously, and setBadgeText on every iteration would be a needless call
+// per long-poll. The click handler writes the same badge for its own errors.
+let pollBadgeText = null;
+function pollBadge(text, title) {
+  if (pollBadgeText === text) return;
+  pollBadgeText = text;
+  try {
+    browser.browserAction.setBadgeText({ text });
+    browser.browserAction.setTitle({ title: text ? (title || "Claude") : "Claude — open chat panel" });
+  } catch (e) {}
+}
+
 async function loop() {
   for (;;) {
     try {
@@ -199,6 +212,7 @@ async function loop() {
       const r = await hubFetch("/pull", { method: "POST" });
       hubUp = true;
       if (r.status === 200) {
+        pollBadge("");
         const call = await r.json();
         try {
           const result = await handleCall(call);
@@ -206,8 +220,28 @@ async function loop() {
         } catch (e) {
           await postResult(call.id, { error: String((e && e.message) || e) });
         }
+      } else if (r.status === 204) {
+        // Long-poll timeout with nothing queued: the healthy idle case. Loop
+        // straight back in, and clear any badge a previous failure raised.
+        pollBadge("");
+      } else {
+        // ANY other status is an answering hub that is refusing us, and this
+        // loop has no natural pacing for that: /pull returns at once, so the
+        // next iteration starts immediately. Measured in the persistent
+        // background page: a 403 from a 0.35 hub polled by a 0.34 extension ran
+        // at 619 requests per second until Safari was quit. A 401 (a token
+        // configured on the hub but not in the gear) does the same. Back off
+        // like an unreachable hub, and put the hub's own explanation on the
+        // toolbar badge, which is the only in-chrome signal available here.
+        hubUp = false;
+        let why = "HTTP " + r.status;
+        try {
+          const body = await r.json();
+          if (body && body.error) why = String(body.error);
+        } catch (e) {}
+        pollBadge("!", "Claude: the bridge refused this extension — " + why);
+        await sleep(3000);
       }
-      // 204 = long-poll timeout with nothing queued; loop straight back in.
     } catch (e) {
       hubUp = false;   // hub not running (it self-starts with the next Claude session)
       await sleep(3000);
@@ -230,12 +264,12 @@ browser.browserAction.onClicked.addListener(async (tab) => {
     const ping = await browser.tabs.sendMessage(tab.id, { op: "ping" }).catch(() => null);
     const fromOverview = !!(ping && ping.hidden);
     await browser.tabs.sendMessage(tab.id, { op: "togglePanel", withAllTabs: fromOverview });
-    browser.browserAction.setBadgeText({ text: "" });
-    browser.browserAction.setTitle({ title: "Claude — open chat panel" });
+    pollBadge("");
   } catch (e) {
     // Badge as the only in-chrome signal we have; the title carries the why.
-    browser.browserAction.setBadgeText({ text: "!" });
-    browser.browserAction.setTitle({ title: "Claude: " + String((e && e.message) || e) });
+    // Through pollBadge so the poll loop and the click handler share one idea
+    // of what the badge currently says.
+    pollBadge("!", "Claude: " + String((e && e.message) || e));
   }
 });
 
@@ -289,6 +323,44 @@ browser.runtime.onMessage.addListener((msg) => {
       // what the panel depends on.
       .catch((e) => ({ error: "bridge unreachable — run: launchctl kickstart -k gui/$UID/com.ayushsharma.claude-safari-bridge  (" + (e && e.message) + ")" }));
   }
+  // ── The gear's "Sites served as Chrome" pane ──
+  // The panel lives in a content script, which cannot reach declarativeNet-
+  // Request or scripting, so it hands the raw textarea text here and gets back
+  // what was actually stored. Parsing and validation therefore have ONE home
+  // (ua-chrome-sites.js), and the pane renders the normalised result rather
+  // than its own idea of it.
+  if (msg.op === "uaSitesGet") {
+    return (async () => {
+      let saved = null;
+      try {
+        const st = await browser.storage.local.get(UA_SITES_KEY);
+        if (Array.isArray(st[UA_SITES_KEY])) saved = st[UA_SITES_KEY];
+      } catch (e) {}
+      return {
+        sites: saved || UA_CHROME_SITES.slice(),
+        defaults: UA_CHROME_SITES.slice(),
+        usingDefaults: saved === null,
+        status: uaStatus,
+      };
+    })();
+  }
+  if (msg.op === "uaSitesSet") {
+    return (async () => {
+      const { sites, rejected } = parseSiteList(msg.text);
+      await browser.storage.local.set({ [UA_SITES_KEY]: sites });
+      uaLastApplied = null;          // a save always re-applies, even if equal
+      await applyUaSites();
+      return { sites, rejected, defaults: UA_CHROME_SITES.slice(), usingDefaults: false, status: uaStatus };
+    })().catch((e) => ({ error: String((e && e.message) || e) }));
+  }
+  if (msg.op === "uaSitesReset") {
+    return (async () => {
+      await browser.storage.local.remove(UA_SITES_KEY);
+      uaLastApplied = null;
+      const sites = await applyUaSites();
+      return { sites, rejected: [], defaults: UA_CHROME_SITES.slice(), usingDefaults: true, status: uaStatus };
+    })().catch((e) => ({ error: String((e && e.message) || e) }));
+  }
   if (msg.op === "hubping") {
     return hubFetch("/health")
       .then((r) => r.json())
@@ -298,84 +370,149 @@ browser.runtime.onMessage.addListener((msg) => {
   return undefined;
 });
 
-// ── Per-site Chrome user agent (header half) ───────────────────────────────
+// ── Per-site Chrome user agent ─────────────────────────────────────────────
 // Safari's default UA stays honest — leave Safari's own CustomUserAgent
-// preference unset — and the Chrome spoof lives HERE, scoped to the sites in
-// ua-chrome-sites.js (the inversion story and the measurements live in that
-// file's header). These dynamic rules set the Chrome User-Agent header on
-// every request to those domains; the JS half is ua-consistency.js, and both
-// read the one generated string (ua-chrome.js) so header and navigator can
-// never disagree.
+// preference unset — and the Chrome spoof lives HERE, scoped to an effective
+// site list: the user's own (browser.storage.local "uaChromeSites", edited in
+// the panel's gear) or, when nothing is saved, the UA_CHROME_SITES default in
+// ua-chrome-sites.js, whose header carries the inversion story and the
+// measurements.
 //
-// main_frame IS covered. An earlier comment here claimed Safari applies
-// modifyHeaders to subresources but not the top-level navigation; re-measured
-// 2026-09-01 with a server-side header echo, Safari 27 rewrites the
-// main_frame User-Agent too. What remains true is the LAUNCH RACE: rules
-// installed from this background page cannot be relied on for pages loaded
-// immediately after a cold Safari launch, so a listed site's first load can
-// go out as honest Safari. That now fails soft and visible (the site's own
+// TWO LAYERS, ONE LIST, BOTH APPLIED LIVE (0.36):
+//
+//   header    a declarativeNetRequest rule setting the Chrome User-Agent on
+//             every request to the listed domains. These rules were ALWAYS
+//             dynamic — this extension ships no static rule_resources — so the
+//             2026-09-01 server-side echo that measured Safari 27 rewriting the
+//             main_frame User-Agent was measuring a DYNAMIC rule. Rebuilding
+//             them from a new list therefore changes nothing about that result.
+//
+//   navigator ua-consistency.js and webrtc-legacy-compat.js, registered through
+//             scripting.registerContentScripts with world "MAIN", document_start
+//             and `matches` built from the same list.
+//
+// WHY registerContentScripts RATHER THAN A STATIC content_scripts ENTRY. The
+// MAIN world has no extension APIs at all, and browser.storage has no
+// synchronous read, so a statically injected document_start script cannot learn
+// a runtime list in time — the page can read navigator.userAgent before any
+// async answer arrives. Scoping the registration solves that by construction:
+// the scripts run only where they are registered and carry no list of their
+// own. The API is the constraint, and it is met here — per MDN's compat data
+// the scripting namespace is Safari 15.4+ and "available for use in Manifest V2
+// or later" (unlike Chrome, where it is MV3-only), with
+// registerContentScripts and RegisteredContentScript.world both Safari 16.4+.
+// This project already requires macOS 14, i.e. Safari 17+. If the API is
+// missing anyway, the header layer still applies and uaScopeStatus records
+// "scripting-unavailable" rather than failing silently.
+//
+// THE LAUNCH RACE remains, unchanged: neither layer can be relied on for pages
+// loaded immediately after a cold Safari launch, so a listed site's first load
+// can go out as honest Safari. That fails soft and visible (the site's own
 // "unsupported browser" banner; a reload fixes it) instead of the old
-// direction's invisible Cloudflare token poisoning — the accepted trade.
+// direction's invisible Cloudflare token poisoning — the accepted trade. The
+// same is true right after a list change: a page already open keeps whatever it
+// loaded with until it is reloaded.
 //
 // THE CHROME STRING IS NOT HARDCODED here: build-app.sh regenerates
 // ua-chrome.js into the build copy of the extension from $SAFARI_USER_AGENT
 // or the $SAFARI_UA_CACHE file, and the tracked ua-chrome.js is the committed
 // default it falls back to.
-(function () {
-  const api = (typeof browser !== "undefined" ? browser : chrome);
-  const dnr = api && api.declarativeNetRequest;
-  // "Did the rules install" must stay answerable after the fact; from the
-  // background page's console: browser.storage.local.get("uaSpoofStatus").
-  // (Replaces the exception-era uaExceptionStatus key, removed below so a
-  // stale success can never be read as current.)
-  const note = (m) => {
-    try {
-      api.storage.local.set({ uaSpoofStatus: m });
-      api.storage.local.remove("uaExceptionStatus");
-    } catch (e) {}
-  };
-  if (!dnr || !dnr.updateDynamicRules) { note("dnr-unavailable"); return; }
+const UA_SITES_KEY = "uaChromeSites";
+const UA_SCRIPT_ID = "ua-chrome-main";
+// ua-chrome-sites.js is deliberately NOT in this list: the registration's
+// `matches` is the scope, so the site list no longer travels into web pages.
+const UA_MAIN_WORLD_JS = ["ua-chrome.js", "ua-consistency.js", "webrtc-legacy-compat.js"];
 
+const uaApi = (typeof browser !== "undefined" ? browser : chrome);
+
+// "Did it apply" must stay answerable after the fact; from the background
+// page's console: browser.storage.local.get(["uaSpoofStatus","uaScopeStatus"]).
+// (uaSpoofStatus replaces the exception-era uaExceptionStatus, removed here so
+// a stale success can never be read as current.)
+let uaStatus = { dnr: "pending", scope: "pending" };
+function noteUaStatus(part, value) {
+  uaStatus = { ...uaStatus, ...(part === "dnr" ? { dnr: value } : { scope: value }) };
+  try {
+    uaApi.storage.local.set({ uaSpoofStatus: uaStatus.dnr, uaScopeStatus: uaStatus.scope });
+    uaApi.storage.local.remove("uaExceptionStatus");
+  } catch (e) {}
+}
+
+// The effective list: the saved one when there is one, else the built-in
+// default. A saved EMPTY array is a real answer — "spoof nothing" — and must
+// not fall through to the default.
+async function effectiveUaSites() {
+  try {
+    const st = await uaApi.storage.local.get(UA_SITES_KEY);
+    const v = st && st[UA_SITES_KEY];
+    if (Array.isArray(v)) return v.map(normaliseHost).filter(Boolean);
+  } catch (e) {}
+  return UA_CHROME_SITES.slice();
+}
+
+async function applyUaHeaderRule(sites) {
+  const dnr = uaApi && uaApi.declarativeNetRequest;
+  if (!dnr || !dnr.updateDynamicRules) return noteUaStatus("dnr", "dnr-unavailable");
   const ua = (typeof chromeUA === "function" && chromeUA()) || "";
-  const domains = (typeof UA_CHROME_SITES !== "undefined") ? UA_CHROME_SITES : [];
-
-  // Dynamic rules PERSIST in extension storage across updates, so the
-  // exception-era rules (five 9200s restoring Safari on claude.ai et al) and
-  // the client-hint probes must be swept even though this build never adds
-  // them — and swept even when there is nothing to add, or an emptied list
-  // would leave the last build's rules running forever.
-  const sweep = Array.from({ length: 100 }, (_, i) => 9200 + i).concat([9001, 9100]);
-
-  if (!domains.length || !/Chrome\/\d+\./.test(ua)) {
-    dnr.updateDynamicRules({ removeRuleIds: sweep })
-      .then(() => note(domains.length ? "no-chrome-ua" : "no-chrome-sites"))
-      .catch((e) => note("failed: " + (e && e.message)));
-    return;
+  const rule = buildUaHeaderRule(sites, ua);
+  try {
+    // The sweep runs even when there is nothing to add: dynamic rules persist
+    // across updates AND across a list change, so without it a domain the user
+    // has just removed would keep the previous rule forever.
+    await dnr.updateDynamicRules(rule
+      ? { removeRuleIds: UA_RULE_SWEEP_IDS, addRules: [rule] }
+      : { removeRuleIds: UA_RULE_SWEEP_IDS });
+    noteUaStatus("dnr", rule ? "ok:" + sites.join(",") : (sites.length ? "no-chrome-ua" : "no-chrome-sites"));
+  } catch (e) {
+    noteUaStatus("dnr", "failed: " + String((e && e.message) || e));
   }
+}
 
-  // One rule per domain. requestDomains matches the domain AND its
-  // subdomains, so "example.com" covers app.example.com without an extra
-  // entry.
-  const rules = domains.map((d, i) => ({
-    id: 9200 + i,
-    priority: 100,                              // beat anything added later
-    action: {
-      type: "modifyHeaders",
-      requestHeaders: [{ header: "user-agent", operation: "set", value: ua }],
-    },
-    condition: {
-      requestDomains: [d],
-      resourceTypes: [
-        "main_frame", "sub_frame", "xmlhttprequest", "script",
-        "stylesheet", "image", "font", "media", "websocket", "other",
-      ],
-    },
-  }));
+async function applyUaMainWorldScripts(sites) {
+  const sc = uaApi && uaApi.scripting;
+  if (!sc || !sc.registerContentScripts) return noteUaStatus("scope", "scripting-unavailable");
+  // Unregister first, unconditionally: register() rejects an id that already
+  // exists and update() rejects one that does not, and after a crash or an
+  // update either state is possible. Unregistering an absent id throws, which
+  // is why this is swallowed rather than checked.
+  try { await sc.unregisterContentScripts({ ids: [UA_SCRIPT_ID] }); } catch (e) {}
+  const matches = siteMatchPatterns(sites);
+  if (!matches.length) return noteUaStatus("scope", "no-chrome-sites");
+  try {
+    await sc.registerContentScripts([{
+      id: UA_SCRIPT_ID,
+      js: UA_MAIN_WORLD_JS,
+      matches,
+      runAt: "document_start",
+      allFrames: true,           // the shims must reach cross-origin iframes
+      world: "MAIN",             // an isolated world's navigator is not the page's
+      // The background page re-registers from storage at every start, so a
+      // registration persisted from an older list would only ever be stale.
+      persistAcrossSessions: false,
+    }]);
+    noteUaStatus("scope", "ok:" + sites.join(","));
+  } catch (e) {
+    noteUaStatus("scope", "failed: " + String((e && e.message) || e));
+  }
+}
 
-  dnr.updateDynamicRules({ removeRuleIds: sweep, addRules: rules })
-    .then(() => note("ok:" + domains.join(",")))
-    .catch((e) => note("failed: " + (e && e.message)));
-})();
+// Applying is idempotent, and both a direct save and the storage listener call
+// it; the key guard keeps the second call from churning a registration.
+let uaLastApplied = null;
+async function applyUaSites() {
+  const sites = await effectiveUaSites();
+  const key = JSON.stringify(sites);
+  if (key === uaLastApplied) return sites;
+  uaLastApplied = key;
+  await applyUaHeaderRule(sites);
+  await applyUaMainWorldScripts(sites);
+  return sites;
+}
+
+uaApi.storage.onChanged.addListener((ch, area) => {
+  if (area === "local" && ch[UA_SITES_KEY]) applyUaSites();
+});
+applyUaSites();
 
 // NOTE — Sec-CH-UA headers are NOT set here, and cannot be.
 // Real Chrome sends sec-ch-ua / -mobile / -platform on every request; Safari

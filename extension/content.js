@@ -559,13 +559,32 @@ function buildPanel() {
         padding: 7px 9px; color: var(--ink); outline: none;
         font: 12.5px -apple-system, system-ui, sans-serif; }
       .hubov input:focus { border-color: var(--accent); }
+      /* The site-list box reuses the input's material but must be able to grow.
+         The bare textarea rule above is the composer's and caps height at
+         120px, so both dimensions are restated here. NO BACKTICKS anywhere in
+         this stylesheet: it is a JS template literal, and one would end it. */
+      .hubov textarea { display: block; width: 100%; margin-top: 4px;
+        background: var(--fill); border: 1px solid var(--line); border-radius: 8px;
+        padding: 7px 9px; color: var(--ink); outline: none; resize: vertical;
+        min-height: 92px; max-height: 260px;
+        font: 12px/1.5 ui-monospace, "SF Mono", monospace; }
+      .hubov textarea:focus { border-color: var(--accent); }
+      .hubov .sep { height: 1px; background: var(--line); margin: 16px 0 14px; }
       .hubrow { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
       .hubstat { flex: 1; font-size: 11.5px; color: var(--ink2); }
       .hubstat.ok { color: #46c46b; }
       .hubstat.bad { color: #ff6961; }
       .hubsave { background: var(--accent); color: #fff; border-radius: 8px;
         padding: 6px 14px; font-size: 12px; }
-      @media (hover: hover) { .hubsave:hover { filter: brightness(1.12); } }
+      /* Secondary action beside Save: the same shape in control material, so
+         "Restore defaults" cannot be mistaken for the primary button. */
+      .hubalt { background: var(--ctl); color: var(--ink); border-radius: 8px;
+        padding: 6px 12px; font-size: 12px; }
+      @media (hover: hover) {
+        .hubsave:hover { filter: brightness(1.12); }
+        .hubalt:hover { background: var(--ctl2); color: var(--ink); }
+      }
+      .hubalt:active { background: var(--ctl3); }
 
       /* The dimmed page behind the phone sheet; a tap on it dismisses, like
          tapping outside any iOS sheet. Never shown on desktop. */
@@ -718,6 +737,20 @@ function buildPanel() {
         <div class="hubrow">
           <span class="hubstat" id="hubstat"></span>
           <button class="hubsave" id="hubsave">Save</button>
+        </div>
+        <div class="sep"></div>
+        <div class="lede2">Sites served a Chrome user agent, for the few that
+          refuse Safari. One hostname per line; a bare hostname also covers its
+          subdomains. Everywhere else Safari stays honest. Saving applies at
+          once — reload a page that is already open.</div>
+        <label>Sites served as Chrome
+          <textarea id="uasites" rows="6" spellcheck="false" autocapitalize="off"
+            autocorrect="off" autocomplete="off" placeholder="example.com"></textarea>
+        </label>
+        <div class="hubrow">
+          <span class="hubstat" id="uastat"></span>
+          <button class="hubalt" id="uareset">Restore defaults</button>
+          <button class="hubsave" id="uasave">Save</button>
         </div>
       </div>
       <div class="msgs" id="msgs">
@@ -1219,11 +1252,60 @@ function buildPanel() {
     if (r && r.ok) { el.className = "hubstat ok"; el.textContent = "hub reachable — " + (r.hub || "local"); }
     else { el.className = "hubstat bad"; el.textContent = "hub unreachable" + (r && r.error ? " — " + r.error : ""); }
   }
+  // ── the site list ──
+  // The list is applied by the BACKGROUND page (declarativeNetRequest rules and
+  // the MAIN-world script registration are both background-only APIs), so this
+  // pane hands over raw text and renders whatever comes back normalised. That
+  // keeps one parser, and it means the box shows exactly what is in effect
+  // rather than what was typed.
+  function drawUaResult(r) {
+    const el = $("uastat");
+    if (!r || r.error) {
+      el.className = "hubstat bad";
+      el.textContent = "could not apply" + (r && r.error ? " — " + r.error : "");
+      return;
+    }
+    $("uasites").value = (r.sites || []).join("\n");
+    const scope = (r.status && r.status.scope) || "";
+    const dnrOk = String((r.status && r.status.dnr) || "").startsWith("ok:") ||
+      String((r.status && r.status.dnr) || "").startsWith("no-chrome-sites");
+    const bits = [];
+    bits.push(r.sites && r.sites.length
+      ? r.sites.length + (r.sites.length === 1 ? " site" : " sites")
+      : "no sites — Safari everywhere");
+    if (r.usingDefaults) bits.push("built-in default");
+    if (r.rejected && r.rejected.length) bits.push("ignored: " + r.rejected.slice(0, 3).join(", "));
+    if (scope === "scripting-unavailable") bits.push("header only (no script scoping on this Safari)");
+    else if (String(scope).startsWith("failed:")) bits.push(scope);
+    el.className = "hubstat" + ((r.rejected && r.rejected.length) || !dnrOk || String(scope).startsWith("failed:") ? " bad" : " ok");
+    el.textContent = bits.join(" · ");
+  }
+  async function drawUaSites() {
+    const el = $("uastat");
+    el.className = "hubstat"; el.textContent = "loading…";
+    const r = await browser.runtime.sendMessage({ op: "uaSitesGet" }).catch((e) => ({ error: String(e) }));
+    drawUaResult(r);
+  }
+  $("uasave").onclick = async () => {
+    const el = $("uastat");
+    el.className = "hubstat"; el.textContent = "applying…";
+    const r = await browser.runtime.sendMessage({ op: "uaSitesSet", text: $("uasites").value })
+      .catch((e) => ({ error: String(e) }));
+    drawUaResult(r);
+  };
+  $("uareset").onclick = async () => {
+    const el = $("uastat");
+    el.className = "hubstat"; el.textContent = "restoring…";
+    const r = await browser.runtime.sendMessage({ op: "uaSitesReset" }).catch((e) => ({ error: String(e) }));
+    drawUaResult(r);
+  };
+
   async function drawHub() {
     const st = await browser.storage.local.get(["hubUrl", "hubToken"]).catch(() => ({}));
     $("huburl").value = st.hubUrl || "";
     $("hubtok").value = st.hubToken || "";
     pingHub();
+    drawUaSites();
   }
   $("hubbtn").onclick = () => {
     histov.classList.remove("open");

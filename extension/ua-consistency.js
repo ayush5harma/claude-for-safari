@@ -18,13 +18,21 @@
 // patches present. So: the UA string, exactly like the menu item.
 //
 // IT MUST RUN IN THE PAGE WORLD — an isolated content script's `navigator` is
-// not the page's one. The manifest asks for "world": "MAIN" so the BROWSER
+// not the page's one. The registration asks for world "MAIN" so the BROWSER
 // does that injection, which is the only route a strict
 // Content-Security-Policy cannot refuse (measured on claude.ai in the
 // pre-inversion era: an inline <script> was silently blocked there). The
 // injection is kept as a fallback in case `world` is ignored (pre-16.4
 // Safari), and documentElement gets a data-ua-fix attribute naming the path
 // that actually applied, so "did it run" has an answer rather than a guess.
+//
+// NO SITE CHECK LIVES HERE ANY MORE (0.36). This file used to be injected on
+// <all_urls> and gate itself on a compiled-in list, which is why the list had
+// to ship into every page. Since the list became a user setting, the background
+// page registers this script through scripting.registerContentScripts with
+// `matches` built from it: running at all IS the gate, so an added host is
+// covered and a removed one is not, with no list in the page and no async
+// storage read racing document_start.
 //
 // LAUNCH RACE, ACCEPTED: content scripts are not injected into pages loaded
 // immediately after a cold Safari launch (measured), so the first paint of a
@@ -35,10 +43,10 @@
 (function () {
   "use strict";
 
-  // Only ever ACT on the listed sites. ua-chrome-sites.js and ua-chrome.js
-  // are loaded before this script (manifest order); if either is missing or
-  // garbled, do nothing rather than half-spoof.
-  if (typeof isChromeUASite !== "function" || !isChromeUASite(location.hostname)) return;
+  // The registration decided WHERE; all that is left is WHAT. ua-chrome.js is
+  // listed before this file in the same registration, so its function is
+  // already defined; if it is missing or garbled, do nothing rather than
+  // half-spoof.
   var ua = (typeof chromeUA === "function" && chromeUA()) || "";
   if (!/Chrome\/\d+\./.test(ua)) return;
 
