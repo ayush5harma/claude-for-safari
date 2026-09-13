@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude for Safari Settings</title>
+<style>
+  :root { color-scheme: light dark; --ink: #1f1e1d; --ink2: #6b6862; --line: #dedbd4;
+          --bg: #faf9f5; --field: #ffffff; --accent: #c96442; --ok: #3f7d4e; --bad: #b3452e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink: #ecebe6; --ink2: #a3a09a; --line: #3a3936; --bg: #1f1e1d;
+            --field: #2a2927; --ok: #7fbf8e; --bad: #e0876f; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 28px 20px 40px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 28px 0 6px; }
+  p { color: var(--ink2); margin: 0 0 12px; }
+  textarea { box-sizing: border-box; width: 100%; min-height: 160px; padding: 10px 12px;
+             border: 1px solid var(--line); border-radius: 10px; background: var(--field);
+             color: var(--ink); font: 13px/1.5 ui-monospace, "SF Mono", Menlo, monospace; resize: vertical; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  .stat { flex: 1 1 200px; font-size: 12.5px; color: var(--ink2); }
+  .stat.ok { color: var(--ok); } .stat.bad { color: var(--bad); }
+  button { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--field); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  code { font: 12.5px ui-monospace, "SF Mono", Menlo, monospace; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Claude for Safari</h1>
+  <p>The chat panel's own settings (hub URL and token) stay in the panel's gear.</p>
+
+  <h2>Sites served as Chrome</h2>
+  <p>For the few sites that refuse Safari, or stream only on their Chrome code path.
+    One hostname per line; a bare hostname also covers its subdomains, so
+    <code>browserstack.com</code> covers <code>app-live.browserstack.com</code>.
+    A bare top-level domain is refused, and an international domain must be written
+    in its punycode (<code>xn--</code>) form. Everywhere else Safari stays honest.
+    Saving applies at once; reload a page that is already open.</p>
+  <textarea id="uasites" rows="8" spellcheck="false" autocapitalize="off"
+    autocorrect="off" autocomplete="off" placeholder="example.com"
+    aria-label="Sites served as Chrome, one hostname per line"></textarea>
+  <div class="row">
+    <span class="stat" id="uastat" role="status" aria-live="polite"></span>
+    <button id="uareset" type="button">Restore defaults</button>
+    <button id="uasave" type="button" class="primary">Save</button>
+  </div>
+</main>
+<script src="options.js"></script>
+</body>
+</html>

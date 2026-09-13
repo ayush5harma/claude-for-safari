@@ -718,7 +718,7 @@ function buildPanel() {
     <div class="panel">
       <div class="hdr">
         <img class="spark" src="${SPARK_URL}" alt=""><b>Claude</b>
-        <button class="ctl" id="hubbtn" title="Hub settings" aria-label="Hub settings">${SVG.gear}</button>
+        <button class="ctl" id="hubbtn" title="Settings" aria-label="Settings">${SVG.gear}</button>
         <button class="ctl" id="hist" title="History" aria-label="History">${SVG.clock}</button>
         <button class="ctl" id="fresh" title="New chat" aria-label="New chat">${SVG.fresh}</button>
         <button class="ctl" id="close" title="Close" aria-label="Close">${SVG.close}</button>
@@ -740,7 +740,8 @@ function buildPanel() {
         </div>
         <div class="sep"></div>
         <div class="lede2">Sites served a Chrome user agent, for the few that
-          refuse Safari. One hostname per line; a bare hostname also covers its
+          refuse Safari (also under Safari Settings &gt; Extensions &gt; Claude
+          for Safari &gt; Settings). One hostname per line; a bare hostname also covers its
           subdomains. A bare top-level domain is refused, and an international
           domain must be written in its punycode (xn--) form. Everywhere else
           Safari stays honest. Saving applies at once — reload a page that is

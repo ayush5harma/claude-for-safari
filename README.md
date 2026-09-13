@@ -239,8 +239,10 @@ declarativeNetRequest header rule (`background.js`) and a MAIN-world
 
 ### The site list is a setting
 
-Open the panel, click the **gear**, and edit **Sites served as Chrome** — one
-hostname per line. A bare hostname also covers its subdomains, so `example.com`
+Edit **Sites served as Chrome** in either of two places, which are the same
+setting: **Safari > Settings > Extensions > Claude for Safari > Settings**
+(Settings > Safari > Extensions on iPhone and iPad), or the panel's **gear**.
+One hostname per line. A bare hostname also covers its subdomains, so `example.com`
 matches `app.example.com`. **Restore defaults** puts back the built-in list;
 emptying the box turns the feature off entirely. The same pane is on Mac,
 iPhone and iPad.
@@ -389,7 +391,8 @@ it in place, so every build that saw a new Chrome major dirtied the checkout.)
 
 **`ua-chrome.js` still carries the UA string; the site list no longer lives in
 a file.** Since 0.36 the list is a runtime setting in `browser.storage.local`
-(`uaChromeSites`), edited in the panel's gear, and
+(`uaChromeSites`), edited on the extension's Settings page or in the panel's
+gear (both go through the same background ops), and
 `extension/ua-chrome-sites.js` is its **default and fallback** plus the parser
 and the two builders (the declarativeNetRequest rule, the
 `registerContentScripts` match patterns). A packaging system that wants a
