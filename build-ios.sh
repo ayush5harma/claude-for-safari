@@ -287,7 +287,7 @@ built_app() {
 # other, and is exactly what the profile authorises.
 resign_wildcard() {  # $1 = built .app
   case "$PROFILE_APPID" in *'.*') ;; *) return 0 ;; esac
-  local ent; ent="$(mktemp -t ent).plist"
+  local ent; ent="$(mktemp "${TMPDIR:-/tmp}/ent.XXXXXX").plist"   # full template: `-t prefix` is BSD-only
   security cms -D -i "$PROFILE_FILE" 2>/dev/null | plutil -extract Entitlements xml1 -o "$ent" - || return 0
   local x
   for x in "$1"/PlugIns/*.appex "$1"; do

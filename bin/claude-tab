@@ -90,7 +90,7 @@ EOS
 # logged-in pages, and a predictable path under a shared /tmp is readable by
 # every user on the machine and squattable besides; mktemp gives a fresh 0700
 # directory per run. Removed on exit, after claude has read it.
-CTX_DIR="$(mktemp -d -t claude-tab)"
+CTX_DIR="$(mktemp -d "${TMPDIR:-/tmp}/claude-tab.XXXXXX")"   # full template: `-t prefix` is BSD-only
 trap 'rm -rf "$CTX_DIR"' EXIT
 CTX="$CTX_DIR/tabs-$(date +%Y%m%d-%H%M%S).md"
 

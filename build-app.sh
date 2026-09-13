@@ -88,7 +88,10 @@ REGISTER=$FORCE_REGISTER
 # The generated ua-chrome.js goes HERE, never over the tracked file: the build
 # that wrote it in place rewrote a committed file every time the Chrome major
 # moved, so every build dirtied the checkout.
-STAGE_EXT="$(mktemp -d -t claude-safari-ext)"
+# A full template, not `-t prefix`: that form is BSD-only, and GNU mktemp
+# (first on PATH inside a nix-darwin/home-manager activation, which runs this
+# build) refuses it with "too few X's in template" (measured 2026-09-13).
+STAGE_EXT="$(mktemp -d "${TMPDIR:-/tmp}/claude-safari-ext.XXXXXX")"
 trap 'rm -rf "$STAGE_EXT"' EXIT
 cp -R "$EXT/." "$STAGE_EXT/"
 
