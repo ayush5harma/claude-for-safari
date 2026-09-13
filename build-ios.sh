@@ -287,15 +287,22 @@ built_app() {
 # other, and is exactly what the profile authorises.
 resign_wildcard() {  # $1 = built .app
   case "$PROFILE_APPID" in *'.*') ;; *) return 0 ;; esac
-  local ent; ent="$(mktemp "${TMPDIR:-/tmp}/ent.XXXXXX").plist"   # full template: `-t prefix` is BSD-only
-  security cms -D -i "$PROFILE_FILE" 2>/dev/null | plutil -extract Entitlements xml1 -o "$ent" - || return 0
+  # A private 0700 directory, and the .plist inside it: codesign wants the
+  # extension, and a name mktemp never created, in a shared /tmp (the fallback
+  # when sudo strips TMPDIR), would be open to a symlink race. Full template:
+  # `-t prefix` is BSD-only, and GNU mktemp refuses it.
+  local entdir ent
+  entdir="$(mktemp -d "${TMPDIR:-/tmp}/ent.XXXXXX")" || return 0
+  ent="$entdir/entitlements.plist"
+  security cms -D -i "$PROFILE_FILE" 2>/dev/null | plutil -extract Entitlements xml1 -o "$ent" - \
+    || { rm -rf "$entdir"; return 0; }
   local x
   for x in "$1"/PlugIns/*.appex "$1"; do
     [ -e "$x" ] || continue
     codesign -f -s "$SIGN_ID" --entitlements "$ent" --timestamp=none "$x" >/dev/null 2>&1 \
-      || { echo "  WARNING: re-sign failed for ${x##*/}; the build keeps Xcode's entitlements" >&2; rm -f "$ent"; return 0; }
+      || { echo "  WARNING: re-sign failed for ${x##*/}; the build keeps Xcode's entitlements" >&2; rm -rf "$entdir"; return 0; }
   done
-  rm -f "$ent"
+  rm -rf "$entdir"
   echo "  re-signed with the wildcard profile's entitlements (application-identifier $PROFILE_APPID)"
 }
 # The dev-signed .app zipped as Payload/ IS an ipa: installable as-is (no
