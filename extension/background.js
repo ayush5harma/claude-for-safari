@@ -31,12 +31,55 @@ browser.storage.onChanged.addListener((ch, area) => {
   if (ch.hubUrl) hub.url = ch.hubUrl.newValue || HUB_DEFAULT;
   if (ch.hubToken) hub.token = ch.hubToken.newValue || "";
 });
+// This background page's name to the hub. Safari runs one copy of the
+// extension per profile, every copy polls the same hub, the copies number the
+// same tabs differently, and only one of them can reach any given page's
+// content script (the copy whose content.js ran there first; the run-once
+// guard keeps the others out). The hub routes each call to the copy that can
+// serve it -- see "Several extension instances, one hub" in the bridge -- and
+// this id, fresh per background-page start, is how it tells the copies apart.
+// (crypto.randomUUID is everywhere Safari runs this; the fallback is for the
+// test sandbox, which has no crypto global.)
+const INSTANCE = (typeof crypto !== "undefined" && crypto.randomUUID)
+  ? crypto.randomUUID()
+  : Math.random().toString(36).slice(2) + Date.now().toString(36);
 const hubFetch = (path, opts = {}) => {
-  const o = { ...opts, headers: { ...(opts.headers || {}) } };
+  const o = { ...opts, headers: { ...(opts.headers || {}), "x-claude-instance": INSTANCE } };
   if (hub.token) o.headers.authorization = "Bearer " + hub.token;
   return fetch(hub.url + path, o);
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The content script's answer to a ping, or null: absent (Safari resolves a
+// sendMessage nobody receives with undefined), another instance's, or a page
+// too busy to answer within the bound.
+async function pingTab(tabId, boundMs = 1500) {
+  const ask = browser.tabs.sendMessage(tabId, { op: "ping" }).catch(() => undefined);
+  const r = await Promise.race([ask, sleep(boundMs)]);
+  return r && r.ok ? r : null;
+}
+
+// The toolbar click's hand-off: when this instance cannot reach the clicked
+// page, ask the hub to have the instance that owns it toggle the panel there
+// (the clicked tab is the active tab of the focused window in every
+// instance's view). False when no instance owns the page, or the hub is down,
+// and the caller injects as before.
+async function relayToggle() {
+  try {
+    const r = await hubFetch("/relay", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tool: "toggleActive", args: {} }),
+      // A hub that accepts and never answers must not hang the click.
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!r.ok) return false;
+    const b = await r.json();
+    return !!(b && b.handled);
+  } catch (e) {
+    return false;
+  }
+}
 
 // Default target: the active tab of the last focused window; a call may pin
 // an explicit tabId instead (from claude_safari_tabs).
@@ -56,8 +99,7 @@ async function targetTab(args) {
 // click grants activeTab, so injection works on the clicked tab even before
 // any site-wide permission.
 async function ensureContent(tabId) {
-  const ping = await browser.tabs.sendMessage(tabId, { op: "ping" }).catch(() => undefined);
-  if (ping && ping.ok) return;
+  if (await pingTab(tabId)) return;
   try {
     await browser.tabs.executeScript(tabId, { file: "content.js" });
   } catch (e) {
@@ -86,9 +128,14 @@ async function askContent(tabId, msg) {
 }
 
 const handlers = {
-  async tabs() {
+  async tabs(args) {
     const tabs = await browser.tabs.query({});
-    return tabs.map((t) => ({
+    // `owned` (this instance's ping is answered) is for the hub, which asks
+    // for it (probe) to merge every profile's listing and strips it before a
+    // caller sees the list. The panel's @-picker lists without it: no pings.
+    const probe = !!(args && args.probe);
+    const owned = probe ? await Promise.all(tabs.map((t) => pingTab(t.id).then((p) => !!p))) : null;
+    return tabs.map((t, i) => ({
       tabId: t.id, windowId: t.windowId, active: t.active,
       url: t.url, title: t.title,
       // The tab's OWN icon, which Safari has already fetched. The panel used to
@@ -97,7 +144,27 @@ const handlers = {
       // was drawn. May be absent (a tab Safari has not loaded, a site with no
       // icon); the panel then draws no icon.
       favIconUrl: t.favIconUrl || "",
+      ...(probe ? { owned: owned[i] } : {}),
     }));
+  },
+
+  // The hub's two routing probes (see INSTANCE). probeActive: which tab this
+  // instance calls active, and whether it can reach it. toggleActive: toggle
+  // the panel in the active tab if this instance owns it -- the receiving end
+  // of another instance's relayed toolbar click.
+  async probeActive() {
+    const tabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tabs.length) return { tabId: null, owned: false };
+    return { tabId: tabs[0].id, owned: !!(await pingTab(tabs[0].id)) };
+  },
+
+  async toggleActive() {
+    const tabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tabs.length) return { handled: false };
+    const ping = await pingTab(tabs[0].id);
+    if (!ping) return { handled: false };
+    await browser.tabs.sendMessage(tabs[0].id, { op: "togglePanel", withAllTabs: !!ping.hidden });
+    return { handled: true };
   },
 
   async read(args) {
@@ -263,11 +330,19 @@ loop();
 // which runs the real `claude -p` with --resume for multi-turn memory.
 browser.browserAction.onClicked.addListener(async (tab) => {
   try {
-    await ensureContent(tab.id);
+    let ping = await pingTab(tab.id);
+    if (!ping) {
+      // Not this instance's page (see INSTANCE): another profile's copy ran
+      // content.js here first and is the only one that can reach the panel.
+      // Hand the click to it through the hub; only when no copy owns the page
+      // does this one inject and take it.
+      if (await relayToggle()) { pollBadge(""); return; }
+      await ensureContent(tab.id);
+      ping = await pingTab(tab.id);
+    }
     // In Safari's Tab Overview the active page reports itself hidden — the
     // only overview signal an extension gets. A click from there means "chat
     // about all my tabs", so the panel opens with every tab attached.
-    const ping = await browser.tabs.sendMessage(tab.id, { op: "ping" }).catch(() => null);
     const fromOverview = !!(ping && ping.hidden);
     await browser.tabs.sendMessage(tab.id, { op: "togglePanel", withAllTabs: fromOverview });
     pollBadge("");

@@ -72,7 +72,9 @@ Then, the steps no script can take for you:
    Safari > Develop > **Allow Unsigned Extensions** (see
    [Signing](#signing-and-what-permanent-means)).
 3. Repeat step 2 **per Safari profile**. Each profile runs its own extension
-   instance with its own grants.
+   instance with its own grants; the hub routes every call to the instance
+   that can reach the tab (see [Limits](#the-mcp-server)), so enabling it in
+   all of them is fine.
 
 `bash install.sh --uninstall` reverses all of it.
 
@@ -154,13 +156,33 @@ the current window), `claude_safari_eval`, `claude_safari_screenshot`. A
 `tabId` from `tabs` pins a call to one tab; there is no close-tab tool.
 
 Limits worth knowing: the extension must be enabled and granted the site in the
-profile you want driven; one hub serves every profile's extension instance and
-the first to poll answers a call, so with the extension on in two profiles a
-call can land in the other one — turn it off in the profile that should stay
-out, or pin a `tabId`; parallel callers share that one queue, each call
-serialised; a tab Safari has not loaded answers `read` from a fetched copy
-(the background page refetches the URL with the profile's cookies and reduces
-the HTML to text).
+profile you want driven; parallel callers share one queue per extension
+instance, each call serialised; a tab Safari has not loaded answers `read`
+from a fetched copy (the background page refetches the URL with the profile's
+cookies and reduces the HTML to text).
+
+Safari runs one copy of the extension **per profile**, and every copy polls the
+same hub. Measured on Safari 27 with three profiles (2026-09-15): the copies
+see the same windows and tabs but number them differently, a profile with no
+window of its own lists nothing, and for any one page exactly one copy can
+reach its content script — the copy whose `content.js` ran there first (the
+run-once guard keeps the others out). Until 0.38 the hub handed each call to
+whichever copy polled last, so the same tab worked from one call and failed
+the next ("Tab not found", or "content script did not answer after
+injection"), and the workaround was to leave the extension on in one profile
+only. Since 0.38 each background page names itself to the hub
+(`x-claude-instance`), the hub gives each a slot and hands out tab ids as
+`slot * 1000000 + Safari's id`, with the slots starting at a random base per
+hub run, so a `tabId` is opaque and only ever comes from `claude_safari_tabs`.
+That listing merges every copy's view by which copy can reach each tab, a call
+with no `tabId` goes to the copy that owns the active tab, and a toolbar click
+in a copy that cannot reach the page is relayed through the hub (`/relay`) to
+the copy that can. A `tabId` whose copy stopped polling (its profile closed,
+its background page restarted, the hub restarted) is refused with a message to
+list tabs again, never tried on another copy. `GET /status` shows one row per
+polling copy. A hub shared by several devices ([HOSTING.md](HOSTING.md))
+merges every device's copies into one list the same way; that is the shape of
+a shared hub, not a bug.
 
 `SAFARI-MCP-EVALUATION.md` is a measured, tool-by-tool comparison with Apple's
 own `safaridriver --mcp`, which is a WebDriver session: its own automation
@@ -410,7 +432,7 @@ Identifiers, and how to change them:
   `launchd/com.ayushsharma.claude-safari-bridge.plist.template`, its `Label`
   key, and `LABEL` in `install.sh`. The only other place that string appears is
   the "bridge unreachable" hint in `extension/background.js`.
-- Hub port `29170` and its caller gate: `/pull`, `/result` and `/chat` (the
+- Hub port `29170` and its caller gate: `/pull`, `/result`, `/relay` and `/chat` (the
   extension's endpoints) answer **POST only** and accept only a missing Origin
   or a `safari-web-extension://` one; `/call` and `/status` (the CLI side)
   require both a missing Origin and a missing `Sec-Fetch-Site`; `/health` is a
@@ -494,7 +516,7 @@ the page's text is in the prompt, so it can shape what Claude says to you.
 
 The hub binds `127.0.0.1` only by default.
 
-- `/pull`, `/result` and `/chat` — the extension's endpoints — answer **POST
+- `/pull`, `/result`, `/relay` and `/chat` — the extension's endpoints — answer **POST
   only** and reject any request carrying a web page's Origin. The method is
   half the protection: a page can reach any GET with `<img>`, `<script>`,
   prefetch or a `no-cors` fetch and send **no Origin at all** (measured on

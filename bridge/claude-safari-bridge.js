@@ -21,7 +21,7 @@
 //     "Authorization: Bearer <token>" (the extension sends it from its hub
 //     settings) — and the hub refuses to start exposed without one. TLS is
 //     the reverse proxy's job (see HOSTING.md).
-//   - /pull, /result and /chat (the extension's endpoints) answer POST ONLY and
+//   - /pull, /result, /relay and /chat (the extension's endpoints) answer POST ONLY and
 //     reject any web-page Origin. The method is the load-bearing half: a page
 //     can reach a GET with <img>/<script>/no-cors fetch and send NO Origin at
 //     all, but it cannot make a cross-origin POST without one. See the measured
@@ -47,6 +47,92 @@ const CALL_TIMEOUT_MS = 90000; // extension must answer within this
 const CHAT_TIMEOUT_MS = 300000; // a headless claude turn can legitimately take minutes
 const MAX_QUEUE = 100;         // undelivered tool calls kept before dropping the oldest
 const MAX_BODY = 90e6;         // an attachment-carrying /chat turn is the large case
+
+// ── Several extension instances, one hub ──────────────────────────────────────
+// Safari runs one copy of the extension PER PROFILE, and every copy long-polls
+// this hub. Measured 2026-09-15 (Safari 27, three profiles, nine tabs): the
+// copies see the SAME windows and tabs but NUMBER THEM DIFFERENTLY (324/322/...
+// from one instance, 325/323/... from the next, in windows 312 and 313), a
+// profile with no window of its own lists nothing at all, and for any one tab
+// exactly ONE instance can reach its content script -- the one whose content.js
+// ran first in that page; the run-once guard in content.js keeps every later
+// copy out, and executeScript from another copy is a no-op behind it. So a
+// call handed to "whichever instance polled last" failed on a per-tab lottery:
+// tabs.get() with a foreign id ("Tab not found"), or a ping nothing answered
+// ("content script did not answer after injection"), the same page working
+// from one click and not the next. Turning the extension off in every profile
+// but one was the documented workaround; this is the fix.
+//
+// The hub tells instances apart by the x-claude-instance header each
+// background page sends (a UUID minted when it starts), gives each a SLOT, and
+// hands callers tab ids of slot * TAB_SLOT + Safari's own id, so a tabId that
+// came from `tabs` routes back to the instance that numbered it. `tabs` fans
+// out to every live instance and merges by OWNERSHIP: each instance marks the
+// tabs it can reach (its ping is answered), the merged list takes an owned tab
+// from its owner, and a tab nobody owns yet (not loaded, a Safari page) once,
+// from the instance that sees the most. A call with no tabId goes to the
+// instance that owns the active tab, and the toolbar click relays through
+// /relay the same way. Slots start at a random base PER HUB RUN: the hub
+// restarts routinely (launchd, tools-update, a session's respawn), the
+// profiles race for slots again, and an id a session still holds from the
+// previous run must fall into "no longer polling" rather than onto whichever
+// profile now sits in that slot. So a caller's tab ids are never Safari's raw
+// numbers; they are opaque and come from `tabs`. An extension too old to send
+// the header is one instance named "legacy". A hub shared by more than one
+// device (HOSTING.md) merges every device's copies into one list; that is the
+// cost of the hosted shape, and the README says so.
+const TAB_SLOT = 1e6;
+const SLOT_BASE = 1 + crypto.randomInt(999);  // this run's first slot
+const LIVE_MS = PULL_HOLD_MS + 5000;      // an idle instance re-parks within PULL_HOLD_MS
+const PROBE_TIMEOUT_MS = 8000;            // a fan-out step to a live instance
+const FORGET_MS = 10 * 60 * 1000;         // an instance silent this long is dropped
+const encodeTabId = (slot, id) =>
+  (typeof id === "number" && Number.isFinite(id) && id >= 0 ? slot * TAB_SLOT + id : id);
+const decodeTabId = (n) => ({ slot: Math.floor(n / TAB_SLOT), id: n % TAB_SLOT });
+
+// One list from several instances' listings ({ slot, tabs }), each tab as the
+// extension reports it ({ tabId, windowId, active, url, title, favIconUrl,
+// owned }). Instances agree on nothing but what a tab shows and where it sits:
+// tabs.query({}) lists every window's tabs in window order then tab order for
+// every instance alike, so a tab is matched across listings by its POSITION in
+// the whole listing plus url and title (a tab's index within its window is not
+// enough: two windows both start at index 0). The largest listing sets the
+// order, each of its tabs is taken from the instance that owns it, and owned
+// tabs it never saw are appended.
+function mergeTabListings(listings) {
+  const live = (listings || []).filter((l) => l && Array.isArray(l.tabs));
+  if (!live.length) return [];
+  const key = (t, pos) => [pos, t.url || "", t.title || ""].join("\u0000");
+  const pub = (slot, t) => {
+    const { owned, index, ...rest } = t;
+    return { ...rest, tabId: encodeTabId(slot, t.tabId), windowId: encodeTabId(slot, t.windowId) };
+  };
+  const primary = live.slice().sort((a, b) => b.tabs.length - a.tabs.length || a.slot - b.slot)[0];
+  const ownedElsewhere = new Map();
+  for (const l of live) {
+    if (l === primary) continue;
+    l.tabs.forEach((t, pos) => { if (t.owned && !ownedElsewhere.has(key(t, pos))) ownedElsewhere.set(key(t, pos), { slot: l.slot, tab: t }); });
+  }
+  const out = [];
+  primary.tabs.forEach((t, pos) => {
+    if (t.owned) { out.push(pub(primary.slot, t)); return; }
+    const o = ownedElsewhere.get(key(t, pos));
+    if (o) { ownedElsewhere.delete(key(t, pos)); out.push(pub(o.slot, o.tab)); } else out.push(pub(primary.slot, t));
+  });
+  for (const o of ownedElsewhere.values()) out.push(pub(o.slot, o.tab));
+  return out;
+}
+
+// Which instance takes a call that names no tab: the one that owns the active
+// tab; failing that, one that at least sees an active tab (a profile with no
+// window sees none and would answer "no active Safari tab"); then the lowest
+// slot, which is the longest-polling one. `probes` is [{ slot, probe }] with
+// probe = { tabId, owned } or null when the instance did not answer.
+function pickActiveSlot(probes) {
+  const score = (p) => (p && p.owned ? 2 : 0) + (p && p.tabId != null ? 1 : 0);
+  const best = (probes || []).slice().sort((a, b) => score(b.probe) - score(a.probe) || a.slot - b.slot)[0];
+  return best ? best.slot : null;
+}
 
 // WHICH BROWSER TOOLS A PANEL TURN MAY USE. The panel's `claude -p` is headless
 // and cannot ask, so whatever is listed here is pre-approved for a turn whose
@@ -178,10 +264,38 @@ async function saveAttachments(list) {
 function runHub() {
   pruneAttachments();
   writeChatMcpConfig();
-  const queue = [];               // calls not yet handed to the extension
-  const waiters = new Map();      // id -> { respond, timer }
-  let parkedPull = null;          // the extension's waiting /pull response
+  const anyQueue = [];            // calls for whichever instance polls next
+  const waiters = new Map();      // id -> { respond, timer, inst }
+  const instances = new Map();    // instance id -> { iid, slot, parked, queue, lastPullAt }
+  let nextSlot = SLOT_BASE;
   let lastPullAt = 0;
+
+  // The instance behind a request, registered on first sight. Slots are
+  // handed out in polling order and never reused within one hub run.
+  const instanceFor = (req) => {
+    const iid = String(req.headers["x-claude-instance"] || "legacy").slice(0, 64);
+    let inst = instances.get(iid);
+    if (!inst) {
+      inst = { iid, slot: nextSlot++, parked: null, queue: [], lastPullAt: 0 };
+      instances.set(iid, inst);
+    }
+    return inst;
+  };
+  // Live: parked right now, or polled within one hold period (an idle
+  // instance re-parks every PULL_HOLD_MS; one that stopped -- Safari quit, a
+  // background page recycled under a new id -- drops out after one).
+  const liveInstances = () => {
+    const now = Date.now();
+    return [...instances.values()].filter((i) => i.parked || now - i.lastPullAt < LIVE_MS).sort((a, b) => a.slot - b.slot);
+  };
+  const pruneInstances = () => {
+    const now = Date.now();
+    for (const inst of instances.values()) {
+      if (inst.parked || now - inst.lastPullAt < FORGET_MS) continue;
+      for (const c of inst.queue) settle(c.id, { error: "the Safari extension instance this call was routed to stopped polling" });
+      instances.delete(inst.iid);
+    }
+  };
 
   const json = (res, code, obj) => {
     const body = JSON.stringify(obj);
@@ -251,36 +365,124 @@ function runHub() {
     return got.length === want.length && crypto.timingSafeEqual(got, want);
   };
 
-  // Answer a waiter once and clean up everything attached to its id.
+  // Answer a waiter once and clean up everything attached to its id. The
+  // answer carries the instance that took the call, so the router can stamp
+  // its slot onto any tab id in the result.
   const settle = (id, payload) => {
     const w = waiters.get(id);
     if (!w) return false;
     waiters.delete(id);
     clearTimeout(w.timer);
-    w.respond(payload);
+    w.respond({ result: payload.result, error: payload.error, status: payload.status, inst: w.inst || null });
     return true;
   };
   const dequeue = (id) => {
-    const i = queue.findIndex((c) => c.id === id);
-    if (i >= 0) queue.splice(i, 1);
+    for (const q of [anyQueue, ...[...instances.values()].map((i) => i.queue)]) {
+      const i = q.findIndex((c) => c.id === id);
+      if (i >= 0) q.splice(i, 1);
+    }
   };
 
-  const handToExtension = (call) => {
-    if (parkedPull) {
-      const res = parkedPull; parkedPull = null;
+  // Hand one call to one parked /pull, remembering who took it.
+  const deliver = (inst, res, call) => {
+    const w = waiters.get(call.id);
+    if (w) w.inst = inst;
+    json(res, 200, call);
+  };
+
+  // `inst` null means any instance: the next one to poll takes it, which is
+  // also how a hub with no instance yet (Safari still starting) behaves.
+  const handToInstance = (inst, call) => {
+    const target = inst || liveInstances().find((i) => i.parked) || null;
+    if (target && target.parked) {
+      const res = target.parked; target.parked = null;
       clearTimeout(res._holdTimer);
-      json(res, 200, call);
+      deliver(target, res, call);
       return;
     }
-    queue.push(call);
+    const q = inst ? inst.queue : anyQueue;
+    q.push(call);
     // Bounded, drop-oldest. With no extension polling, an unbounded queue grows
     // for as long as anything calls, and every entry it holds is a tool call
     // some caller is still blocked on; dropping one has to answer that caller
     // rather than leave it waiting out the full timeout.
-    while (queue.length > MAX_QUEUE) {
-      const dropped = queue.shift();
+    while (q.length > MAX_QUEUE) {
+      const dropped = q.shift();
       settle(dropped.id, { error: "dropped: the hub's call queue is full (" + MAX_QUEUE + ") and the Safari extension is not polling" });
     }
+  };
+
+  const EXT_TIMEOUT = "Safari extension did not respond — is 'Claude for Safari' enabled in Safari Settings > Extensions, with Safari running?";
+  // One call to one instance (or to any), resolved with { result | error,
+  // status, inst }; never rejects. The timeout takes the call OUT of its queue
+  // too: deleting only the waiter left a timed-out call sitting there, and the
+  // next poll handed it to the extension anyway -- a navigate that had already
+  // answered 504 was executed minutes later, in whatever tab was current then.
+  const dispatch = (inst, tool, args, timeoutMs = CALL_TIMEOUT_MS) => new Promise((resolve) => {
+    const id = crypto.randomUUID();
+    const timer = setTimeout(() => {
+      waiters.delete(id);
+      dequeue(id);
+      resolve({ error: EXT_TIMEOUT, status: 504, inst });
+    }, timeoutMs);
+    waiters.set(id, { respond: resolve, timer, inst });
+    handToInstance(inst, { id, tool, args });
+  });
+
+  // One call to each of several instances, resolved EARLY as soon as one
+  // answer satisfies `done` (the owner has spoken; nobody else needs to), else
+  // when all have answered or timed out. Results are positional; a slot that
+  // was not waited for is null.
+  const fanOut = (insts, tool, args, done) => new Promise((resolve) => {
+    const out = insts.map(() => null);
+    let left = insts.length;
+    if (!left) return resolve(out);
+    insts.forEach((inst, i) => dispatch(inst, tool, args, PROBE_TIMEOUT_MS).then((r) => {
+      out[i] = r;
+      left -= 1;
+      if (left === 0 || (done && done(r))) resolve(out);
+    }));
+  });
+
+  // The routing described at TAB_SLOT. Returns what /call answers with.
+  const withSlot = (r) => {
+    if (!r || !r.inst || !r.result || typeof r.result !== "object") return r;
+    if (typeof r.result.tabId !== "number") return r;
+    return { ...r, result: { ...r.result, tabId: encodeTabId(r.inst.slot, r.result.tabId) } };
+  };
+  const routeCall = async (tool, args) => {
+    pruneInstances();
+    const live = liveInstances();
+    const probeArgs = { ...args, probe: true };   // `tabs` marks ownership only when asked
+    if (tool === "tabs") {
+      if (live.length <= 1) {
+        const r = await dispatch(live[0] || null, "tabs", probeArgs);
+        if (r.error || !Array.isArray(r.result)) return r;
+        return { ...r, result: mergeTabListings([{ slot: r.inst ? r.inst.slot : SLOT_BASE, tabs: r.result }]) };
+      }
+      const rs = await fanOut(live, "tabs", probeArgs);
+      const listings = rs.map((r, i) => ({ slot: live[i].slot, tabs: r && Array.isArray(r.result) ? r.result : null }))
+        .filter((l) => l.tabs);
+      // Every instance failed: say so, as one instance always did, rather than
+      // report a Safari with no tabs.
+      if (!listings.length) return rs.find((r) => r && r.error) || { error: "no extension instance answered" };
+      return { result: mergeTabListings(listings) };
+    }
+    if (typeof args.tabId === "number") {
+      const { slot, id } = decodeTabId(args.tabId);
+      const inst = live.find((i) => i.slot === slot);
+      if (inst) return withSlot(await dispatch(inst, tool, { ...args, tabId: id }));
+      // Not this run's slot, or a slot nobody polls any more: the id is stale.
+      // Never strip the slot and try the raw id on whoever is there -- the
+      // instances number the same tabs one apart, so that runs the call in a
+      // neighbouring tab of another profile.
+      return { error: "tab " + args.tabId + " was listed by an extension instance that is no longer polling (its Safari profile closed, its background page restarted, or the hub restarted); run claude_safari_tabs again" };
+    }
+    if (live.length <= 1) return withSlot(await dispatch(live[0] || null, tool, args));
+    const probes = await fanOut(live, "probeActive", {}, (r) => !!(r && r.result && r.result.owned));
+    const slot = pickActiveSlot(live.map((inst, i) => ({ slot: inst.slot, probe: probes[i] && probes[i].result || null })));
+    const inst = live.find((i) => i.slot === slot) || live[0];
+    return withSlot(await dispatch(inst, tool, args));
   };
 
   const readBody = (req) => new Promise((resolve, reject) => {
@@ -318,38 +520,49 @@ function runHub() {
       }
       if (req.method === "POST" && req.url === "/pull") {
         if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
-        lastPullAt = Date.now();
-        if (queue.length) return json(res, 200, queue.shift());
-        if (parkedPull) { clearTimeout(parkedPull._holdTimer); parkedPull.writeHead(204); parkedPull.end(); }
-        parkedPull = res;
+        pruneInstances();
+        const inst = instanceFor(req);
+        inst.lastPullAt = lastPullAt = Date.now();
+        // Calls for anyone first, then this instance's own; otherwise park,
+        // one parked /pull per instance (a second one from the same instance
+        // releases the first).
+        const next = anyQueue.length ? anyQueue.shift() : inst.queue.length ? inst.queue.shift() : null;
+        if (next) return deliver(inst, res, next);
+        if (inst.parked) { const old = inst.parked; inst.parked = null; clearTimeout(old._holdTimer); old.writeHead(204); old.end(); }
+        inst.parked = res;
         res._holdTimer = setTimeout(() => {
-          if (parkedPull === res) { parkedPull = null; res.writeHead(204); res.end(); }
+          if (inst.parked === res) { inst.parked = null; res.writeHead(204); res.end(); }
         }, PULL_HOLD_MS);
-        req.on("close", () => { if (parkedPull === res) parkedPull = null; });
+        req.on("close", () => { if (inst.parked === res) inst.parked = null; });
         return;
       }
       if (req.method === "POST" && req.url === "/result") {
         if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
         const body = await readBody(req);
+        // Only the instance a call was routed to may answer it.
+        const w = waiters.get(body.id);
+        if (w && w.inst && w.inst !== instanceFor(req)) return json(res, 403, { error: "not this instance's call" });
         settle(body.id, body);
         return json(res, 200, { ok: true });
       }
       if (req.method === "POST" && req.url === "/call") {
         if (!cliOriginOk(req)) return json(res, 403, { error: "forbidden" });
         const body = await readBody(req);
-        const id = crypto.randomUUID();
-        const timer = setTimeout(() => {
-          waiters.delete(id);
-          // Take the call OUT of the queue too. Deleting only the waiter left a
-          // timed-out call sitting there, and the next poll handed it to the
-          // extension anyway: a navigate that had already answered 504 was
-          // executed minutes later, in whatever tab was current by then.
-          dequeue(id);
-          json(res, 504, { error: "Safari extension did not respond — is 'Claude for Safari' enabled in Safari Settings > Extensions, with Safari running?" });
-        }, CALL_TIMEOUT_MS);
-        waiters.set(id, { respond: (r) => json(res, 200, r), timer });
-        handToExtension({ id, tool: body.tool, args: body.args || {} });
-        return;
+        const out = await routeCall(String(body.tool || ""), body.args || {});
+        if (out.error) return json(res, out.status || 200, { error: out.error });
+        return json(res, 200, { result: out.result });
+      }
+      // The toolbar click's hand-off (see TAB_SLOT): the instance that was
+      // clicked cannot reach the page, so every OTHER live instance is asked to
+      // toggle the panel in the active tab, and the one that owns it does.
+      if (req.method === "POST" && req.url === "/relay") {
+        if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
+        const sender = instanceFor(req);
+        const body = await readBody(req);
+        if (body.tool !== "toggleActive") return json(res, 400, { error: "relay: unknown tool" });
+        const others = liveInstances().filter((i) => i !== sender);
+        const rs = await fanOut(others, "toggleActive", body.args || {}, (r) => !!(r && r.result && r.result.handled));
+        return json(res, 200, { handled: rs.some((r) => r && r.result && r.result.handled) });
       }
       if (req.method === "POST" && req.url === "/chat") {
         // The extension's in-page chat panel. Each turn runs `claude -p`; the
@@ -443,11 +656,14 @@ function runHub() {
       }
       if (req.method === "GET" && req.url === "/status") {
         if (!cliOriginOk(req)) return json(res, 403, { error: "forbidden" });
+        const live = liveInstances();
         return json(res, 200, {
           ok: true,
           extensionSeenMsAgo: lastPullAt ? Date.now() - lastPullAt : null,
           panelTools: PANEL_TOOLS,
-          queued: queue.length,
+          queued: anyQueue.length + live.reduce((n, i) => n + i.queue.length, 0),
+          // One row per polling extension instance (one per Safari profile).
+          instances: live.map((i) => ({ slot: i.slot, seenMsAgo: Date.now() - i.lastPullAt, parked: !!i.parked })),
         });
       }
       json(res, 404, { error: "not found" });
@@ -584,5 +800,10 @@ function runMcp() {
   }
 }
 
-if (process.argv.includes("--serve")) runHub();
-else runMcp();
+if (require.main === module) {
+  if (process.argv.includes("--serve")) runHub();
+  else runMcp();
+} else {
+  // The pure routing pieces, for test/hub-routing.test.js.
+  module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot };
+}
