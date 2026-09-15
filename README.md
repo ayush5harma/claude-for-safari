@@ -139,6 +139,13 @@ A `!` badge on the toolbar button means the page needs one reload or the site
 lacks an access grant (hover the button for the exact reason). Chat turns
 inherit the environment of the process running the hub.
 
+The panel's stylesheet is a constructed `CSSStyleSheet` adopted by the shadow
+root, not a `<style>` element, and its markup carries no `style=""`
+attributes: a page whose Content-Security-Policy sets `style-src` without
+`'unsafe-inline'` (claude.ai does) blocks both, even inside a closed shadow
+root, and the panel rendered as bare markup there until 0.39. CSSOM
+construction is not governed by `style-src`.
+
 ## The claude-safari MCP bridge
 
 `bridge/claude-safari-bridge.js` is one file with two modes. `--serve` is the
@@ -154,6 +161,15 @@ Tools: `claude_safari_tabs`, `claude_safari_read`, `claude_safari_click`,
 `claude_safari_fill`, `claude_safari_navigate` (`newTab: true` opens a tab in
 the current window), `claude_safari_eval`, `claude_safari_screenshot`. A
 `tabId` from `tabs` pins a call to one tab; there is no close-tab tool.
+
+One more op is reachable at the hub but is not an MCP tool: `diag`.
+`curl -s -XPOST 127.0.0.1:29170/call -d '{"tool":"diag","args":{"tabId":N}}'`
+reports, for one tab, which extension instance answered (its base URL names
+the profile's storage directory), whether that instance's ping to the page is
+answered and how fast, and what `tabs.executeScript` sees in the page's
+content world (the content script's run-once state, whether the extension API
+is present). It is the first thing to run when a page says "content script
+did not answer after injection".
 
 Limits worth knowing: the extension must be enabled and granted the site in the
 profile you want driven; parallel callers share one queue per extension

@@ -7,8 +7,16 @@
 // has it would double-register the message listener — every togglePanel
 // would then open AND close the panel in one click.
 (() => {
-if (window.__claudeSafariContent) return;
-window.__claudeSafariContent = true;
+// The guard is a STATE, not a flag (0.39): only "ready" -- the message
+// listener below is installed -- stops a second run. A run that set a flag
+// and then threw before its listener existed used to poison the page for
+// good: every later injection returned here, every ping went unanswered,
+// and the toolbar showed "content script did not answer after injection"
+// with no way back but a reload. So anything but "ready" is re-run, and the
+// listener is installed right after the tool ops, ahead of everything the
+// panel needs, so the ops survive a panel-side failure.
+if (window.__claudeSafariContent === "ready") return;
+window.__claudeSafariContent = "loading";
 
 // ── Tool ops (driven by Claude Code sessions via the bridge) ─────────────────
 
@@ -92,6 +100,22 @@ const ops = {
   },
 };
 
+// Installed HERE, before the panel's constants and functions, so a failure
+// anywhere below leaves ping/read/click/fill/eval working (togglePanel then
+// fails on its own and says why). togglePanel is a function declaration, so
+// it is already hoisted; ops is the table above.
+browser.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.op === "togglePanel") return Promise.resolve(togglePanel(msg));
+  const fn = msg && ops[msg.op];
+  if (!fn) return undefined;   // not ours
+  try {
+    return Promise.resolve(fn(msg));
+  } catch (e) {
+    return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+  }
+});
+window.__claudeSafariContent = "ready";
+
 // ── Chat panel ───────────────────────────────────────────────────────────────
 // Design matched to Claude for Chrome: near-black ground, assistant text with
 // no bubble, user messages in soft cards, a floating rounded composer card
@@ -112,13 +136,19 @@ let tabChips = [];      // {tabId, title, url}
 const PANEL_FOOTPRINT = 360;
 // Under 700px the panel is a full-width SHEET (see the phone-layout CSS), so
 // shoving the page right-ward would just wedge a hidden margin under it.
-const NARROW = window.matchMedia("(max-width: 700px)");
+// A media query that cannot throw at load: a page (or a world) without
+// matchMedia gets a query that never matches and takes listeners quietly.
+function mediaQuery(q) {
+  try { const m = window.matchMedia(q); if (m) return m; } catch (e) {}
+  return { matches: false, addEventListener() {}, removeEventListener() {} };
+}
+const NARROW = mediaQuery("(max-width: 700px)");
 // Coarse pointer = a fingertip (iPhone, and an iPad with no trackpad). Gates
 // the touch BEHAVIOURS in buildPanel — what the return key does, when the
 // composer auto-focuses — independently of width: an iPad keeps the side-pane
 // layout and still needs the finger rules. Sizing lives in the stylesheet's
 // (pointer: coarse) block for the same reason.
-const TOUCH = window.matchMedia("(pointer: coarse)");
+const TOUCH = mediaQuery("(pointer: coarse)");
 // On a phone the panel is presented like an iOS sheet: inset from the top by
 // this much (the page shows, dimmed, above the rounded top corners), so the
 // silhouette matches the system sheets the user sees everywhere else in iOS.
@@ -140,7 +170,7 @@ function pushPage(on) {
 }
 
 // The real Claude spark artwork, shipped in the bundle (web_accessible_resources).
-const SPARK_URL = browser.runtime.getURL("images/spark.png");
+const SPARK_URL = (() => { try { return browser.runtime.getURL("images/spark.png"); } catch (e) { return ""; } })();
 
 
 const SVG = {
@@ -214,12 +244,34 @@ function faviconImg(favIconUrl, cls) {
   return img;
 }
 
+// The panel's stylesheet goes in as a CONSTRUCTED sheet, never as a <style>
+// element: a page whose Content-Security-Policy has a style-src without
+// 'unsafe-inline' blocks a <style> element's text even inside a closed shadow
+// root (measured on claude.ai, 2026-09-15 -- an inline <style> probe did not
+// apply there while it did on Calendar and Slack), and the panel rendered as
+// bare markup: the spark at natural size, unstyled controls, a visible file
+// input. CSSOM construction is not governed by style-src. The element is the
+// fallback for a WebKit without adoptedStyleSheets (before 16.4). For the same
+// reason the markup carries no style="" attribute: those are inline styles
+// too, and the file input is hidden from the sheet instead.
+function adoptStyles(root, css) {
+  try {
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(css);
+    root.adoptedStyleSheets = [sheet];
+    return "constructed";
+  } catch (e) {}
+  const st = document.createElement("style");
+  st.textContent = css;
+  root.prepend(st);
+  return "element";
+}
+
 function buildPanel() {
   panelHost = document.createElement("div");
   panelHost.id = "claude-safari-panel-host";
   const root = panelHost.attachShadow({ mode: "closed" });
-  root.innerHTML = `
-    <style>
+  const css = `
       /* Native-material design: the panel is built like a Safari sidebar —
          translucent system-gray with backdrop blur, hairlines, system accent,
          both appearances via prefers-color-scheme — not a web widget. The one
@@ -713,7 +765,9 @@ function buildPanel() {
         .hubov label { font-size: 12.5px; }
         .hubstat { font-size: 13px; }
       }
-    </style>
+      #file { display: none; }
+  `;
+  root.innerHTML = `
     <div class="scrim" id="scrim"></div>
     <div class="panel">
       <div class="hdr">
@@ -786,9 +840,10 @@ function buildPanel() {
             <button class="send" id="send" title="Send" aria-label="Send">${SVG.up}</button>
           </div>
         </div>
-        <input type="file" id="file" multiple accept="image/*,video/*" style="display:none">
+        <input type="file" id="file" multiple accept="image/*,video/*">
       </div>
     </div>`;
+  adoptStyles(root, css);
 
   const $ = (id) => root.getElementById(id);
   const msgs = $("msgs"), input = $("in"), chips = $("chips"),
@@ -1486,16 +1541,5 @@ function togglePanel(msg) {
   }
   return { open: !!panelHost };
 }
-
-browser.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.op === "togglePanel") return Promise.resolve(togglePanel(msg));
-  const fn = msg && ops[msg.op];
-  if (!fn) return undefined;   // not ours
-  try {
-    return Promise.resolve(fn(msg));
-  } catch (e) {
-    return Promise.reject(e instanceof Error ? e : new Error(String(e)));
-  }
-});
 
 })();

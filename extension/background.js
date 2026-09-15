@@ -167,6 +167,32 @@ const handlers = {
     return { handled: true };
   },
 
+  // One tab as this instance sees it, for a curl at the hub
+  // (POST /call {"tool":"diag","args":{"tabId":N}}); not an MCP tool. Which
+  // instance answered (its base URL names the profile's storage directory),
+  // whether its ping is answered and how fast, and what tabs.executeScript can
+  // see of the page's content world: the run-once state and whether the
+  // extension API is present there. This is what "content script did not
+  // answer after injection" could never say.
+  async diag(args) {
+    const tab = await targetTab(args);
+    const t0 = Date.now();
+    const ping = await pingTab(tab.id, 3000);
+    const pingMs = Date.now() - t0;
+    let world = null, worldError = null;
+    try {
+      const r = await browser.tabs.executeScript(tab.id, { code:
+        "({ state: String(window.__claudeSafariContent), api: typeof browser, href: location.href, ready: document.readyState })" });
+      world = Array.isArray(r) ? r[0] : r;
+    } catch (e) {
+      worldError = String((e && e.message) || e);
+    }
+    let instance = "", version = "";
+    try { instance = browser.runtime.getURL(""); } catch (e) {}
+    try { version = browser.runtime.getManifest().version; } catch (e) {}
+    return { tabId: tab.id, url: tab.url, status: tab.status, instance, version, ping, pingMs, world, worldError };
+  },
+
   async read(args) {
     const tab = await targetTab(args);
     const maxChars = (args && args.maxChars) || 120000;

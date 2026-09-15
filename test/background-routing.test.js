@@ -30,7 +30,7 @@ function load({ tabs = [], owned = [], relay = { handled: false }, pull = null }
     declarativeNetRequest: { async updateDynamicRules() {} },
     scripting: { async registerContentScripts() {}, async unregisterContentScripts() {} },
     browserAction: { setBadgeText() {}, setTitle() {}, onClicked: { addListener: (fn) => { clicked = fn; } } },
-    runtime: { onMessage: { addListener() {} } },
+    runtime: { onMessage: { addListener() {} }, getURL: (p) => "safari-web-extension://TEST-INSTANCE/" + p, getManifest: () => ({ version: "test" }) },
     tabs: {
       async query(q) {
         if (q && q.active) return tabs.filter((t) => t.active);
@@ -114,6 +114,21 @@ test("toggleActive toggles the panel only in a page this instance owns", async (
   await settle(20);
   assert.deepEqual(other.results.find((r) => r.id === "t").result, { handled: false });
   assert.equal(other.injected.length, 0, "a probe never injects");
+});
+
+test("diag reports the instance, the ping and what the content world shows", async () => {
+  const env = load({ tabs: [T(8, true)], owned: [8], pull: { id: "d", tool: "diag", args: { tabId: 8 } } });
+  await settle(20);
+  const r = env.results.find((x) => x.id === "d").result;
+  assert.equal(r.tabId, 8);
+  assert.equal(r.instance, "safari-web-extension://TEST-INSTANCE/");
+  assert.equal(r.version, "test");
+  assert.equal(r.ping.ok, true);
+  assert.ok(r.pingMs >= 0);
+  // The stub executeScript returns nothing; the field is still reported.
+  assert.equal(r.world, undefined);
+  assert.equal(r.worldError, null);
+  assert.equal(env.injected.length, 1, "diag ran one executeScript probe");
 });
 
 test("a click on a page this instance owns toggles it directly, no relay, no injection", async () => {
