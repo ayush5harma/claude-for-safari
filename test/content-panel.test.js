@@ -34,7 +34,7 @@ function makeStyle() {
 // shadow root (an XML document did, measured), "ok" gets far enough to fail on
 // the markup instead. Either way buildPanel throws, which is the case under
 // test -- a successful build needs a real DOM.
-function load({ ns = XHTML, contentType = "text/html", shadow = "throw" } = {}) {
+function load({ ns = XHTML, contentType = "text/html", shadow = "throw", bodyChildren = [] } = {}) {
   const documentElement = {
     namespaceURI: ns,
     style: makeStyle(),
@@ -46,7 +46,7 @@ function load({ ns = XHTML, contentType = "text/html", shadow = "throw" } = {}) 
     contentType,
     hidden: false,
     documentElement,
-    body: { innerText: "body text" },
+    body: { innerText: "body text", children: bodyChildren },
     getElementById: () => null,
     querySelectorAll: () => [],
     createElementNS(namespace, tag) {
@@ -115,6 +115,26 @@ test("text/plain is NOT refused: WebKit renders it as an HTML document", () => {
   const { ctx } = load({ contentType: "text/plain" });
   // It gets past the document check and fails further in (this stub has no
   // shadow DOM), which is the distinction the check exists to make.
+  assert.throws(() => ctx.window.__claudeSafari.run({ op: "togglePanel" }), /operation is not supported/);
+});
+
+test("a PDF is refused: Safari renders it with its own viewer", () => {
+  // It passes the namespace test -- Safari's PDF viewer IS an HTML document --
+  // and there is still nothing to build a panel into.
+  const { ctx } = load({ contentType: "application/pdf" });
+  assert.throws(() => ctx.window.__claudeSafari.run({ op: "togglePanel" }),
+    /needs a web page.*application\/pdf/);
+});
+
+test("any document whose whole body is one plugin embed is refused too", () => {
+  const embed = { tagName: "EMBED", getAttribute: (k) => (k === "type" ? "application/x-shockwave-flash" : null) };
+  const { ctx } = load({ contentType: "application/x-shockwave-flash", bodyChildren: [embed] });
+  assert.throws(() => ctx.window.__claudeSafari.run({ op: "togglePanel" }), /needs a web page/);
+});
+
+test("an ordinary page with one element in its body is NOT mistaken for a plugin document", () => {
+  const div = { tagName: "DIV", getAttribute: () => null };
+  const { ctx } = load({ contentType: "text/html", bodyChildren: [div] });
   assert.throws(() => ctx.window.__claudeSafari.run({ op: "togglePanel" }), /operation is not supported/);
 });
 

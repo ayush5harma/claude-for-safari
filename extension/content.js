@@ -55,6 +55,11 @@ try {
   if (stale) { stale.remove(); pushPage(false); }
 } catch (e) {}
 const GEN = (world.gen = (world.gen || 0) + 1);
+// The content-script protocol version, reported on BOTH routes below. One
+// constant, because ensureContent prefers the newest script in the page by
+// this number and two spellings that disagreed would send it silently down the
+// wrong route. background.js's CONTENT_V is its counterpart.
+const V = 6;
 
 // ── Tool ops (driven by Claude Code sessions via the bridge) ─────────────────
 
@@ -85,7 +90,7 @@ const ops = {
   // message listener and world.v) so a background page can tell which one it
   // reached and how old the script in the page is.
   ping() {
-    return { ok: true, v: 6, hidden: !!document.hidden };
+    return { ok: true, v: V, hidden: !!document.hidden };
   },
 
   read(msg) {
@@ -180,7 +185,7 @@ browser.runtime.onMessage.addListener((msg) => {
 // The world route: reachable with tabs.executeScript from ANY context of this
 // extension, which is what makes a page driveable by the profile that is
 // actually asking rather than only by the one that injected first.
-world.v = 6;
+world.v = V;
 world.ctx = CTX;
 world.run = (msg) => (world.gen === GEN ? runOp(msg) : undefined);
 window.__claudeSafariContent = "ready";
@@ -375,6 +380,23 @@ function buildPanel() {
   if (!docRoot || docRoot.namespaceURI !== "http://www.w3.org/1999/xhtml") {
     throw new Error("the panel needs an HTML document; this tab is " +
       (document.contentType || (docRoot && docRoot.namespaceURI) || "unknown"));
+  }
+  // A PLUGIN DOCUMENT passes the namespace test and is still nowhere to put a
+  // panel. Safari's PDF viewer is one: an HTML document whose whole body is a
+  // single <embed> filled by the viewer, so a panel appended to it is appended
+  // to the viewer's own chrome and the page has no DOM of its own to read. The
+  // MIME test 0.40 shipped refused these as a side effect of refusing text
+  // types it should not have; this is the arm that was worth keeping. The
+  // content type is the measured case (Safari 27 reports application/pdf);
+  // the single-<embed> body is the general shape of it.
+  const ctype = String(document.contentType || "").toLowerCase();
+  const onlyChild = (document.body && document.body.children && document.body.children.length === 1)
+    ? document.body.children[0] : null;
+  const embedded = !!(onlyChild && /^(embed|object)$/i.test(String(onlyChild.tagName || "")) &&
+    String((onlyChild.getAttribute && onlyChild.getAttribute("type")) || "").toLowerCase() === ctype);
+  if (/\bpdf\b/.test(ctype) || embedded) {
+    throw new Error("the panel needs a web page; this tab is " + (ctype || "a plugin document") +
+      ", which Safari renders with its own viewer");
   }
   // createElementNS, not createElement: in an XML document createElement makes
   // a null-namespace element, and WebKit refuses a shadow root on one. An HTML
