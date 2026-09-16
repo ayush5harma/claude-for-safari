@@ -109,18 +109,34 @@ function mergeTabListings(listings) {
     return { ...rest, tabId: encodeTabId(slot, t.tabId), windowId: encodeTabId(slot, t.windowId) };
   };
   const primary = live.slice().sort((a, b) => b.tabs.length - a.tabs.length || a.slot - b.slot)[0];
-  const ownedElsewhere = new Map();
+  // Every tab the other instances see, best claim per key: an owner outranks a
+  // listing that merely saw it.
+  const elsewhere = new Map();
   for (const l of live) {
     if (l === primary) continue;
-    l.tabs.forEach((t, pos) => { if (t.owned && !ownedElsewhere.has(key(t, pos))) ownedElsewhere.set(key(t, pos), { slot: l.slot, tab: t }); });
+    l.tabs.forEach((t, pos) => {
+      const k = key(t, pos);
+      const seen = elsewhere.get(k);
+      if (!seen || (t.owned && !seen.tab.owned)) elsewhere.set(k, { slot: l.slot, tab: t });
+    });
   }
   const out = [];
   primary.tabs.forEach((t, pos) => {
-    if (t.owned) { out.push(pub(primary.slot, t)); return; }
-    const o = ownedElsewhere.get(key(t, pos));
-    if (o) { ownedElsewhere.delete(key(t, pos)); out.push(pub(o.slot, o.tab)); } else out.push(pub(primary.slot, t));
+    const k = key(t, pos);
+    const o = elsewhere.get(k);
+    elsewhere.delete(k);          // this tab is accounted for, whoever serves it
+    if (!t.owned && o && o.tab.owned) { out.push(pub(o.slot, o.tab)); return; }
+    out.push(pub(primary.slot, t));
   });
-  for (const o of ownedElsewhere.values()) out.push(pub(o.slot, o.tab));
+  // WHAT IS LEFT IS A WINDOW THE PRIMARY'S LISTING DID NOT CONTAIN, owned or
+  // not. Measured 2026-09-16 on Safari 27: a context lists only the windows of
+  // its OWN profile, so with two profiles open the listings were disjoint (25
+  // tabs in one window, 9 in another) and taking only the OWNED leftovers
+  // dropped the eight tabs of the second profile whose content script had not
+  // run yet -- they simply did not exist for claude_safari_tabs. A duplicate is
+  // still not possible: a tab both listings hold has the same position, url and
+  // title in both, so it was matched and deleted above.
+  for (const o of elsewhere.values()) out.push(pub(o.slot, o.tab));
   return out;
 }
 

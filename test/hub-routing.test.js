@@ -83,6 +83,20 @@ test("an owned tab only a smaller listing saw is appended, not lost", () => {
   assert.deepEqual(merged.map((t) => t.tabId), [1, 2, TAB_SLOT + 9]);
 });
 
+test("a second profile's whole window survives the merge, not just the tabs it owns", () => {
+  // Measured 2026-09-16 on Safari 27: a context lists only its OWN profile's
+  // windows, so two profiles give two disjoint listings. Taking only the OWNED
+  // leftovers dropped every tab of the smaller window whose content script had
+  // not run yet -- eight of nine, invisible to claude_safari_tabs.
+  const personal = [tab(1, 0, "https://a/", true), tab(2, 1, "https://b/", false), tab(3, 2, "https://c/", false)];
+  const work = [tab(50, 0, "https://w1/", false, { windowId: 400 }),
+    tab(51, 1, "https://w2/", true, { windowId: 400 })];
+  const merged = mergeTabListings([{ slot: 1, tabs: personal }, { slot: 2, tabs: work }]);
+  assert.deepEqual(merged.map((t) => t.tabId),
+    [TAB_SLOT + 1, TAB_SLOT + 2, TAB_SLOT + 3, 2 * TAB_SLOT + 50, 2 * TAB_SLOT + 51]);
+  assert.equal(merged.filter((t) => t.url === "https://w1/").length, 1, "once, not twice");
+});
+
 test("empty and malformed listings merge to nothing", () => {
   assert.deepEqual(mergeTabListings([]), []);
   assert.deepEqual(mergeTabListings([{ slot: 0, tabs: null }, null]), []);
