@@ -377,8 +377,20 @@ async function explainNoInjection(tabId, err) {
     return "cannot run in this tab: Safari has not finished loading it (" + tab.status +
       "); open the tab and let it load, then click again (" + raw + ")";
   }
-  return "cannot run in this tab: it is loaded and its site is granted, so Safari refused for a reason " +
-    "only it knows -- if a new build was installed while Safari was running, quit and reopen Safari (" + raw + ")";
+  // Everything checkable holds and Safari still refuses. Measured 2026-09-16 on
+  // the page this whole round started from: a github pull request open since
+  // 11:06, still live (AppleScript ran JavaScript in it, readyState complete,
+  // 6h14m of page time), site granted, this copy's files intact -- and
+  // tabs.executeScript answered "Could not execute script in tab", while every
+  // other page in the same window and profile answered the world probe from
+  // the same copy. The one thing that set it apart was its age: it was the only
+  // page loaded BEFORE the two installs that replaced the extension under the
+  // running Safari that day. A fresh tab of the very same URL was reachable at
+  // once. So a page can outlive the copy of the extension that could reach it,
+  // and the cheap repair is to reload that page.
+  return "cannot run in this tab: the page is loaded and its site is granted, but Safari will not let " +
+    "this copy of the extension into it -- a page that was already open when a new build was installed " +
+    "keeps the copy it was loaded with. Reload the tab, or quit and reopen Safari (" + raw + ")";
 }
 
 // The world route's liveness probe, and the ping payload with it (hidden is

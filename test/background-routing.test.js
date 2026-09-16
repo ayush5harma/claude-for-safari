@@ -355,6 +355,7 @@ test("a granted, loaded page that Safari still refuses is not blamed on the tab 
   const env = load({ tabs: [T(8, true)], owned: [], injectFails: [8] });
   const why = await clickReason(env, T(8, true));
   assert.match(why, /loaded and its site is granted/);
+  assert.match(why, /Reload the tab/, "the measured repair comes first");
   assert.match(why, /quit and reopen Safari/);
   assert.equal(/has not loaded it/.test(why), false, "the tab is loaded; do not say otherwise");
 });

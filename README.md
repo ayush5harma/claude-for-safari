@@ -571,8 +571,14 @@ tab — another profile's window, or a revoked site); a site
 Claude for Safari > Allow on All Websites); a copy of the extension that can no
 longer read its own files, which is what installing a new build under a running
 Safari leaves behind and which only a Safari relaunch clears; a tab Safari has
-not finished loading; and, when none of those hold, Safari's own reason with
-the relaunch named as the known repair. Two reasons unrelated to injection:
+not finished loading; and, when none of those hold, a page that was already
+open when a new build was installed — it keeps the copy of the extension it was
+loaded with, and the repair is to reload the tab, or to quit and reopen Safari.
+Measured 2026-09-16: a pull request open since 11:06 that day, live and granted,
+refused injection ("Could not execute script in tab") from the copy registered
+after two reinstalls, while every page in the same window loaded after those
+reinstalls answered, and a fresh tab of the same URL answered at once. Two
+reasons unrelated to injection:
 "the panel needs an HTML document" (an `.svg` opened as a page, an XML feed) or
 "the panel needs a web page" (a PDF — Safari renders it with its own viewer,
 whose whole body is one `<embed>`), and the hub being unreachable, which does
