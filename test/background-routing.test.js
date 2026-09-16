@@ -23,7 +23,7 @@ const settle = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise(
 // hub says to /relay. `pull` hands the poll loop one call and then parks it
 // forever.
 function load({ tabs = [], owned = [], worldOwned = [], blockInjection = [], injectFails = [],
-  relay = { handled: false }, pull = null, store = {} } = {}) {
+  relay = { handled: false }, pull = null, store = {}, messageV = 6 } = {}) {
   const sent = [];           // [tabId, msg] for every tabs.sendMessage
   const injected = [];       // tabIds given to executeScript with a file
   const evaluated = [];      // [tabId, code] for every executeScript with code
@@ -71,7 +71,10 @@ function load({ tabs = [], owned = [], worldOwned = [], blockInjection = [], inj
       async sendMessage(id, msg) {
         sent.push([id, plain(msg)]);
         if (!ownedSet.has(id)) return undefined;              // Safari: nobody received it
-        if (msg.op === "ping") return { ok: true, v: 6, hidden: false };
+        // messageV models WHICH build's content script holds the message
+        // channel: an older copy of the extension answers with its own,
+        // lower, protocol version.
+        if (msg.op === "ping") return { ok: true, v: messageV, hidden: false };
         if (msg.op === "togglePanel") return { open: true };
         return { ok: true };
       },
@@ -223,6 +226,17 @@ test("a click on a page another context's script holds goes through the world, n
   assert.equal(env.hubRequests.filter(([p]) => p === "/relay").length, 0, "the panel must open with the hub down");
   assert.deepEqual(env.injected, [], "a script that answers the world needs no second run");
   assert.ok(env.evaluated.some(([id, code]) => id === 8 && code.includes("togglePanel")), "toggled through the world");
+});
+
+test("an older copy's script on the message channel loses to this build's in the world", async () => {
+  // Both routes answer; the message one is an older build (it registered its
+  // listener first), and taking it would open that build's panel, without the
+  // fixes this version ships.
+  const env = load({ tabs: [T(8, true)], owned: [8], worldOwned: [8], messageV: 4 });
+  await env.click(T(8, true));
+  assert.ok(env.evaluated.some(([id, code]) => id === 8 && code.includes("togglePanel")), "toggled through the world");
+  assert.equal(env.sent.filter(([, m]) => m.op === "togglePanel").length, 0, "not through the old script");
+  assert.deepEqual(env.injected, [], "an old script that answers is not re-injected over");
 });
 
 test("a page whose script answers neither route is taken over, then toggled", async () => {

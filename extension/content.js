@@ -46,6 +46,10 @@ window.__claudeSafariContent = "loading";
 // Whatever a previous run left in the page goes with it: a takeover happens
 // only when that run could not be reached, so its panel could not be closed
 // either, and two panel hosts in one page would stack.
+// (pushPage is hoisted, and only its `on === false` half runs here -- the half
+// that touches no load-time constant. Keep it that way: this line runs before
+// PANEL_FOOTPRINT and NARROW are initialised, and a ReferenceError here would
+// be swallowed by the catch below, leaving the page silently pushed aside.)
 try {
   const stale = document.getElementById("claude-safari-panel-host");
   if (stale) { stale.remove(); pushPage(false); }
@@ -130,7 +134,9 @@ const ops = {
     const value = (0, eval)(msg.code);
     try {
       JSON.stringify(value);
-      return { value };
+      // undefined would be dropped by JSON on the way back and the caller would
+      // read an empty object rather than "this evaluated to nothing".
+      return { value: value === undefined ? null : value };
     } catch {
       return { value: String(value) };
     }
@@ -159,11 +165,14 @@ function runOp(msg) {
 // that is not its own, so the current run's answer is still the one delivered.
 browser.runtime.onMessage.addListener((msg) => {
   if (world.gen !== GEN) return undefined;
-  if (msg && msg.op === "togglePanel") return Promise.resolve(togglePanel(msg));
-  const fn = msg && ops[msg.op];
-  if (!fn) return undefined;   // not ours
+  if (!msg || (msg.op !== "togglePanel" && !ops[msg.op])) return undefined;   // not ours
+  // Through runOp, and INSIDE the try: togglePanel used to be dispatched ahead
+  // of it, so a synchronous throw from buildPanel left Safari resolving the
+  // sender with undefined -- indistinguishable from "no listener" -- and the
+  // background page's fallback then ran the same op a second time through the
+  // world route.
   try {
-    return Promise.resolve(fn(msg));
+    return Promise.resolve(runOp(msg));
   } catch (e) {
     return Promise.reject(e instanceof Error ? e : new Error(String(e)));
   }
@@ -230,12 +239,20 @@ function pushPage(on) {
       de.style.setProperty("transition", "margin-right .22s ease-out");
       de.style.setProperty("margin-right", PANEL_FOOTPRINT + "px", "important");
     } else {
-      if (de.__claudePrevMR) de.style.setProperty("margin-right", de.__claudePrevMR);
-      else de.style.removeProperty("margin-right");
-      if (de.__claudePrevTr) de.style.setProperty("transition", de.__claudePrevTr);
-      else de.style.removeProperty("transition");
-      delete de.__claudePrevMR;
-      delete de.__claudePrevTr;
+      // Restore ONLY what was recorded. The push returns early on a narrow
+      // viewport (the phone sheet does not move the page), so nothing was
+      // recorded there, and an unconditional removeProperty would strip the
+      // page's OWN inline margin-right or transition on every close.
+      if (de.__claudePrevMR !== undefined) {
+        if (de.__claudePrevMR) de.style.setProperty("margin-right", de.__claudePrevMR);
+        else de.style.removeProperty("margin-right");
+        delete de.__claudePrevMR;
+      }
+      if (de.__claudePrevTr !== undefined) {
+        if (de.__claudePrevTr) de.style.setProperty("transition", de.__claudePrevTr);
+        else de.style.removeProperty("transition");
+        delete de.__claudePrevTr;
+      }
     }
   } catch {}
 }
@@ -349,9 +366,15 @@ function buildPanel() {
   // read as "the button does nothing", so say what is actually true. XHTML is
   // NOT refused: it renders HTML, and the markup below is XML-parseable (void
   // elements closed, the icons namespaced, no named entities) for its sake.
-  const kind = String(document.contentType || "text/html").toLowerCase();
-  if (kind !== "text/html" && kind !== "application/xhtml+xml") {
-    throw new Error("the panel needs an HTML document; this tab is " + kind);
+  // The test is the ROOT ELEMENT'S NAMESPACE, not the MIME type: WebKit serves
+  // text/plain, and plenty of application/json, as an HTML document with a
+  // synthesized <pre> body, where the panel works and did (a MIME allowlist
+  // refused those by mistake). An SVG or XML root is the case that cannot
+  // work.
+  const docRoot = document.documentElement;
+  if (!docRoot || docRoot.namespaceURI !== "http://www.w3.org/1999/xhtml") {
+    throw new Error("the panel needs an HTML document; this tab is " +
+      (document.contentType || (docRoot && docRoot.namespaceURI) || "unknown"));
   }
   // createElementNS, not createElement: in an XML document createElement makes
   // a null-namespace element, and WebKit refuses a shadow root on one. An HTML
@@ -927,7 +950,7 @@ function buildPanel() {
           <div class="lede">
             <span class="mark"><img class="spark" src="${SPARK_URL}" alt=""/></span>
             <div class="hi">How can I help you today?</div>
-            <div class="sub">@ to add tabs  ·  + for images &amp; video  ·  ask it to click, fill or open pages</div>
+            <div class="sub">@ to add tabs&#160;&#160;·&#160;&#160;+ for images &amp; video&#160;&#160;·&#160;&#160;ask it to click, fill or open pages</div>
           </div>
           <div class="sugg" id="sugg"></div>
           <button class="addall" id="addall">Add all tabs</button>
@@ -1657,6 +1680,12 @@ function buildPanel() {
 
   panelApi = { addAllTabs, close: closePanel };
 
+  // A panel another script in this world put there is not ours to keep: two
+  // hosts would stack two panes over each other. This happens when an older
+  // copy of the extension is also running in Safari and its script opened its
+  // own panel before this one was asked (measured 2026-09-16).
+  const foreign = document.getElementById("claude-safari-panel-host");
+  if (foreign && foreign !== panelHost) { try { foreign.remove(); } catch (e) {} }
   document.documentElement.appendChild(panelHost);
   pushPage(true);
   // A page can take the host straight back out: a framework that owns <html>

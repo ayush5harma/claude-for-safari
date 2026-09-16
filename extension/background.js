@@ -68,14 +68,26 @@ const hubFetch = (path, opts = {}) => {
   return fetch(hub.url + path, o);
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// A long poll the hub parks for 25s, given 10s of slack — and then ABANDONED.
+// A long poll the hub parks for 25s, and then ABANDONED.
 // Without a bound this loop has no way back from a fetch that never settles,
 // and that is not hypothetical: measured 2026-09-16, two background pages sat
 // silent for over 100 seconds while four sockets to the hub stayed ESTABLISHED,
 // the hub reported no polling instance at all, and every queued tool call timed
 // out. A poll that overruns the park time is a dead poll; drop it and start the
 // next one.
-const PULL_TIMEOUT_MS = 35000;
+// Under the hub's LIVE_MS (its PULL_HOLD_MS + 5s = 30s), deliberately: the
+// extension has to abandon a wedged poll and re-park BEFORE the hub writes the
+// instance off, or calls routed in that window are answered "stopped polling".
+// The two constants are coupled across the two files; change them together.
+const PULL_TIMEOUT_MS = 28000;
+// A world-route probe's bound. Long enough for a busy page (2.2s blocks
+// measured), short enough that a wedged one fails like the message route.
+const WORLD_CALL_MS = 4000;
+const WORLD_TIMED_OUT = Symbol("world-call-timed-out");
+// The content-script protocol version THIS build ships: content.js's ping
+// answers with it on both routes. Keep the two in step -- it is how a page
+// holding an older copy's script is recognised (see ensureContent).
+const CONTENT_V = 6;
 
 // The content script's answer to a ping, or null: absent (Safari resolves a
 // sendMessage nobody receives with undefined), another instance's, or a page
@@ -131,13 +143,23 @@ async function targetTab(args) {
 //
 // Returns the op's value, undefined when no script is published there, and
 // throws what the op threw.
-async function worldCall(tabId, msg) {
+async function worldCall(tabId, msg, boundMs = WORLD_CALL_MS) {
   const code =
     "(() => { var w = window.__claudeSafari;" +
     " if (!w || typeof w.run !== 'function') return { absent: true };" +
     " try { var v = w.run(" + JSON.stringify(msg) + "); return v === undefined ? { absent: true } : { value: v }; }" +
     " catch (e) { return { failed: String((e && e.message) || e) }; } })()";
-  const r = await browser.tabs.executeScript(tabId, { code });
+  // BOUNDED, like pingTab. executeScript runs on the page's main thread and
+  // does not settle while that thread is blocked -- an undismissed alert(), a
+  // long synchronous script -- and an unbounded probe would hang the toolbar
+  // click with no panel and no badge, where the message route gave up in 1.5s.
+  // A timeout reads as "nothing answered here", which is what the caller does
+  // with it anyway.
+  const r = await Promise.race([
+    browser.tabs.executeScript(tabId, { code }),
+    sleep(boundMs).then(() => WORLD_TIMED_OUT),
+  ]);
+  if (r === WORLD_TIMED_OUT) return undefined;
   const out = Array.isArray(r) ? r[0] : r;
   if (!out || out.absent) return undefined;
   if (out.failed) throw new Error(out.failed);
@@ -161,21 +183,40 @@ async function takeOver(tabId) {
 // click grants activeTab, so injection works on the clicked tab even before
 // any site-wide permission.
 //
-// Returns which route reached the page: "message" for this context's own
-// channel, "world" for the shared content world.
+// Returns { via, ping }: which route reached the page ("message" for this
+// context's own channel, "world" for the shared content world) and the ping
+// payload that proved it. The ping rides along because the caller needs it --
+// `hidden` is what tells a toolbar click it came from Safari's Tab Overview --
+// and running the ladder a second time just to ask again doubles every repair.
 async function ensureContent(tabId) {
-  if (await pingTab(tabId)) return "message";
-  if (await worldPing(tabId)) return "world";
+  // THE NEWEST SCRIPT IN THE PAGE WINS, not the first route that answers.
+  // Measured 2026-09-16: with an older copy of the extension still running in
+  // Safari, its content script answers the message channel (it registered
+  // first) while this build's script sits in the same world -- and the old one
+  // opened its own panel, without the fixes this version exists for (the host
+  // hidden by the page's CSS again, the page left with our transition). Both
+  // routes report the content-script protocol version, so prefer a current
+  // one, and fall back to an old script rather than to nothing.
+  const m = await pingTab(tabId);
+  if (m && (m.v || 0) >= CONTENT_V) return { via: "message", ping: m };
+  const w = await worldPing(tabId);
+  if (w && (w.v || 0) >= CONTENT_V) return { via: "world", ping: w };
+  if (m) return { via: "message", ping: m };
+  if (w) return { via: "world", ping: w };
   await injectContent(tabId);
-  if (await pingTab(tabId, 3000)) return "message";
-  if (await worldPing(tabId)) return "world";
+  p = await pingTab(tabId, 3000);
+  if (p) return { via: "message", ping: p };
+  p = await worldPing(tabId);
+  if (p) return { via: "world", ping: p };
   // Something is in the page that answers neither route and blocks injection.
   // Take the page over and inject once more; the fresh run removes whatever
   // panel the unreachable one had left behind.
   await takeOver(tabId);
   await injectContent(tabId);
-  if (await pingTab(tabId, 3000)) return "message";
-  if (await worldPing(tabId)) return "world";
+  p = await pingTab(tabId, 3000);
+  if (p) return { via: "message", ping: p };
+  p = await worldPing(tabId);
+  if (p) return { via: "world", ping: p };
   throw new Error("content script did not answer after injection (Safari-internal or blocked page?)");
 }
 
@@ -208,7 +249,12 @@ async function worldPing(tabId) {
 }
 
 async function askContent(tabId, msg) {
-  const via = await ensureContent(tabId);
+  const { via } = await ensureContent(tabId);
+  return sendVia(tabId, via, msg);
+}
+
+// One op down a route ensureContent has already established.
+async function sendVia(tabId, via, msg) {
   if (via === "world") {
     const w = await worldCall(tabId, msg);
     if (w === undefined) throw new Error("content script gave no response for op " + msg.op);
@@ -257,12 +303,16 @@ const handlers = {
   async toggleActive() {
     const tabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
     if (!tabs.length) return { handled: false };
-    // Both routes, but no injection and no takeover: a relayed click is an
-    // offer ("can you reach this page?"), and the instance that was clicked
-    // falls back to its own repair when every other one says no.
-    const ping = (await pingTab(tabs[0].id)) || (await worldPing(tabs[0].id));
-    if (!ping) return { handled: false };
-    await askContent(tabs[0].id, { op: "togglePanel", withAllTabs: !!ping.hidden });
+    // Both routes, but NO injection and NO takeover, and the route that
+    // answered is the one used: a relayed click is an offer ("can you reach
+    // this page?"), and the instance that was clicked does its own repair when
+    // every other one says no. Going through askContent here would run the
+    // whole ladder and take a page over on another instance's behalf.
+    const ping = await pingTab(tabs[0].id);
+    const world = ping ? null : await worldPing(tabs[0].id);
+    if (!ping && !world) return { handled: false };
+    await sendVia(tabs[0].id, ping ? "message" : "world",
+      { op: "togglePanel", withAllTabs: !!(ping || world).hidden });
     return { handled: true };
   },
 
@@ -385,7 +435,9 @@ async function fetchAsText(url, max) {
 }
 
 async function handleCall(call) {
-  const fn = handlers[call.tool];
+  // hasOwnProperty, not a bare lookup: handlers[call.tool] also resolves
+  // Object.prototype members, so {"tool":"constructor"} used to run Object().
+  const fn = Object.prototype.hasOwnProperty.call(handlers, call.tool) ? handlers[call.tool] : null;
   if (!fn) throw new Error("unknown tool: " + call.tool);
   return fn(call.args || {});
 }
@@ -480,24 +532,23 @@ loop();
 // clicked programmatically, and the click path is the one that has to work.
 async function toolbarClick(tab) {
   try {
-    // ask through every route this context has, repairing the page as needed
-    // (see ensureContent). The hub is NOT in this path: the panel must open
-    // with the bridge down, and the relay below is only for a page this
-    // context genuinely cannot reach.
-    let ping = await askContent(tab.id, { op: "ping" }).catch(() => null);
-    if (!ping) {
-      // Another profile's copy owns the page and this one cannot reach it at
-      // all. Hand the click to whichever copy can, through the hub.
+    // ONE ladder for the whole click: it establishes the route and hands back
+    // the ping that proved it. The hub is NOT in this path -- the panel must
+    // open with the bridge down -- and the relay below is for a page NO copy
+    // can reach from here, which is also the case it is least likely to help
+    // with; it costs one hub round trip and is tried only once the local
+    // routes have all failed.
+    let via, ping;
+    try {
+      ({ via, ping } = await ensureContent(tab.id));
+    } catch (e) {
       if (await relayToggle()) { pollBadge(""); return { relayed: true }; }
-      // Nothing owns it: report the reason the local routes gave.
-      await ensureContent(tab.id);
-      ping = await askContent(tab.id, { op: "ping" });
+      throw e;                       // the local routes' reason is the honest one
     }
     // In Safari's Tab Overview the active page reports itself hidden — the
     // only overview signal an extension gets. A click from there means "chat
     // about all my tabs", so the panel opens with every tab attached.
-    const fromOverview = !!(ping && ping.hidden);
-    const r = await askContent(tab.id, { op: "togglePanel", withAllTabs: fromOverview });
+    const r = await sendVia(tab.id, via, { op: "togglePanel", withAllTabs: !!(ping && ping.hidden) });
     pollBadge("");
     return r;
   } catch (e) {
