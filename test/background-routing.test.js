@@ -326,8 +326,29 @@ test("a page whose script answers neither route is taken over, then toggled", as
 test("a page no route can reach falls back to the hub relay", async () => {
   const env = load({ tabs: [T(8, true)], owned: [], injectFails: [8], relay: { handled: true } });
   await env.click(T(8, true));
-  assert.equal(env.hubRequests.filter(([p]) => p === "/relay").length, 1);
+  const relays = env.hubRequests.filter(([p]) => p === "/relay");
+  assert.equal(relays.length, 1);
+  assert.equal(relays[0][2].args.url, "https://t8/", "the relay names the page, so the owner can check it");
   assert.equal(env.sent.filter(([, m]) => m.op === "togglePanel").length, 0);
+});
+
+test("a click aimed at a tab that is not the active one is never relayed", async () => {
+  // The relay's receiving end has no handle on the page but "the active tab of
+  // the focused window" -- it numbers tabs differently, so the clicked id means
+  // nothing to it. Relaying a call that named some other tab opened the panel
+  // in whatever that copy called active (measured through the hub's toolbar op
+  // on 2026-09-16).
+  const env = load({ tabs: [T(7), T(8, true)], owned: [], injectFails: [7], relay: { handled: true } });
+  await env.click(T(7)).catch(() => {});
+  assert.equal(env.hubRequests.filter(([p]) => p === "/relay").length, 0);
+});
+
+test("toggleActive refuses a relay for a page that is not what it has active", async () => {
+  const env = load({ tabs: [T(8, true)], owned: [8],
+    pull: { id: "t", tool: "toggleActive", args: { url: "https://somewhere-else/" } } });
+  await settle(20);
+  assert.deepEqual(env.results.find((r) => r.id === "t").result, { handled: false });
+  assert.equal(env.sent.some(([, m]) => m.op === "togglePanel"), false, "nothing was toggled");
 });
 
 test("a page that answers only the longer probe is not taken over", async () => {

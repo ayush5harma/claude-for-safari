@@ -154,12 +154,16 @@ async function pingTab(tabId, boundMs = 1500) {
 // (the clicked tab is the active tab of the focused window in every
 // instance's view). False when no instance owns the page, or the hub is down,
 // and the caller injects as before.
-async function relayToggle() {
+async function relayToggle(url) {
   try {
     const r = await hubFetch("/relay", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tool: "toggleActive", args: {} }),
+      // The url rides along so the copy that answers can check it is toggling
+      // the page that was clicked. It may be "" -- Safari hides a tab's
+      // address from a copy with no access to it, which is one of the cases
+      // the relay exists for -- and then the check is skipped.
+      body: JSON.stringify({ tool: "toggleActive", args: { url: url || "" } }),
       // A hub that accepts and never answers must not hang the click.
       signal: AbortSignal.timeout(3000),
     });
@@ -456,9 +460,18 @@ const handlers = {
     return { tabId: tabs[0].id, owned: !!(await pingTab(tabs[0].id)) };
   },
 
-  async toggleActive() {
+  async toggleActive(args) {
     const tabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
     if (!tabs.length) return { handled: false };
+    // The relay is "toggle the page that was just clicked", and the only
+    // handle every copy shares for it is the active tab of the focused window.
+    // When the asking copy could see the url, it sends it, and a copy whose
+    // active tab is a DIFFERENT page says no rather than opening a panel
+    // somewhere the user did not click -- measured 2026-09-16, a relay from a
+    // call that named a non-active tab opened the panel in another window's
+    // active tab.
+    const want = args && args.url;
+    if (want && tabs[0].url && tabs[0].url !== want) return { handled: false };
     // Both routes, but NO injection and NO takeover, and the route that
     // answered is the one used: a relayed click is an offer ("can you reach
     // this page?"), and the instance that was clicked does its own repair when
@@ -705,7 +718,14 @@ async function toolbarClick(tab) {
     try {
       ({ via, ping } = await ensureContent(tab.id));
     } catch (e) {
-      if (await relayToggle()) { pollBadge(""); return { relayed: true }; }
+      // ONLY for the tab that is actually active. A real toolbar click always
+      // is, and the relay's receiving end has no other handle on the page (it
+      // numbers tabs differently, so the clicked id means nothing to it). The
+      // hub's `toolbar` op can name any tab, and relaying that one toggled the
+      // panel in whatever the answering copy called active instead -- measured
+      // 2026-09-16 against a non-active tab, which opened a panel in another
+      // window.
+      if (tab.active && await relayToggle(tab.url)) { pollBadge(""); return { relayed: true }; }
       throw e;                       // the local routes' reason is the honest one
     }
     // In Safari's Tab Overview the active page reports itself hidden — the
