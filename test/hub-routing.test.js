@@ -11,6 +11,7 @@ const path = require("node:path");
 
 const {
   TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
+  cmpVersion, currentInstances, describeInstance,
 } = require(path.join(__dirname, "..", "bridge", "claude-safari-bridge.js"));
 
 const tab = (id, index, url, owned, extra = {}) => ({
@@ -95,4 +96,31 @@ test("the active-tab call goes to the owner, else to an instance that sees a tab
   // beats one that did.
   assert.equal(pickActiveSlot([{ slot: 0, probe: null }, { slot: 3, probe: { tabId: 1, owned: false } }]), 3);
   assert.equal(pickActiveSlot([]), null);
+});
+
+test("versions compare component by component, so 0.40 is newer than 0.9", () => {
+  // This project numbers 0.37, 0.38, 0.39, 0.40 -- a string compare would call
+  // 0.9 the newest of those.
+  assert.equal(cmpVersion("0.40", "0.9") > 0, true);
+  assert.equal(cmpVersion("0.37", "0.41") < 0, true);
+  assert.equal(cmpVersion("0.41", "0.41"), 0);
+  assert.equal(cmpVersion("1.0", "0.99") > 0, true);
+  assert.equal(cmpVersion("", "0.41") < 0, true);
+});
+
+test("only contexts running the newest version a live one reports may take a call", () => {
+  const i = (slot, version) => ({ slot, version, base: "safari-web-extension://" + slot + "/" });
+  const live = [i(1, "0.37"), i(2, "0.41"), i(3, "0.41")];
+  assert.deepEqual(currentInstances(live).map((x) => x.slot), [2, 3]);
+  // An extension too old to report a version cannot be the newest -- but if
+  // NOBODY reports one, every instance stays eligible rather than none.
+  assert.deepEqual(currentInstances([i(1, ""), i(2, "0.41")]).map((x) => x.slot), [2]);
+  assert.deepEqual(currentInstances([i(1, ""), i(2, "")]).map((x) => x.slot), [1, 2]);
+  assert.deepEqual(currentInstances([]), []);
+});
+
+test("a refusal names the slot, the build and the context diag reports", () => {
+  assert.equal(describeInstance({ slot: 460, version: "0.41", base: "safari-web-extension://7A6C/" }),
+    "slot 460 (version 0.41, safari-web-extension://7A6C/)");
+  assert.equal(describeInstance({ slot: 3, version: "", base: "" }), "slot 3 (version unknown)");
 });

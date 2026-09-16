@@ -26,6 +26,11 @@ const tab = (id, index, url, owned, windowId) =>
 // (A: 324/15050/29993 in window 312; B: 325/15051/29994 in window 313); A
 // reaches the talkback PR (the active tab), B the mobile PR; C has no window.
 const MODELS = {
+  // The two contexts of the last tests: the build the app now holds, and a
+  // copy an update superseded that Safari is still running.
+  NEW: { tabs: [tab(900, 1, "https://new-context/", true, 700)] },
+  OLD: { tabs: [tab(800, 1, "https://superseded-context/", true, 701)] },
+  TWIN: { tabs: [tab(700, 1, "https://twin/", true, 702)] },
   A: {
     tabs: [tab(324, 0, "https://calendar/", false, 312),
       tab(15050, 1, "https://github.com/browserstack/talkback/pull/145", true, 312),
@@ -38,7 +43,7 @@ const MODELS = {
   },
   C: { tabs: [] },
 };
-const served = { A: [], B: [], C: [] };   // which calls each instance answered
+const served = { A: [], B: [], C: [], NEW: [], OLD: [], TWIN: [] };   // which calls each instance answered
 
 function model(name, tool, args) {
   const m = MODELS[name];
@@ -61,23 +66,46 @@ function model(name, tool, args) {
 }
 
 const instances = [];
-function startInstance(name) {
+// `opts` is what an extension puts in its headers: the id it persists, and
+// (since 0.41) the context's base URL and the build it runs. Two loops sharing
+// one id is the measured case of a profile running a second context after a
+// bundle was replaced under it.
+function startInstance(name, opts = {}) {
   const ctl = new AbortController();
+  const headers = { "x-claude-instance": opts.id || "inst-" + name };
+  if (opts.base) headers["x-claude-base"] = opts.base;
+  if (opts.version) headers["x-claude-version"] = opts.version;
+  let polls = 0;
+  const self = { ctl, name, polls: () => polls };
   const loop = (async () => {
     for (;;) {
       let r;
       try {
-        r = await fetch(HUB + "/pull", { method: "POST", headers: { "x-claude-instance": "inst-" + name }, signal: ctl.signal });
+        polls += 1;
+        r = await fetch(HUB + "/pull", { method: "POST", headers, signal: ctl.signal });
       } catch (e) { if (ctl.signal.aborted) return; await new Promise((f) => setTimeout(f, 50)); continue; }
       if (r.status !== 200) continue;
       const call = await r.json();
       let out;
       try { out = { result: model(name, call.tool, call.args || {}) }; } catch (e) { out = { error: e.message }; }
-      await fetch(HUB + "/result", { method: "POST", headers: { "content-type": "application/json", "x-claude-instance": "inst-" + name },
+      await fetch(HUB + "/result", { method: "POST", headers: { ...headers, "content-type": "application/json" },
         body: JSON.stringify({ id: call.id, ...out }) }).catch(() => {});
     }
   })();
-  instances.push({ ctl, loop });
+  self.loop = loop;
+  instances.push(self);
+  return self;
+}
+
+// Wait until the hub's instance list satisfies `ok`, or give up.
+async function waitForStatus(ok, tries = 100) {
+  let st = null;
+  for (let i = 0; i < tries; i++) {
+    st = await (await fetch(HUB + "/status")).json();
+    if (ok(st)) return st;
+    await new Promise((f) => setTimeout(f, 50));
+  }
+  return st;
 }
 
 async function call(tool, args = {}) {
@@ -197,4 +225,63 @@ test("a relayed toolbar click is handled by the instance that owns the active ta
   const r2 = await fetch(HUB + "/relay", { method: "POST", headers: { "content-type": "application/json", "x-claude-instance": "inst-A" },
     body: JSON.stringify({ tool: "toggleActive", args: {} }) });
   assert.deepEqual(await r2.json(), { handled: false });
+});
+
+// ── Two contexts of one profile, and a build that superseded one ─────────────
+// These start extra instances and leave them polling, so they run last.
+
+test("two contexts polling under one id get a slot each, instead of releasing each other's park", async () => {
+  // storage.local is per profile, so before 0.41 both contexts of a profile
+  // sent the same id. The hub kept one parked /pull per id: the second park
+  // released the first with 204, the released copy re-polled at once, and the
+  // pair spun. Splitting them apart also keeps their tab numbering apart.
+  const before = (await (await fetch(HUB + "/status")).json()).instances.length;
+  const one = startInstance("TWIN", { id: "shared-id" });
+  const two = startInstance("TWIN", { id: "shared-id" });
+  const st = await waitForStatus((s) => s.instances.length >= before + 2);
+  assert.equal(st.instances.length, before + 2, "two slots, not one");
+  const parkedPolls = one.polls() + two.polls();
+  await new Promise((f) => setTimeout(f, 300));
+  assert.ok(one.polls() + two.polls() <= parkedPolls,
+    "both parks hold; neither copy is being released and re-polling");
+  assert.equal(st.instances.filter((i) => i.parked).length, before + 2, "every instance is parked");
+});
+
+test("a call is never routed to a context a newer build has superseded", async () => {
+  startInstance("OLD", { id: "ctx-old", base: "safari-web-extension://OLD/", version: "0.37" });
+  startInstance("NEW", { id: "ctx-new", base: "safari-web-extension://NEW/", version: "0.41" });
+  const st = await waitForStatus((s) => s.instances.some((i) => i.version === "0.41") &&
+    s.instances.some((i) => i.version === "0.37"));
+  const oldRow = st.instances.find((i) => i.version === "0.37");
+  const newRow = st.instances.find((i) => i.version === "0.41");
+  assert.equal(newRow.current, true);
+  assert.equal(oldRow.current, false, "the superseded context is not one a call may be routed to");
+
+  // A call naming no tab goes to the newest build, never to the old copy --
+  // which is where "unknown tool: diag" came from on the Mac this was measured
+  // on: an older build answering an op it does not have.
+  const servedOld = served.OLD.length;
+  const r = await call("eval", { code: "1" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.match(r.body.result.value, /via NEW$/);
+  assert.equal(served.OLD.length, servedOld, "the superseded copy answered nothing");
+});
+
+test("a tab id the superseded context minted is refused by name, not run there", async () => {
+  const st = await (await fetch(HUB + "/status")).json();
+  const oldRow = st.instances.find((i) => i.version === "0.37");
+  const servedOld = served.OLD.length;
+  const r = await call("eval", { tabId: oldRow.slot * TAB_SLOT + 800, code: "1" });
+  assert.equal(r.status, 200);
+  assert.match(r.body.error, /superseded/);
+  assert.match(r.body.error, /version 0\.37/, "the refusal names the build");
+  assert.match(r.body.error, /safari-web-extension:\/\/OLD\//, "and the context, as diag reports it");
+  assert.match(r.body.error, /version 0\.41/, "and what is live instead");
+  assert.equal(served.OLD.length, servedOld, "nothing ran in the old copy's tab");
+});
+
+test("the merged tab listing leaves out a superseded context's tabs", async () => {
+  const { body } = await call("tabs");
+  assert.ok(body.result.some((t) => t.url === "https://new-context/"));
+  assert.equal(body.result.some((t) => t.url === "https://superseded-context/"), false);
 });
