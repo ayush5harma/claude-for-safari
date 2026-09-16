@@ -280,6 +280,26 @@ test("a tab id the superseded context minted is refused by name, not run there",
   assert.equal(served.OLD.length, servedOld, "nothing ran in the old copy's tab");
 });
 
+test("a pre-0.35 GET /pull is held, then refused, and an abandoned one costs nothing", async () => {
+  // The hold is what turns a stale build's unbacked poll loop (287 GET/s
+  // measured) into one request every few seconds. It must still ANSWER -- the
+  // timer is cleared on the request's close, and node emits that only after
+  // the response ends for a client that waits (measured on node 24), so a
+  // waiting client gets its 403 and an aborted one leaves no timer behind.
+  const t0 = Date.now();
+  const r = await fetch(HUB + "/pull");
+  assert.equal(r.status, 403);
+  assert.match((await r.json()).error, /POST-only/);
+  assert.ok(Date.now() - t0 >= 2500, "it was held, not answered at once");
+
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 50);
+  await assert.rejects(fetch(HUB + "/pull", { signal: ac.signal }));
+  // The hub is still serving: a hold that had crashed on its own write would
+  // show up here.
+  assert.equal((await (await fetch(HUB + "/health")).json()).ok, true);
+});
+
 test("the merged tab listing leaves out a superseded context's tabs", async () => {
   const { body } = await call("tabs");
   assert.ok(body.result.some((t) => t.url === "https://new-context/"));

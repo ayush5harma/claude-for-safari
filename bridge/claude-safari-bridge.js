@@ -610,10 +610,18 @@ function runHub() {
         // seconds) for as long as Safari ran, and no Safari restart cleared it.
         // Nothing waits on this answer, so holding it turns that spin into one
         // request every few seconds until the stale copy goes.
-        return setTimeout(() => {
-          if (res.writableEnded) return;
+        //
+        // The timer is cleared when the client goes away. A held socket that
+        // is aborted leaves writableEnded false (measured on node 24: the
+        // response is destroyed, the late write is discarded, the server
+        // survives), so that check alone never fired and every refused GET
+        // kept a timer for the full hold -- and a page's no-cors GETs could
+        // park sockets, of which Safari allows about six per origin.
+        const holdTimer = setTimeout(() => {
           json(res, 403, { error: "/pull is POST-only since 0.35 (a GET can be forged by any web page); rebuild the extension" });
         }, LEGACY_REFUSE_MS);
+        req.on("close", () => clearTimeout(holdTimer));
+        return;
       }
       if (req.method === "POST" && req.url === "/pull") {
         if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
