@@ -551,14 +551,27 @@ on its own (measured several times an hour on an idle Mac), so every tab id a
 session was holding went stale with it. The id is persisted per profile now;
 only a HUB restart invalidates tab ids, which is the guarantee that matters.
 
-**The hub log shows a flood of `GET /pull`.** That is an extension older than
-0.35 — Safari can keep a stale copy of the extension running in one profile
-alongside the current one, and the pre-0.36 poll loop has no backoff, so it
-spins as fast as the hub answers (287 requests per second, measured
-2026-09-16, unchanged by three Safari restarts). The hub holds that refusal for
-three seconds, which caps it at well under one request per second while the
-stale copy lasts. It answers nothing and drives nothing; the current copy in
-the same Safari is unaffected.
+**The hub log shows a flood of `GET /pull`, or the gear's site list says an
+older copy owns the page.** Safari can keep a stale copy of this extension
+running beside the current one. Measured 2026-09-16 with 0.40 installed and
+Safari restarted three times: a page's content world had its `browser` bound to
+a context whose `runtime.getManifest().version` read **0.34**, and two contexts
+were still polling with the pre-0.35 `GET /pull`, which the hub refuses; that
+build predates the 0.36 backoff, so it spun as fast as the hub answered (287
+requests per second). Two consequences, both handled rather than hidden:
+
+- The hub holds that refusal for three seconds, which caps the spin at well
+  under one request per second for as long as the stale copy lasts.
+- A content script's `browser.runtime` belongs to whichever context injected
+  into that world first, so the panel's own messages (chat, the `@` picker, the
+  hub check) go to THAT background page. Ops it is too old to have — the site
+  list arrived in 0.36 — answer nothing, and the gear says so and points at
+  Safari > Settings > Extensions > Claude for Safari > Settings, which reaches
+  the current copy directly. Tool calls are unaffected: they take the world
+  route.
+
+Neither the badge nor the tools can clear the stale copy, and quitting Safari
+does not: it came back each time here.
 
 **A tool call lands in the wrong Safari profile.** One hub serves every
 profile's extension instance and the first to poll answers. Disable the

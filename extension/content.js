@@ -1443,6 +1443,19 @@ function buildPanel() {
   // rather than what was typed.
   function drawUaResult(r) {
     const el = $("uastat");
+    // NO ANSWER AT ALL is its own case, and a common one. A content script's
+    // browser.runtime belongs to whichever context of this extension injected
+    // into the page's world first, which can be an older copy Safari is still
+    // running beside the current one -- measured 2026-09-16: a page whose world
+    // was bound to a 0.34 context, where the site-list ops (0.36) simply do not
+    // exist, so sendMessage resolved undefined and this pane said "could not
+    // apply" with nothing after it. The Settings page reaches the current copy
+    // directly, so send the reader there.
+    if (r === undefined) {
+      el.className = "hubstat bad";
+      el.textContent = "an older copy of the extension owns this page — edit the list in Safari Settings > Extensions > Claude for Safari > Settings";
+      return;
+    }
     if (!r || r.error) {
       el.className = "hubstat bad";
       el.textContent = "could not apply" + (r && r.error ? " — " + r.error : "");
