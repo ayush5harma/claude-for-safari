@@ -142,7 +142,9 @@ test("every hub request names this background page, with one id for its whole li
 test("a restarted background page keeps its instance id, so tab ids stay valid", async () => {
   // Safari restarts this page on its own; with a fresh id the hub called the
   // restarted copy a new profile and every tabId a session held went stale.
-  const restarted = load({ tabs: [T(1, true)], owned: [1], store: { instanceId: "kept-across-restarts" },
+  const BASE = "safari-web-extension://TEST-INSTANCE/";
+  const restarted = load({ tabs: [T(1, true)], owned: [1],
+    store: { instanceIds: { [BASE]: { id: "kept-across-restarts", at: 1 } } },
     pull: { id: "c1", tool: "probeActive", args: {} } });
   await settle(20);
   const ids = new Set(restarted.hubRequests.map(([, h]) => h["x-claude-instance"]));
@@ -151,7 +153,35 @@ test("a restarted background page keeps its instance id, so tab ids stay valid",
   const first = load({ tabs: [T(1, true)], owned: [1], pull: { id: "c1", tool: "probeActive", args: {} } });
   await settle(20);
   const [minted] = new Set(first.hubRequests.map(([, h]) => h["x-claude-instance"]));
-  assert.equal(first.store.instanceId, minted, "a first run persists the id it minted");
+  assert.equal(first.store.instanceIds[BASE].id, minted, "a first run persists the id it minted");
+});
+
+test("a context whose bundle was replaced does not share the profile's id", async () => {
+  // storage.local is per PROFILE and both contexts read it. Keyed by the
+  // context's own base URL, the copy left behind by a replaced bundle keeps
+  // its id and the new one mints its own, so the hub sees two instances
+  // rather than two copies fighting over one parked /pull.
+  const OLD = "safari-web-extension://OLD-BUNDLE/";
+  const NEW = "safari-web-extension://TEST-INSTANCE/";
+  const store = { instanceIds: { [OLD]: { id: "the-replaced-copy", at: 1 } } };
+  const fresh = load({ tabs: [T(1, true)], owned: [1], store,
+    pull: { id: "c1", tool: "probeActive", args: {} } });
+  await settle(20);
+  const [id] = new Set(fresh.hubRequests.map(([, h]) => h["x-claude-instance"]));
+  assert.notEqual(id, "the-replaced-copy");
+  assert.equal(store.instanceIds[OLD].id, "the-replaced-copy", "the other context's id is left alone");
+  assert.equal(store.instanceIds[NEW].id, id);
+});
+
+test("every hub request carries this build's version and base URL", async () => {
+  // The hub tells a superseded context from the current one by these, and
+  // names them when it refuses a call.
+  const env = load({ tabs: [T(1, true)], owned: [1], pull: { id: "c1", tool: "probeActive", args: {} } });
+  await settle(20);
+  for (const [, h] of env.hubRequests) {
+    assert.equal(h["x-claude-version"], "test");
+    assert.equal(h["x-claude-base"], "safari-web-extension://TEST-INSTANCE/");
+  }
 });
 
 test("tabs marks ownership only when the hub asks for it; the panel's listing pings nothing", async () => {

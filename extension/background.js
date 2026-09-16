@@ -51,19 +51,63 @@ browser.storage.onChanged.addListener((ch, area) => {
 // the id keeps them valid. The hub still refuses ids from an earlier HUB run:
 // its slots start at a random base each time it starts, which is what that
 // guarantee actually rests on.
-const INSTANCE_KEY = "instanceId";
-let INSTANCE = (typeof crypto !== "undefined" && crypto.randomUUID)
+//
+// AND IT IS KEYED BY THIS CONTEXT'S BASE URL (0.41), because storage.local is
+// per PROFILE and a profile can run more than one context at a time. A scalar
+// key gave both the same id, and the hub keeps ONE parked /pull per id: the
+// second park releases the first with 204, the released copy re-polls at once,
+// and the two spin against loopback for as long as both live -- while calls
+// routed to that id land on whichever copy is parked, whose tab numbering is
+// not the numbering the caller was given.
+//
+// The base URL is the right key because Safari mints one per REGISTRATION and
+// persists it. Measured on Safari 27, 2026-09-16, on this Mac: each profile's
+// State.plist (Safari's own, beside the extension's LocalStorage.db) carries a
+// LastSeenBaseURL together with a LastSeenBundleHash -- 7A6C0444... for the
+// default profile, 73A70A96... for the other -- while the content worlds of
+// pages injected earlier that day still answered from 571B849E... and
+// 6DFCFE6F..., base URLs of bundles that had since been replaced. So the base
+// URL survives a background-page restart (Safari reads it back from that file)
+// and changes when the bundle does, which is exactly when a second context
+// appears. If it ever did NOT survive a restart, this degrades to the pre-0.40
+// behaviour for that context -- a new id, stale tab ids -- and still never
+// hands two live contexts one id.
+const CTX_BASE = (() => { try { return browser.runtime.getURL(""); } catch (e) { return ""; } })();
+const EXT_VERSION = (() => { try { return browser.runtime.getManifest().version; } catch (e) { return ""; } })();
+const INSTANCE_KEY = "instanceIds";
+// Every replaced bundle leaves one entry behind for good; keep the newest few.
+const INSTANCE_KEEP = 8;
+const mintInstance = () => ((typeof crypto !== "undefined" && crypto.randomUUID)
   ? crypto.randomUUID()
-  : Math.random().toString(36).slice(2) + Date.now().toString(36);
+  : Math.random().toString(36).slice(2) + Date.now().toString(36));
+let INSTANCE = mintInstance();
 const instanceReady = (async () => {
   try {
     const st = await browser.storage.local.get(INSTANCE_KEY);
-    if (typeof st[INSTANCE_KEY] === "string" && st[INSTANCE_KEY]) { INSTANCE = st[INSTANCE_KEY]; return; }
-    await browser.storage.local.set({ [INSTANCE_KEY]: INSTANCE });
+    const saved = st && st[INSTANCE_KEY];
+    const map = (saved && typeof saved === "object" && !Array.isArray(saved)) ? { ...saved } : {};
+    const mine = map[CTX_BASE];
+    if (mine && typeof mine.id === "string" && mine.id) INSTANCE = mine.id;
+    map[CTX_BASE] = { id: INSTANCE, at: Date.now() };
+    // Two contexts of one profile write this map at the same time and the
+    // loser's entry is lost. That costs the loser a fresh id at its next start
+    // -- never a shared one, since each writes only its own key with its own
+    // uuid.
+    const kept = {};
+    for (const k of Object.keys(map).sort((a, b) => (map[b].at || 0) - (map[a].at || 0)).slice(0, INSTANCE_KEEP)) {
+      kept[k] = map[k];
+    }
+    await browser.storage.local.set({ [INSTANCE_KEY]: kept });
   } catch (e) {}
 })();
 const hubFetch = (path, opts = {}) => {
-  const o = { ...opts, headers: { ...(opts.headers || {}), "x-claude-instance": INSTANCE } };
+  // The version and the base URL ride along so the hub can tell a context an
+  // update has superseded from the current one, and name it in a refusal the
+  // way diag names it.
+  const headers = { ...(opts.headers || {}), "x-claude-instance": INSTANCE };
+  if (EXT_VERSION) headers["x-claude-version"] = EXT_VERSION;
+  if (CTX_BASE) headers["x-claude-base"] = CTX_BASE;
+  const o = { ...opts, headers };
   if (hub.token) o.headers.authorization = "Bearer " + hub.token;
   return fetch(hub.url + path, o);
 };
