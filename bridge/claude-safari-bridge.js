@@ -43,6 +43,7 @@ const BIND = process.env.BRIDGE_BIND || "127.0.0.1";
 const TOKEN = process.env.BRIDGE_TOKEN || "";
 const HUB = `http://127.0.0.1:${PORT}`;
 const PULL_HOLD_MS = 25000;    // long-poll park time
+const LEGACY_REFUSE_MS = 3000; // how long a pre-0.35 GET /pull is held before its 403
 const CALL_TIMEOUT_MS = 90000; // extension must answer within this
 const CHAT_TIMEOUT_MS = 300000; // a headless claude turn can legitimately take minutes
 const MAX_QUEUE = 100;         // undelivered tool calls kept before dropping the oldest
@@ -516,7 +517,17 @@ function runHub() {
       // old GET with a reason rather than a bare 404, since a stale extension
       // build hitting a new hub is exactly the case that lands here.
       if (req.method === "GET" && req.url === "/pull") {
-        return json(res, 403, { error: "/pull is POST-only since 0.35 (a GET can be forged by any web page); rebuild the extension" });
+        // Refused SLOWLY, on purpose. An extension old enough to poll with GET
+        // is older than the backoff that 0.36 added, so it re-polls the instant
+        // this answers: measured 2026-09-16, a build left behind in one Safari
+        // profile drove 287 GET /pull per second into this hub (20,669 in 72
+        // seconds) for as long as Safari ran, and no Safari restart cleared it.
+        // Nothing waits on this answer, so holding it turns that spin into one
+        // request every few seconds until the stale copy goes.
+        return setTimeout(() => {
+          if (res.writableEnded) return;
+          json(res, 403, { error: "/pull is POST-only since 0.35 (a GET can be forged by any web page); rebuild the extension" });
+        }, LEGACY_REFUSE_MS);
       }
       if (req.method === "POST" && req.url === "/pull") {
         if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
