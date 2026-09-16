@@ -23,12 +23,18 @@ const settle = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise(
 // hub says to /relay. `pull` hands the poll loop one call and then parks it
 // forever.
 function load({ tabs = [], owned = [], worldOwned = [], blockInjection = [], injectFails = [],
-  relay = { handled: false }, pull = null, store = {}, messageV = 6 } = {}) {
+  relay = { handled: false }, pull = null, store = {}, messageV = 6,
+  // What the failure diagnosis reads: which origins this copy is granted, and
+  // whether it can still read its own files (a bundle replaced under a running
+  // Safari cannot -- the shape the user hit on 2026-09-16).
+  grantedOrigins = ["<all_urls>"], bundleReadable = true, worldOwnedAtProbe = 0 } = {}) {
   const sent = [];           // [tabId, msg] for every tabs.sendMessage
   const injected = [];       // tabIds given to executeScript with a file
   const evaluated = [];      // [tabId, code] for every executeScript with code
   const hubRequests = [];    // [path, headers, body] for every hubFetch
   const results = [];        // bodies posted to /result
+  const badges = [];         // every browserAction badge text set
+  const titles = [];         // and its hover title, which carries the reason
   let clicked = null;
   const ownedSet = new Set(owned);
   // One content world per tab, as the page would hold it: a run that publishes
@@ -60,7 +66,13 @@ function load({ tabs = [], owned = [], worldOwned = [], blockInjection = [], inj
     },
     declarativeNetRequest: { async updateDynamicRules() {} },
     scripting: { async registerContentScripts() {}, async unregisterContentScripts() {} },
-    browserAction: { setBadgeText() {}, setTitle() {}, onClicked: { addListener: (fn) => { clicked = fn; } } },
+    browserAction: { setBadgeText(o) { badges.push(o.text); }, setTitle(o) { titles.push(o.title); }, onClicked: { addListener: (fn) => { clicked = fn; } } },
+    permissions: {
+      async contains(q) {
+        if (grantedOrigins.includes("<all_urls>")) return true;
+        return (q.origins || []).every((o) => grantedOrigins.includes(o));
+      },
+    },
     runtime: { onMessage: { addListener() {} }, getURL: (p) => "safari-web-extension://TEST-INSTANCE/" + p, getManifest: () => ({ version: "test" }) },
     tabs: {
       async query(q) {
@@ -93,6 +105,9 @@ function load({ tabs = [], owned = [], worldOwned = [], blockInjection = [], inj
           return [undefined];
         }
         evaluated.push([id, (opts && opts.code) || ""]);
+        // A page too busy to answer a bounded probe, which answers a later,
+        // longer one: the case a takeover must NOT fire on.
+        if (worldOwnedAtProbe && evaluated.filter(([x]) => x === id).length >= worldOwnedAtProbe) publish(id);
         const world = worlds.get(id) || {};
         // Enough page for the probes the background page evaluates there.
         const ctx = vm.createContext({ window: world, document: { readyState: "complete" },
@@ -107,6 +122,12 @@ function load({ tabs = [], owned = [], worldOwned = [], blockInjection = [], inj
   };
   let pulled = false;
   const fetch = async (url, opts = {}) => {
+    // The extension reading one of its OWN files back: the probe for a bundle
+    // replaced under a running Safari.
+    if (String(url).startsWith("safari-web-extension://")) {
+      if (!bundleReadable) throw new Error("The requested URL was not found on this server.");
+      return { ok: true, status: 200, text: async () => "" };
+    }
     const p = url.replace(/^https?:\/\/[^/]+/, "");
     hubRequests.push([p, opts.headers || {}, opts.body ? JSON.parse(opts.body) : null]);
     if (p === "/pull") {
@@ -118,13 +139,14 @@ function load({ tabs = [], owned = [], worldOwned = [], blockInjection = [], inj
     throw new Error("unexpected " + p);
   };
   const ctx = vm.createContext({
-    browser, chrome: browser, console, fetch,
+    browser, chrome: browser, console, fetch, URL,
     setTimeout, clearTimeout, setInterval, clearInterval,
     AbortSignal: { timeout: () => undefined },
   });
   const src = BACKGROUND_SCRIPTS.map((f) => fs.readFileSync(path.join(EXT, f), "utf8")).join("\n;\n");
   vm.runInContext(src, ctx, { filename: "background-bundle.js" });
-  return { ctx, sent, injected, evaluated, hubRequests, results, worlds, store, click: (tab) => clicked(tab) };
+  return { ctx, sent, injected, evaluated, hubRequests, results, worlds, store, badges, titles,
+    click: (tab) => clicked(tab) };
 }
 
 const T = (id, active = false) => ({ id, windowId: 1, index: id, active, url: "https://t" + id + "/", title: "T" + id });
@@ -284,6 +306,65 @@ test("a page no route can reach falls back to the hub relay", async () => {
   await env.click(T(8, true));
   assert.equal(env.hubRequests.filter(([p]) => p === "/relay").length, 1);
   assert.equal(env.sent.filter(([, m]) => m.op === "togglePanel").length, 0);
+});
+
+test("a page that answers only the longer probe is not taken over", async () => {
+  // The takeover clears the run-once guard, and the next run removes any panel
+  // it finds and puts the page back -- on a page that is merely busy that is a
+  // live panel torn out with its unsaved turns. It fires only after a SECOND
+  // failure.
+  const env = load({ tabs: [T(8, true)], owned: [], blockInjection: [8], worldOwnedAtProbe: 3 });
+  await env.click(T(8, true));
+  assert.equal(env.evaluated.some(([, code]) => code.includes("'stale'")), false, "no takeover");
+  assert.ok(env.evaluated.some(([id, code]) => id === 8 && code.includes("togglePanel")), "toggled through the world");
+});
+
+// ── What a failed injection says ─────────────────────────────────────────────
+// The hover text of the ! badge is the only thing a user gets, so it has to
+// name the condition that actually holds. Measured 2026-09-16: it named a tab
+// Safari had not loaded and a missing site grant when the page was open in
+// front of the user and Safari's own record granted every site.
+const clickReason = async (env, tab) => {
+  await env.click(tab).catch(() => {});
+  return env.titles[env.titles.length - 1] || "";
+};
+
+test("a granted, loaded page that Safari still refuses is not blamed on the tab or the grant", async () => {
+  const env = load({ tabs: [T(8, true)], owned: [], injectFails: [8] });
+  const why = await clickReason(env, T(8, true));
+  assert.match(why, /loaded and its site is granted/);
+  assert.match(why, /quit and reopen Safari/);
+  assert.equal(/has not loaded it/.test(why), false, "the tab is loaded; do not say otherwise");
+});
+
+test("a copy whose bundle was replaced says so, and says to relaunch Safari", async () => {
+  const env = load({ tabs: [T(8, true)], owned: [], injectFails: [8], bundleReadable: false });
+  const why = await clickReason(env, T(8, true));
+  assert.match(why, /can no longer read its own files/);
+  assert.match(why, /quit and reopen Safari/);
+});
+
+test("a site with no grant names the site and where the grant lives", async () => {
+  const env = load({ tabs: [T(8, true)], owned: [], injectFails: [8], grantedOrigins: [] });
+  const why = await clickReason(env, T(8, true));
+  assert.match(why, /no website-access grant for t8/);
+  assert.match(why, /Allow on All Websites/);
+});
+
+test("a tab whose address this copy cannot even see says that, not 'not loaded'", async () => {
+  // Safari hides the url from an extension with no access to the tab, which is
+  // what the active tab looked like on this Mac while the click failed.
+  const hidden = { id: 8, windowId: 1, index: 8, active: true, url: "", title: "" };
+  const env = load({ tabs: [hidden], owned: [], injectFails: [8] });
+  const why = await clickReason(env, hidden);
+  assert.match(why, /cannot even see the tab's address/);
+});
+
+test("a page Safari never runs extensions in is named by its scheme", async () => {
+  const filePage = { id: 8, windowId: 1, index: 8, active: true, url: "file:///Users/x/page.html", title: "page" };
+  const env = load({ tabs: [filePage], owned: [], injectFails: [8] });
+  const why = await clickReason(env, filePage);
+  assert.match(why, /does not let an extension run in file: pages/);
 });
 
 test("with no script in the page at all, the clicked instance injects and takes it", async () => {

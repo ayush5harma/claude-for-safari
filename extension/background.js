@@ -127,6 +127,13 @@ const PULL_TIMEOUT_MS = 28000;
 // A world-route probe's bound. Long enough for a busy page (2.2s blocks
 // measured), short enough that a wedged one fails like the message route.
 const WORLD_CALL_MS = 4000;
+// The bound on the injection itself, and on the one re-probe that has to fail
+// before a page is taken over (see ensureContent). Both are longer than the
+// probes above: an injection does more work than a ping, and a takeover is
+// destructive enough to be worth waiting for.
+const INJECT_MS = 6000;
+const CONFIRM_MS = 8000;
+const INJECT_TIMED_OUT = Symbol("inject-timed-out");
 const WORLD_TIMED_OUT = Symbol("world-call-timed-out");
 // The content-script protocol version THIS build ships: content.js's ping
 // answers with it on both routes. Keep the two in step -- it is how a page
@@ -248,9 +255,20 @@ async function ensureContent(tabId) {
   if (m) return { via: "message", ping: m };
   if (w) return { via: "world", ping: w };
   await injectContent(tabId);
-  p = await pingTab(tabId, 3000);
+  let p = await pingTab(tabId, 3000);
   if (p) return { via: "message", ping: p };
   p = await worldPing(tabId);
+  if (p) return { via: "world", ping: p };
+  // A TAKEOVER NEEDS A SECOND FAILURE, not one timeout. It clears the run-once
+  // guard and the next run's first act is to remove any panel host it finds
+  // and put the page back -- so on a page that is merely busy (the probes
+  // above are bounded, and a blocked main thread does not answer within a
+  // bound) it would tear a working panel out from under the user, losing that
+  // conversation's unsaved turns. Probe once more, with a longer bound, and
+  // only take the page over if THAT fails too.
+  p = await pingTab(tabId, 3000);
+  if (p) return { via: "message", ping: p };
+  p = await worldPing(tabId, CONFIRM_MS);
   if (p) return { via: "world", ping: p };
   // Something is in the page that answers neither route and blocks injection.
   // Take the page over and inject once more; the fresh run removes whatever
@@ -265,27 +283,94 @@ async function ensureContent(tabId) {
 }
 
 async function injectContent(tabId) {
+  let done;
   try {
-    await browser.tabs.executeScript(tabId, { file: "content.js" });
+    // BOUNDED, for the reason the world probe is (see worldCall): an
+    // injection also runs on the page's main thread and does not settle while
+    // that thread is blocked, and the click that waits on it has no way back.
+    done = await Promise.race([
+      browser.tabs.executeScript(tabId, { file: "content.js" }).then(() => true),
+      sleep(INJECT_MS).then(() => INJECT_TIMED_OUT),
+    ]);
   } catch (e) {
-    // Two causes look identical from here: a tab Safari has NOT LOADED (a
-    // tab restored from the last session is a snapshot until it is opened;
-    // iOS does this to every background tab, the Mac after a relaunch) and
-    // a site with no website-access grant.
-    throw new Error(
-      "cannot run in this tab: Safari has not loaded it (open the tab once, then try again), " +
-      "or the site has no website-access grant for the extension " +
-      "(Settings > Safari > Extensions > Claude for Safari > Allow on All Websites): " +
-      String((e && e.message) || e)
-    );
+    throw new Error(await explainNoInjection(tabId, e));
   }
+  if (done === INJECT_TIMED_OUT) {
+    throw new Error("this page has not let the extension run for " + Math.round(INJECT_MS / 1000) +
+      "s: its main thread is blocked (an open alert() or confirm(), or a long script). " +
+      "Dismiss it or reload the page, then click again.");
+  }
+}
+
+// WHICH condition holds, rather than a list of the ones that might.
+//
+// Until 0.41 a failed injection named two ("Safari has not loaded this tab, or
+// the site has no website-access grant") and left the user to guess. On
+// 2026-09-16 it named both when NEITHER held: the page was open and loaded in
+// front of the user, and Safari's own record for both profiles on this Mac
+// granted the extension every site (GrantedPermissionOrigins "*://*/*", no
+// revocations) -- while the copy of the extension that took the click had had
+// its bundle replaced under the running Safari by two installs that morning.
+// Safari's own wording distinguishes more than the message did, too: "This
+// extension does not have access to this tab" is the access case, while "Could
+// not execute script in tab" -- what the user was shown -- is not. So each
+// condition is now CHECKED, in the order that can be answered with certainty,
+// and Safari's own reason is still quoted at the end.
+async function explainNoInjection(tabId, err) {
+  const raw = String((err && err.message) || err);
+  let tab = null;
+  try { tab = await browser.tabs.get(tabId); } catch (e) {}
+  const url = (tab && tab.url) || "";
+  const scheme = (/^([a-z][a-z0-9+.-]*):/i.exec(url) || [])[1] || "";
+  if (scheme && !/^https?$/i.test(scheme)) {
+    return "cannot run in this tab: Safari does not let an extension run in " + scheme +
+      ": pages, so the panel cannot open here (" + raw + ")";
+  }
+  if (!url) {
+    // Safari hides a tab's address from an extension that has no access to it,
+    // so an empty url IS an answer: this copy cannot reach the tab at all.
+    return "cannot run in this tab: this copy of the extension cannot even see the tab's address, " +
+      "which is what Safari shows for a tab it has no access to -- a Safari or file:// page, " +
+      "a window belonging to another Safari profile, or a site whose access was revoked " +
+      "(Settings > Safari > Extensions > Claude for Safari) (" + raw + ")";
+  }
+  let granted = null;
+  try {
+    granted = await browser.permissions.contains({ origins: [new URL(url).origin + "/*"] });
+  } catch (e) {}
+  if (granted === false) {
+    return "cannot run in this tab: the extension has no website-access grant for " + url.split("/")[2] +
+      " (Settings > Safari > Extensions > Claude for Safari > Allow on All Websites, " +
+      "or the toolbar button's per-site menu) (" + raw + ")";
+  }
+  // Safari keeps running an extension context whose bundle has been replaced
+  // on disk -- which is what installing a new build under a running Safari
+  // does -- and then nothing that context asks Safari to inject exists any
+  // more. Reading one of its own files back is the only probe for that from
+  // here.
+  let bundleOk = true;
+  try {
+    const r = await fetch(browser.runtime.getURL("content.js"));
+    bundleOk = !!(r && r.ok);
+  } catch (e) { bundleOk = false; }
+  if (!bundleOk) {
+    return "cannot run in this tab: this copy of the extension can no longer read its own files, " +
+      "which is what a new build installed while Safari was running leaves behind -- " +
+      "quit and reopen Safari (" + raw + ")";
+  }
+  if (tab && tab.status && tab.status !== "complete") {
+    return "cannot run in this tab: Safari has not finished loading it (" + tab.status +
+      "); open the tab and let it load, then click again (" + raw + ")";
+  }
+  return "cannot run in this tab: it is loaded and its site is granted, so Safari refused for a reason " +
+    "only it knows -- if a new build was installed while Safari was running, quit and reopen Safari (" + raw + ")";
 }
 
 // The world route's liveness probe, and the ping payload with it (hidden is
 // what tells a toolbar click it came from Safari's Tab Overview).
-async function worldPing(tabId) {
+async function worldPing(tabId, boundMs = WORLD_CALL_MS) {
   try {
-    const r = await worldCall(tabId, { op: "ping" });
+    const r = await worldCall(tabId, { op: "ping" }, boundMs);
     return r && r.ok ? r : null;
   } catch (e) {
     return null;
@@ -398,11 +483,18 @@ const handlers = {
     } catch (e) {
       worldError = String((e && e.message) || e);
     }
-    let instance = "", version = "";
-    try { instance = browser.runtime.getURL(""); } catch (e) {}
-    try { version = browser.runtime.getManifest().version; } catch (e) {}
-    return { tabId: tab.id, url: tab.url, status: tab.status, instance, version,
-      ping, pingMs, worldPing: worldPingResult, world, worldError };
+    // What the answering copy knows about ITSELF, which is what tells a
+    // superseded context from the current one: the base URL Safari minted for
+    // its registration, the build it runs, whether it can still read its own
+    // files (a bundle replaced under a running Safari cannot), and whether the
+    // tab's site is granted to it.
+    let granted = null;
+    try { granted = await browser.permissions.contains({ origins: [new URL(tab.url).origin + "/*"] }); } catch (e) {}
+    let bundleOk = null;
+    try { const r = await fetch(browser.runtime.getURL("content.js")); bundleOk = !!(r && r.ok); }
+    catch (e) { bundleOk = false; }
+    return { tabId: tab.id, url: tab.url, status: tab.status, instance: CTX_BASE, version: EXT_VERSION,
+      granted, bundleOk, ping, pingMs, worldPing: worldPingResult, world, worldError };
   },
 
   async read(args) {
