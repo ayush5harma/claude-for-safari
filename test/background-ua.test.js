@@ -85,6 +85,10 @@ function loadBackground(opts = {}) {
     browser, chrome: browser, console,
     setTimeout, clearTimeout, setInterval, clearInterval,
     // The poll loop starts at load; park it so it cannot spin during a test.
+    // It bounds each poll with AbortSignal.timeout, so the sandbox has to
+    // carry one: without it every poll threw and the loop retried forever,
+    // which kept this file's process alive after the tests had passed.
+    AbortSignal: { timeout: () => undefined },
     fetch: () => new Promise(() => {}),
   });
   const src = BACKGROUND_SCRIPTS.map((f) => fs.readFileSync(path.join(EXT, f), "utf8")).join("\n;\n");

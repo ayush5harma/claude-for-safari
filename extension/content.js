@@ -15,8 +15,42 @@
 // with no way back but a reload. So anything but "ready" is re-run, and the
 // listener is installed right after the tool ops, ahead of everything the
 // panel needs, so the ops survive a panel-side failure.
-if (window.__claudeSafariContent === "ready") return;
+//
+// THE WORLD THIS STATE LIVES IN IS SHARED (0.40). Measured on Safari 27,
+// 2026-09-16: one page has ONE content world for this extension, and every
+// context of the extension -- one per Safari profile, plus any left behind by
+// a bundle replaced under a running Safari -- injects into that same world.
+// The first run is therefore the only one whose runtime.onMessage listener
+// exists, and that listener answers only ITS OWN context's background page.
+// On a plain static page opened seconds earlier, tabs.sendMessage from the
+// very instance that had opened the tab resolved undefined, executeScript of
+// this file returned at the guard above, and the toolbar reported "content
+// script did not answer after injection": no panel, and every tool call on
+// that tab failed. So the ops are ALSO published on the world below, where
+// tabs.executeScript reaches them from any context, and the run that owns
+// them is the newest one (GEN).
+//
+// The world object is not reachable from the page: measured on the same day
+// with a page-world probe that reported window.__claudeSafari as undefined
+// while the content script's run had already published it.
+const CTX = (() => { try { return browser.runtime.getURL(""); } catch (e) { return ""; } })();
+const world = (window.__claudeSafari && typeof window.__claudeSafari === "object")
+  ? window.__claudeSafari
+  : (window.__claudeSafari = {});
+// A run whose ops are published serves every context, so a second context does
+// not need its own run -- it calls through the world. Only a run that is gone
+// or too old to publish them is replaced, and the background page asks for that
+// by clearing this state (see takeOver in background.js).
+if (window.__claudeSafariContent === "ready" && world.run) return;
 window.__claudeSafariContent = "loading";
+// Whatever a previous run left in the page goes with it: a takeover happens
+// only when that run could not be reached, so its panel could not be closed
+// either, and two panel hosts in one page would stack.
+try {
+  const stale = document.getElementById("claude-safari-panel-host");
+  if (stale) { stale.remove(); pushPage(false); }
+} catch (e) {}
+const GEN = (world.gen = (world.gen || 0) + 1);
 
 // ── Tool ops (driven by Claude Code sessions via the bridge) ─────────────────
 
@@ -43,8 +77,11 @@ const ops = {
   // Liveness probe: Safari resolves sendMessage to a missing receiver with
   // undefined instead of throwing, so the background page detects "content
   // script present" only by this answering.
+  // v is the content-script protocol version, reported by both routes (the
+  // message listener and world.v) so a background page can tell which one it
+  // reached and how old the script in the page is.
   ping() {
-    return { ok: true, v: 5, hidden: !!document.hidden };
+    return { ok: true, v: 6, hidden: !!document.hidden };
   },
 
   read(msg) {
@@ -100,11 +137,28 @@ const ops = {
   },
 };
 
+// One entry point for every op, messaged or not. Synchronous on purpose: the
+// world route below is a tabs.executeScript, whose value is the last
+// expression and which does not await a promise.
+function runOp(msg) {
+  if (msg && msg.op === "togglePanel") return togglePanel(msg);
+  const fn = msg && ops[msg.op];
+  if (!fn) throw new Error("unknown op " + ((msg && msg.op) || ""));
+  return fn(msg);
+}
+
 // Installed HERE, before the panel's constants and functions, so a failure
 // anywhere below leaves ping/read/click/fill/eval working (togglePanel then
 // fails on its own and says why). togglePanel is a function declaration, so
 // it is already hoisted; ops is the table above.
+//
+// GEN keeps a superseded run's listener quiet. A takeover leaves the replaced
+// run's listener registered (nothing can unregister it from here), and two
+// listeners answering one togglePanel would open the panel and close it again
+// in a single click. Returning undefined is what a listener says for a message
+// that is not its own, so the current run's answer is still the one delivered.
 browser.runtime.onMessage.addListener((msg) => {
+  if (world.gen !== GEN) return undefined;
   if (msg && msg.op === "togglePanel") return Promise.resolve(togglePanel(msg));
   const fn = msg && ops[msg.op];
   if (!fn) return undefined;   // not ours
@@ -114,6 +168,12 @@ browser.runtime.onMessage.addListener((msg) => {
     return Promise.reject(e instanceof Error ? e : new Error(String(e)));
   }
 });
+// The world route: reachable with tabs.executeScript from ANY context of this
+// extension, which is what makes a page driveable by the profile that is
+// actually asking rather than only by the one that injected first.
+world.v = 6;
+world.ctx = CTX;
+world.run = (msg) => (world.gen === GEN ? runOp(msg) : undefined);
 window.__claudeSafariContent = "ready";
 
 // ── Chat panel ───────────────────────────────────────────────────────────────
@@ -124,6 +184,7 @@ window.__claudeSafariContent = "ready";
 
 let panelHost = null;
 let panelApi = null;
+let hostWatch = null;   // watches for a page removing the host (see buildPanel)
 let chatSessionId = null;
 let chatBusy = false;
 let attachments = [];   // {name, type, dataUrl}
@@ -159,12 +220,22 @@ function pushPage(on) {
     if (on && NARROW.matches) return;
     if (on) {
       if (de.__claudePrevMR === undefined) de.__claudePrevMR = de.style.marginRight || "";
+      // The transition is ours and has to go back too. It used to be set and
+      // never removed, so every page the panel had been opened on kept
+      // "transition: margin-right .22s ease-out" on its root element for the
+      // rest of its life -- ours to clean up, and it also slowed down any
+      // margin the page itself set afterwards (measured 2026-09-16: every page
+      // in the matrix ended with that declaration still on <html>).
+      if (de.__claudePrevTr === undefined) de.__claudePrevTr = de.style.transition || "";
       de.style.setProperty("transition", "margin-right .22s ease-out");
       de.style.setProperty("margin-right", PANEL_FOOTPRINT + "px", "important");
     } else {
       if (de.__claudePrevMR) de.style.setProperty("margin-right", de.__claudePrevMR);
       else de.style.removeProperty("margin-right");
+      if (de.__claudePrevTr) de.style.setProperty("transition", de.__claudePrevTr);
+      else de.style.removeProperty("transition");
       delete de.__claudePrevMR;
+      delete de.__claudePrevTr;
     }
   } catch {}
 }
@@ -174,10 +245,10 @@ const SPARK_URL = (() => { try { return browser.runtime.getURL("images/spark.png
 
 
 const SVG = {
-  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
-  at: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="3.6"/><path d="M15.6 12v1.3a2.6 2.6 0 0 0 5.2 0V12a8.8 8.8 0 1 0-3.4 6.95"/></svg>',
-  up: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5.5M5.8 11.3L12 5l6.2 6.3"/></svg>',
-  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>',
+  plus: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
+  at: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="3.6"/><path d="M15.6 12v1.3a2.6 2.6 0 0 0 5.2 0V12a8.8 8.8 0 1 0-3.4 6.95"/></svg>',
+  up: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5.5M5.8 11.3L12 5l6.2 6.3"/></svg>',
+  x: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>',
   // Header glyphs. Deliberately a heavier stroke (1.9-2.0) than the inline
   // ones above: they sit on a filled material chip rather than on bare
   // ground, so a hairline reads as a smudge inside the circle. Shapes follow
@@ -185,12 +256,12 @@ const SVG = {
   // because those are the marks a Mac user already knows. SVG.x stays as it
   // is: the chip/history "remove" affordances are 11-13px and need the
   // lighter weight to stay legible at that size.
-  fresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.6 4.8H8A3.2 3.2 0 0 0 4.8 8v8a3.2 3.2 0 0 0 3.2 3.2h8a3.2 3.2 0 0 0 3.2-3.2V9.4"/><path d="M13.2 10.6 18.6 5.2a1.7 1.7 0 0 1 2.2 2.2l-5.4 5.4-3 .8z"/></svg>',
-  clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.1"/><path d="M12 7.1V12h4.1"/></svg>',
-  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7.2 7.2l9.6 9.6M16.8 7.2l-9.6 9.6"/></svg>',
-  gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.1"/><path d="M19.2 12c0-.48-.05-.95-.14-1.4l2-1.55-1.9-3.3-2.35.95a7.3 7.3 0 0 0-2.42-1.4L13.9 2.8h-3.8l-.49 2.5a7.3 7.3 0 0 0-2.42 1.4l-2.35-.95-1.9 3.3 2 1.55a7.2 7.2 0 0 0 0 2.8l-2 1.55 1.9 3.3 2.35-.95a7.3 7.3 0 0 0 2.42 1.4l.49 2.5h3.8l.49-2.5a7.3 7.3 0 0 0 2.42-1.4l2.35.95 1.9-3.3-2-1.55c.09-.45.14-.92.14-1.4z"/></svg>',
-  film: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M7.5 5v14M16.5 5v14M3.5 9.5h4M3.5 14.5h4M16.5 9.5h4M16.5 14.5h4"/></svg>',
-  mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v2.5M9 20.5h6"/></svg>',
+  fresh: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.6 4.8H8A3.2 3.2 0 0 0 4.8 8v8a3.2 3.2 0 0 0 3.2 3.2h8a3.2 3.2 0 0 0 3.2-3.2V9.4"/><path d="M13.2 10.6 18.6 5.2a1.7 1.7 0 0 1 2.2 2.2l-5.4 5.4-3 .8z"/></svg>',
+  clock: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.1"/><path d="M12 7.1V12h4.1"/></svg>',
+  close: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7.2 7.2l9.6 9.6M16.8 7.2l-9.6 9.6"/></svg>',
+  gear: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.1"/><path d="M19.2 12c0-.48-.05-.95-.14-1.4l2-1.55-1.9-3.3-2.35.95a7.3 7.3 0 0 0-2.42-1.4L13.9 2.8h-3.8l-.49 2.5a7.3 7.3 0 0 0-2.42 1.4l-2.35-.95-1.9 3.3 2 1.55a7.2 7.2 0 0 0 0 2.8l-2 1.55 1.9 3.3 2.35-.95a7.3 7.3 0 0 0 2.42 1.4l.49 2.5h3.8l.49-2.5a7.3 7.3 0 0 0 2.42-1.4l2.35.95 1.9-3.3-2-1.55c.09-.45.14-.92.14-1.4z"/></svg>',
+  film: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M7.5 5v14M16.5 5v14M3.5 9.5h4M3.5 14.5h4M16.5 9.5h4M16.5 14.5h4"/></svg>',
+  mic: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v2.5M9 20.5h6"/></svg>',
 };
 
 // Empty-state starter prompts. Deliberately page-shaped (they all act on
@@ -221,8 +292,8 @@ function md(src) {
     .replace(/^#{1,4} (.+)$/gm, "<h4>$1</h4>")
     .replace(/^[-*] (.+)$/gm, '<div class="li">$1</div>')
     .replace(/^(\d+)\. (.+)$/gm, '<div class="li"><span class="ln">$1.</span>$2</div>')
-    .replace(/\n/g, "<br>");
-  return t.replace(/\u0000PRE(\d+)\u0000(?:<br>)?/g, (_, i) => `<pre>${pres[+i]}</pre>`);
+    .replace(/\n/g, "<br/>");
+  return t.replace(/\u0000PRE(\d+)\u0000(?:<br\/>)?/g, (_, i) => `<pre>${pres[+i]}</pre>`);
 }
 
 function hostOf(url) {
@@ -268,8 +339,49 @@ function adoptStyles(root, css) {
 }
 
 function buildPanel() {
-  panelHost = document.createElement("div");
+  // A document that is not HTML or XHTML has nowhere to put an HTML panel:
+  // an .svg or .xml opened as a page renders only its own vocabulary, so an
+  // HTML div appended to <svg> would be invisible even when it can be built.
+  // Measured 2026-09-16 on an image/svg+xml document: createElement made a
+  // null-namespace element WebKit refuses a shadow root on ("The operation is
+  // not supported"), and with that fixed the markup below failed the XML
+  // parser instead ("The string did not match the expected pattern"). Both
+  // read as "the button does nothing", so say what is actually true. XHTML is
+  // NOT refused: it renders HTML, and the markup below is XML-parseable (void
+  // elements closed, the icons namespaced, no named entities) for its sake.
+  const kind = String(document.contentType || "text/html").toLowerCase();
+  if (kind !== "text/html" && kind !== "application/xhtml+xml") {
+    throw new Error("the panel needs an HTML document; this tab is " + kind);
+  }
+  // createElementNS, not createElement: in an XML document createElement makes
+  // a null-namespace element, and WebKit refuses a shadow root on one. An HTML
+  // div is also what the stylesheet below assumes.
+  panelHost = document.createElementNS("http://www.w3.org/1999/xhtml", "div");
   panelHost.id = "claude-safari-panel-host";
+  // A shadow root keeps the page's CSS out of the panel; it does nothing about
+  // the page's CSS reaching the HOST, and rules a page aims at unknown
+  // elements do exactly that. Measured 2026-09-16: a page with
+  // "div:empty { display: none !important }" -- the host has no light-DOM
+  // children, so it matches -- computed display:none on it, and the toolbar
+  // click "succeeded" with nothing on screen, which is the whole bug as a user
+  // sees it. An inline declaration with !important outranks any author rule,
+  // and set through CSSOM it is not an inline STYLE ATTRIBUTE, so a page whose
+  // style-src forbids inline styles (0.39's case) does not block it.
+  for (const [prop, value] of [
+    ["display", "block"], ["visibility", "visible"], ["opacity", "1"],
+    // The panel inside is position:fixed; a transform, filter, perspective,
+    // backdrop-filter or contain on the host would make the host its
+    // containing block and drag it into the page's scroll.
+    ["transform", "none"], ["filter", "none"], ["perspective", "none"],
+    ["contain", "none"], ["content-visibility", "visible"],
+    ["clip-path", "none"], ["mask", "none"], ["pointer-events", "auto"],
+    // A host the page floats, sizes or positions cannot move the fixed panel,
+    // but it can take part in the page's own layout; keep it out of it.
+    ["position", "static"], ["float", "none"], ["width", "auto"], ["height", "auto"],
+    ["margin", "0"], ["padding", "0"], ["border", "0"], ["max-width", "none"], ["max-height", "none"],
+  ]) {
+    try { panelHost.style.setProperty(prop, value, "important"); } catch (e) {}
+  }
   const root = panelHost.attachShadow({ mode: "closed" });
   const css = `
       /* Native-material design: the panel is built like a Safari sidebar —
@@ -771,7 +883,7 @@ function buildPanel() {
     <div class="scrim" id="scrim"></div>
     <div class="panel">
       <div class="hdr">
-        <img class="spark" src="${SPARK_URL}" alt=""><b>Claude</b>
+        <img class="spark" src="${SPARK_URL}" alt=""/><b>Claude</b>
         <button class="ctl" id="hubbtn" title="Settings" aria-label="Settings">${SVG.gear}</button>
         <button class="ctl" id="hist" title="History" aria-label="History">${SVG.clock}</button>
         <button class="ctl" id="fresh" title="New chat" aria-label="New chat">${SVG.fresh}</button>
@@ -783,10 +895,10 @@ function buildPanel() {
           Mac's bridge (127.0.0.1:29170). On iPhone/iPad, point it at a hosted
           or mesh hub — see HOSTING.md — with its token.</div>
         <label>Hub URL
-          <input id="huburl" type="url" placeholder="http://127.0.0.1:29170" autocomplete="off">
+          <input id="huburl" type="url" placeholder="http://127.0.0.1:29170" autocomplete="off"/>
         </label>
         <label>Token
-          <input id="hubtok" type="password" placeholder="only if the hub sets BRIDGE_TOKEN" autocomplete="off">
+          <input id="hubtok" type="password" placeholder="only if the hub sets BRIDGE_TOKEN" autocomplete="off"/>
         </label>
         <div class="hubrow">
           <span class="hubstat" id="hubstat"></span>
@@ -813,9 +925,9 @@ function buildPanel() {
       <div class="msgs" id="msgs">
         <div class="empty" id="empty">
           <div class="lede">
-            <span class="mark"><img class="spark" src="${SPARK_URL}" alt=""></span>
+            <span class="mark"><img class="spark" src="${SPARK_URL}" alt=""/></span>
             <div class="hi">How can I help you today?</div>
-            <div class="sub">@ to add tabs&nbsp;&nbsp;·&nbsp;&nbsp;+ for images &amp; video&nbsp;&nbsp;·&nbsp;&nbsp;ask it to click, fill or open pages</div>
+            <div class="sub">@ to add tabs  ·  + for images &amp; video  ·  ask it to click, fill or open pages</div>
           </div>
           <div class="sugg" id="sugg"></div>
           <button class="addall" id="addall">Add all tabs</button>
@@ -840,7 +952,7 @@ function buildPanel() {
             <button class="send" id="send" title="Send" aria-label="Send">${SVG.up}</button>
           </div>
         </div>
-        <input type="file" id="file" multiple accept="image/*,video/*">
+        <input type="file" id="file" multiple="multiple" accept="image/*,video/*"/>
       </div>
     </div>`;
   adoptStyles(root, css);
@@ -879,7 +991,7 @@ function buildPanel() {
       const el = document.createElement("span");
       el.className = "chip";
       el.innerHTML = (a.type.startsWith("image/")
-        ? `<img class="thumb" src="${a.dataUrl}">`
+        ? `<img class="thumb" src="${a.dataUrl}"/>`
         : `<span class="fico">${SVG.film}</span>`) +
         `<span class="t"></span><button title="Remove">${SVG.x}</button>`;
       el.querySelector(".t").textContent = a.name;
@@ -985,6 +1097,7 @@ function buildPanel() {
   // — or the page scrolled to wherever iOS dragged it to reach the composer:
   // it goes back to where the reader was.
   const teardown = () => {
+    if (hostWatch) { try { hostWatch.disconnect(); } catch (e) {} hostWatch = null; }
     if (rec) { try { rec.stop(); } catch {} }
     if (vv) { vv.removeEventListener("resize", fitViewport); vv.removeEventListener("scroll", fitViewport); }
     NARROW.removeEventListener("change", fitViewport);
@@ -1179,7 +1292,7 @@ function buildPanel() {
     menuItems.forEach((t, i) => {
       const d = document.createElement("div");
       d.className = "mi" + (i === menuSel ? " sel" : "");
-      d.innerHTML = '<span class="col"><span class="ti"></span><br><span class="ho"></span></span>';
+      d.innerHTML = '<span class="col"><span class="ti"></span><br/><span class="ho"></span></span>';
       d.querySelector(".ti").textContent = t.title || t.url;
       d.querySelector(".ho").textContent = hostOf(t.url) + (t.active ? " · current" : "");
       const img = faviconImg(t.favIconUrl);
@@ -1228,10 +1341,22 @@ function buildPanel() {
   };
 
   // ── history (browser.storage.local — survives Safari restarts) ──
+  // crypto.randomUUID is SECURE-CONTEXT ONLY, and a content script inherits
+  // the page's context: on any plain http:// page it is undefined (measured
+  // 2026-09-16 on http://192.168.1.8 — isSecureContext false, randomUUID
+  // undefined). It was called on the first turn of a chat, so that turn threw
+  // before the request was ever sent: the question sat in the transcript, no
+  // reply came, and chatBusy stayed true with the send button disabled for the
+  // life of the page. The id only has to be unique among this browser's stored
+  // conversations.
+  const convoId = () => {
+    try { if (crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
+    return "c-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  };
   const HKEY = "chatHistory";
   let convo = null;   // { id, sessionId, title, updatedAt, msgs: [{r,t}] }
   const note = (r, t) => {
-    if (!convo) convo = { id: crypto.randomUUID(), sessionId: null, title: null, msgs: [] };
+    if (!convo) convo = { id: convoId(), sessionId: null, title: null, msgs: [] };
     convo.msgs.push({ r, t: String(t).slice(0, 20000) });
   };
   async function saveConvo() {
@@ -1521,6 +1646,17 @@ function buildPanel() {
 
   document.documentElement.appendChild(panelHost);
   pushPage(true);
+  // A page can take the host straight back out: a framework that owns <html>
+  // and re-renders it, an anti-injection script that removes what it did not
+  // add (measured 2026-09-16 against a MutationObserver doing exactly that).
+  // The panel cannot be defended there -- re-inserting it would be a fight
+  // with the page -- but the PAGE must not be left shoved 360px aside for a
+  // pane that is gone, which is what happened until this. Disconnected in
+  // teardown, so our own removal on close does not trip it.
+  hostWatch = new MutationObserver(() => {
+    if (panelHost && !panelHost.isConnected) closePanel();
+  });
+  try { hostWatch.observe(document.documentElement, { childList: true }); } catch (e) { hostWatch = null; }
   updateEmpty();
   focusInput();
   // Two frames: the first commits the off-screen start, the second flips to
@@ -1532,9 +1668,28 @@ function buildPanel() {
 }
 
 function togglePanel(msg) {
+  // A host the PAGE took out of the document is not an open panel. Pages do
+  // that: a framework that owns <html> re-renders it away, an anti-injection
+  // script removes what it did not put there (measured 2026-09-16 against a
+  // MutationObserver that removes foreign children of documentElement). While
+  // that counted as open, every second click was spent "closing" a panel that
+  // was not on screen, so the button looked broken half the time.
+  if (panelHost && !panelHost.isConnected) { panelHost = null; panelApi = null; pushPage(false); }
   if (panelHost) { if (panelApi) panelApi.close(); else { panelHost.remove(); panelHost = null; } }
   else {
-    buildPanel();
+    try {
+      buildPanel();
+    } catch (e) {
+      // buildPanel assigns panelHost before it can fail (a document that
+      // refuses a shadow root, a stylesheet a WebKit rejects). Leaving that
+      // half-built host in place made the NEXT click a close, so the panel
+      // could never open again on that page; the error itself belongs to the
+      // caller, which puts it on the toolbar badge.
+      try { if (panelHost) panelHost.remove(); } catch (e2) {}
+      panelHost = null; panelApi = null;
+      pushPage(false);
+      throw e;
+    }
     // Clicked from Tab Overview (the page was hidden): the user is looking at
     // ALL tabs, so start the chat with all of them attached.
     if (msg && msg.withAllTabs && panelApi) panelApi.addAllTabs();

@@ -146,6 +146,45 @@ attributes: a page whose Content-Security-Policy sets `style-src` without
 root, and the panel rendered as bare markup there until 0.39. CSSOM
 construction is not governed by `style-src`.
 
+**How the panel is reached, and why that changed in 0.40.** Safari gives a page
+ONE content world per extension, and every context of the extension injects
+into it — one context per profile, plus one a bundle replaced under a running
+Safari can leave behind. The script that runs first is therefore the only one
+whose `runtime.onMessage` listener exists, and it answers only ITS OWN
+context's background page. Measured 2026-09-16 on a plain static page opened
+seconds earlier: `tabs.sendMessage` from the very instance that had opened the
+tab resolved `undefined`, injecting `content.js` returned at the run-once
+guard, and the toolbar reported "content script did not answer after
+injection" — no panel, and every tool call on that tab failing. So the content
+script now also publishes its ops on the world itself (`window.__claudeSafari`,
+which the page cannot see — a page-world probe reads it as `undefined`), and
+the background page calls them with `tabs.executeScript`, which runs in that
+shared world whoever owns it. A page that answers neither route is taken over:
+the guard is cleared, `content.js` is injected again, and the fresh run removes
+whatever panel the unreachable one had left. The toolbar click no longer
+depends on the hub at all — the `/relay` hand-off is the last resort now, not
+the first step.
+
+**The host element carries its own armour.** A shadow root keeps the page's CSS
+out of the panel; it does nothing about the page's CSS reaching the HOST. A
+page with `div:empty { display: none !important }` — the host has no light-DOM
+children, so it matches — hid the whole panel while the click reported success
+(measured 2026-09-16). The host is therefore given `display`, `visibility`,
+`opacity`, `transform`, `filter`, `contain` and a few more as inline
+declarations with `!important` through CSSOM, which outranks any page rule and,
+not being a `style=""` attribute, survives a strict `style-src`. A page that
+removes the host outright (a framework that re-renders `<html>`, an
+anti-injection script) is not fought: the panel closes itself and the page's
+layout is put back, rather than leaving it shoved 360px aside for a pane that
+is gone.
+
+The panel needs an HTML or XHTML document. In an `image/svg+xml` or XML
+document it refuses with that reason on the badge: WebKit will not put a shadow
+root on the null-namespace element `createElement` makes there, and an HTML
+subtree appended to `<svg>` would not render anyway. XHTML works — the markup
+is XML-parseable (void elements closed, icons namespaced, no named entities)
+for exactly that case.
+
 ## The claude-safari MCP bridge
 
 `bridge/claude-safari-bridge.js` is one file with two modes. `--serve` is the
@@ -162,14 +201,24 @@ Tools: `claude_safari_tabs`, `claude_safari_read`, `claude_safari_click`,
 the current window), `claude_safari_eval`, `claude_safari_screenshot`. A
 `tabId` from `tabs` pins a call to one tab; there is no close-tab tool.
 
-One more op is reachable at the hub but is not an MCP tool: `diag`.
+Two more ops are reachable at the hub but are not MCP tools: `diag` and
+`toolbar`. `curl -s -XPOST 127.0.0.1:29170/call -d '{"tool":"toolbar","args":{"tabId":N}}'`
+runs the toolbar button's own code path against that tab — Safari's toolbar
+cannot be clicked by AppleScript, WebDriver or any WebExtension API, so this is
+the only way to test the path that has to work, and it is how the page matrix
+in 0.40 was measured.
+
+`diag` is the other one.
 `curl -s -XPOST 127.0.0.1:29170/call -d '{"tool":"diag","args":{"tabId":N}}'`
 reports, for one tab, which extension instance answered (its base URL names
 the profile's storage directory), whether that instance's ping to the page is
-answered and how fast, and what `tabs.executeScript` sees in the page's
-content world (the content script's run-once state, whether the extension API
-is present). It is the first thing to run when a page says "content script
-did not answer after injection".
+answered and how fast, whether the world route answers it (`worldPing`), and
+what `tabs.executeScript` sees in the page's content world: the run-once state,
+whether the extension API is present, and — since 0.40 — which context the
+script in that page belongs to (`ctx`), its protocol version and its
+generation. A `ctx` that is not the answering `instance` is the shared-world
+case the panel section describes. It is the first thing to run when a page says
+"content script did not answer after injection".
 
 Limits worth knowing: the extension must be enabled and granted the site in the
 profile you want driven; parallel callers share one queue per extension
@@ -194,9 +243,16 @@ That listing merges every copy's view by which copy can reach each tab, a call
 with no `tabId` goes to the copy that owns the active tab, and a toolbar click
 in a copy that cannot reach the page is relayed through the hub (`/relay`) to
 the copy that can. A `tabId` whose copy stopped polling (its profile closed,
-its background page restarted, the hub restarted) is refused with a message to
-list tabs again, never tried on another copy. `GET /status` shows one row per
-polling copy. A hub shared by several devices ([HOSTING.md](HOSTING.md))
+the hub restarted) is refused with a message to list tabs again, never tried on
+another copy. `GET /status` shows one row per polling copy.
+
+Two things changed in 0.40. A copy that cannot MESSAGE a page can now still
+DRIVE it, through the shared content world (see "How the panel is reached"
+above), so the ownership lottery decides which route is used rather than
+whether the call works at all; the relay is the fallback. And a background page
+keeps its instance id across the restarts Safari gives it, so tab ids survive
+those — only a hub restart invalidates them, which is where the guarantee
+actually comes from. A hub shared by several devices ([HOSTING.md](HOSTING.md))
 merges every device's copies into one list the same way; that is the shape of
 a shared hub, not a bug.
 
@@ -476,6 +532,33 @@ naming a `node` that has moved, which `bash install.sh --bridge-only` fixes.
 **A `!` badge on the toolbar button.** Hover it: either the page predates the
 extension (reload once) or the site has no website-access grant (Safari >
 Settings > Extensions > Claude for Safari > Always Allow on Every Website).
+Two more reasons it can give since 0.40: "the panel needs an HTML document"
+(a PDF, an `.svg` opened as a page, an XML feed — there is nowhere to put an
+HTML panel), and the hub being unreachable, which no longer stops the panel
+from opening at all.
+
+**The panel does not open and nothing happens at all.** `diag` the tab (above).
+`world.run: false` with `state: "ready"` means an old build's content script is
+in the page and 0.40's takeover will clear it on the next click;
+`world.ctx` different from `instance` means another profile's copy holds the
+page, which the world route handles. A tab id that answers "the extension
+instance this call was routed to stopped polling" came from a hub run that has
+since restarted — list the tabs again.
+
+**A tool call says the tab id is stale, repeatedly.** Before 0.40 each
+background-page start minted a new instance id, and Safari restarts that page
+on its own (measured several times an hour on an idle Mac), so every tab id a
+session was holding went stale with it. The id is persisted per profile now;
+only a HUB restart invalidates tab ids, which is the guarantee that matters.
+
+**The hub log shows a flood of `GET /pull`.** That is an extension older than
+0.35 — Safari can keep a stale copy of the extension running in one profile
+alongside the current one, and the pre-0.36 poll loop has no backoff, so it
+spins as fast as the hub answers (287 requests per second, measured
+2026-09-16, unchanged by three Safari restarts). The hub holds that refusal for
+three seconds, which caps it at well under one request per second while the
+stale copy lasts. It answers nothing and drives nothing; the current copy in
+the same Safari is unaffected.
 
 **A tool call lands in the wrong Safari profile.** One hub serves every
 profile's extension instance and the first to poll answers. Disable the

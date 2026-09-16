@@ -34,21 +34,48 @@ browser.storage.onChanged.addListener((ch, area) => {
 // This background page's name to the hub. Safari runs one copy of the
 // extension per profile, every copy polls the same hub, the copies number the
 // same tabs differently, and only one of them can reach any given page's
-// content script (the copy whose content.js ran there first; the run-once
-// guard keeps the others out). The hub routes each call to the copy that can
-// serve it -- see "Several extension instances, one hub" in the bridge -- and
-// this id, fresh per background-page start, is how it tells the copies apart.
+// content script by MESSAGE (the copy whose content.js ran there first; the
+// world route below is how the others reach it anyway). The hub routes each
+// call to the copy that can serve it -- see "Several extension instances, one
+// hub" in the bridge -- and this id is how it tells the copies apart.
 // (crypto.randomUUID is everywhere Safari runs this; the fallback is for the
 // test sandbox, which has no crypto global.)
-const INSTANCE = (typeof crypto !== "undefined" && crypto.randomUUID)
+//
+// IT IS PERSISTED (0.40), not fresh per start. Safari restarts this background
+// page on its own -- measured 2026-09-16, several times an hour on an idle
+// Mac, with the hub seeing a new instance each time -- and a fresh id made the
+// hub treat the restarted copy as a different profile, so every tabId a Claude
+// Code session was holding turned into "the extension instance this call was
+// routed to stopped polling; run claude_safari_tabs again" (hit mid-run in the
+// page matrix). Safari's own tab ids outlive the background page, so keeping
+// the id keeps them valid. The hub still refuses ids from an earlier HUB run:
+// its slots start at a random base each time it starts, which is what that
+// guarantee actually rests on.
+const INSTANCE_KEY = "instanceId";
+let INSTANCE = (typeof crypto !== "undefined" && crypto.randomUUID)
   ? crypto.randomUUID()
   : Math.random().toString(36).slice(2) + Date.now().toString(36);
+const instanceReady = (async () => {
+  try {
+    const st = await browser.storage.local.get(INSTANCE_KEY);
+    if (typeof st[INSTANCE_KEY] === "string" && st[INSTANCE_KEY]) { INSTANCE = st[INSTANCE_KEY]; return; }
+    await browser.storage.local.set({ [INSTANCE_KEY]: INSTANCE });
+  } catch (e) {}
+})();
 const hubFetch = (path, opts = {}) => {
   const o = { ...opts, headers: { ...(opts.headers || {}), "x-claude-instance": INSTANCE } };
   if (hub.token) o.headers.authorization = "Bearer " + hub.token;
   return fetch(hub.url + path, o);
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A long poll the hub parks for 25s, given 10s of slack — and then ABANDONED.
+// Without a bound this loop has no way back from a fetch that never settles,
+// and that is not hypothetical: measured 2026-09-16, two background pages sat
+// silent for over 100 seconds while four sockets to the hub stayed ESTABLISHED,
+// the hub reported no polling instance at all, and every queued tool call timed
+// out. A poll that overruns the park time is a dead poll; drop it and start the
+// next one.
+const PULL_TIMEOUT_MS = 35000;
 
 // The content script's answer to a ping, or null: absent (Safari resolves a
 // sendMessage nobody receives with undefined), another instance's, or a page
@@ -92,14 +119,67 @@ async function targetTab(args) {
   return tabs[0];
 }
 
+// THE WORLD ROUTE. tabs.sendMessage only reaches a content script that
+// registered with THIS context's messaging channel, and a page's content world
+// is shared by every context of this extension (one per Safari profile, plus
+// any a bundle replaced under a running Safari left behind) -- so the script
+// that ran first is often bound to someone else's channel. tabs.executeScript
+// runs in that shared world itself, so it reaches whichever script is actually
+// there. Measured 2026-09-16 on Safari 27: on a plain page opened seconds
+// earlier by this very instance, sendMessage resolved undefined while
+// executeScript read the script's own state out of the world.
+//
+// Returns the op's value, undefined when no script is published there, and
+// throws what the op threw.
+async function worldCall(tabId, msg) {
+  const code =
+    "(() => { var w = window.__claudeSafari;" +
+    " if (!w || typeof w.run !== 'function') return { absent: true };" +
+    " try { var v = w.run(" + JSON.stringify(msg) + "); return v === undefined ? { absent: true } : { value: v }; }" +
+    " catch (e) { return { failed: String((e && e.message) || e) }; } })()";
+  const r = await browser.tabs.executeScript(tabId, { code });
+  const out = Array.isArray(r) ? r[0] : r;
+  if (!out || out.absent) return undefined;
+  if (out.failed) throw new Error(out.failed);
+  return out.value;
+}
+
+// Clear the run-once guard so the next injection really runs. Only for a page
+// whose script answers NEITHER route: it belongs to an extension context that
+// no longer exists, or to a build too old to publish the world route.
+async function takeOver(tabId) {
+  try {
+    await browser.tabs.executeScript(tabId, { code:
+      "try { window.__claudeSafariContent = 'stale'; if (window.__claudeSafari) window.__claudeSafari.run = null; } catch (e) {}" });
+  } catch (e) {}
+}
+
 // content.js may not be in a tab (page opened before the extension, or the
 // site has no access grant) — and Safari resolves sendMessage to a missing
 // receiver with UNDEFINED rather than throwing, so absence must be probed
 // with a ping, then repaired by injecting content.js on demand. A toolbar
 // click grants activeTab, so injection works on the clicked tab even before
 // any site-wide permission.
+//
+// Returns which route reached the page: "message" for this context's own
+// channel, "world" for the shared content world.
 async function ensureContent(tabId) {
-  if (await pingTab(tabId)) return;
+  if (await pingTab(tabId)) return "message";
+  if (await worldPing(tabId)) return "world";
+  await injectContent(tabId);
+  if (await pingTab(tabId, 3000)) return "message";
+  if (await worldPing(tabId)) return "world";
+  // Something is in the page that answers neither route and blocks injection.
+  // Take the page over and inject once more; the fresh run removes whatever
+  // panel the unreachable one had left behind.
+  await takeOver(tabId);
+  await injectContent(tabId);
+  if (await pingTab(tabId, 3000)) return "message";
+  if (await worldPing(tabId)) return "world";
+  throw new Error("content script did not answer after injection (Safari-internal or blocked page?)");
+}
+
+async function injectContent(tabId) {
   try {
     await browser.tabs.executeScript(tabId, { file: "content.js" });
   } catch (e) {
@@ -114,17 +194,33 @@ async function ensureContent(tabId) {
       String((e && e.message) || e)
     );
   }
-  const again = await browser.tabs.sendMessage(tabId, { op: "ping" }).catch(() => undefined);
-  if (!(again && again.ok)) {
-    throw new Error("content script did not answer after injection (Safari-internal or blocked page?)");
+}
+
+// The world route's liveness probe, and the ping payload with it (hidden is
+// what tells a toolbar click it came from Safari's Tab Overview).
+async function worldPing(tabId) {
+  try {
+    const r = await worldCall(tabId, { op: "ping" });
+    return r && r.ok ? r : null;
+  } catch (e) {
+    return null;
   }
 }
 
 async function askContent(tabId, msg) {
-  await ensureContent(tabId);
+  const via = await ensureContent(tabId);
+  if (via === "world") {
+    const w = await worldCall(tabId, msg);
+    if (w === undefined) throw new Error("content script gave no response for op " + msg.op);
+    return w;
+  }
   const r = await browser.tabs.sendMessage(tabId, msg);
-  if (r === undefined) throw new Error("content script gave no response for op " + msg.op);
-  return r;
+  if (r !== undefined) return r;
+  // The channel answered the ping and then stopped: its context was recycled
+  // between the two calls. The world still holds the script.
+  const w = await worldCall(tabId, msg);
+  if (w === undefined) throw new Error("content script gave no response for op " + msg.op);
+  return w;
 }
 
 const handlers = {
@@ -161,10 +257,23 @@ const handlers = {
   async toggleActive() {
     const tabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
     if (!tabs.length) return { handled: false };
-    const ping = await pingTab(tabs[0].id);
+    // Both routes, but no injection and no takeover: a relayed click is an
+    // offer ("can you reach this page?"), and the instance that was clicked
+    // falls back to its own repair when every other one says no.
+    const ping = (await pingTab(tabs[0].id)) || (await worldPing(tabs[0].id));
     if (!ping) return { handled: false };
-    await browser.tabs.sendMessage(tabs[0].id, { op: "togglePanel", withAllTabs: !!ping.hidden });
+    await askContent(tabs[0].id, { op: "togglePanel", withAllTabs: !!ping.hidden });
     return { handled: true };
+  },
+
+  // The toolbar click itself, for a curl at the hub
+  // (POST /call {"tool":"toolbar"}); not an MCP tool. Safari's toolbar button
+  // cannot be clicked by any automation on this platform -- no AppleScript
+  // class, no WebDriver, no WebExtension API -- so this is the only way to
+  // exercise the path a user's click takes, and the path that has to work.
+  async toolbar(args) {
+    const tab = await targetTab(args);
+    return toolbarClick(tab);
   },
 
   // One tab as this instance sees it, for a curl at the hub
@@ -179,10 +288,18 @@ const handlers = {
     const t0 = Date.now();
     const ping = await pingTab(tab.id, 3000);
     const pingMs = Date.now() - t0;
+    // The world route answers for a script bound to another context's channel,
+    // which is exactly the case a failing ping cannot tell apart from "no
+    // script here at all".
+    const worldPingResult = await worldPing(tab.id);
     let world = null, worldError = null;
     try {
       const r = await browser.tabs.executeScript(tab.id, { code:
-        "({ state: String(window.__claudeSafariContent), api: typeof browser, href: location.href, ready: document.readyState })" });
+        "({ state: String(window.__claudeSafariContent), api: typeof browser, href: location.href, ready: document.readyState," +
+        " run: !!(window.__claudeSafari && typeof window.__claudeSafari.run === 'function')," +
+        " ctx: (window.__claudeSafari && window.__claudeSafari.ctx) || ''," +
+        " gen: (window.__claudeSafari && window.__claudeSafari.gen) || 0," +
+        " v: (window.__claudeSafari && window.__claudeSafari.v) || 0 })" });
       world = Array.isArray(r) ? r[0] : r;
     } catch (e) {
       worldError = String((e && e.message) || e);
@@ -190,7 +307,8 @@ const handlers = {
     let instance = "", version = "";
     try { instance = browser.runtime.getURL(""); } catch (e) {}
     try { version = browser.runtime.getManifest().version; } catch (e) {}
-    return { tabId: tab.id, url: tab.url, status: tab.status, instance, version, ping, pingMs, world, worldError };
+    return { tabId: tab.id, url: tab.url, status: tab.status, instance, version,
+      ping, pingMs, worldPing: worldPingResult, world, worldError };
   },
 
   async read(args) {
@@ -301,6 +419,9 @@ function pollBadge(text, title) {
 }
 
 async function loop() {
+  // The first poll waits for the persisted instance id: polling under the
+  // temporary one would take a slot the restored id then has to abandon.
+  await instanceReady;
   for (;;) {
     try {
       // POST, not GET, since 0.35. The hub answers /pull to POST only because a
@@ -308,7 +429,7 @@ async function loop() {
       // send no Origin at all -- byte-identical to this extension's own fetch,
       // measured on Safari 27 -- while a cross-origin POST always carries the
       // page's Origin, which the hub rejects. Nothing is sent in the body.
-      const r = await hubFetch("/pull", { method: "POST" });
+      const r = await hubFetch("/pull", { method: "POST", signal: AbortSignal.timeout(PULL_TIMEOUT_MS) });
       hubUp = true;
       if (r.status === 200) {
         pollBadge("");
@@ -354,31 +475,42 @@ loop();
 // panel injected by content.js. The panel's chat turns are relayed here
 // (content scripts can't reach localhost) and POSTed to the hub's /chat,
 // which runs the real `claude -p` with --resume for multi-turn memory.
-browser.browserAction.onClicked.addListener(async (tab) => {
+// The toolbar click, as a named function so the hub can exercise this exact
+// path for a test (POST /call {"tool":"toolbar"}): Safari's toolbar cannot be
+// clicked programmatically, and the click path is the one that has to work.
+async function toolbarClick(tab) {
   try {
-    let ping = await pingTab(tab.id);
+    // ask through every route this context has, repairing the page as needed
+    // (see ensureContent). The hub is NOT in this path: the panel must open
+    // with the bridge down, and the relay below is only for a page this
+    // context genuinely cannot reach.
+    let ping = await askContent(tab.id, { op: "ping" }).catch(() => null);
     if (!ping) {
-      // Not this instance's page (see INSTANCE): another profile's copy ran
-      // content.js here first and is the only one that can reach the panel.
-      // Hand the click to it through the hub; only when no copy owns the page
-      // does this one inject and take it.
-      if (await relayToggle()) { pollBadge(""); return; }
+      // Another profile's copy owns the page and this one cannot reach it at
+      // all. Hand the click to whichever copy can, through the hub.
+      if (await relayToggle()) { pollBadge(""); return { relayed: true }; }
+      // Nothing owns it: report the reason the local routes gave.
       await ensureContent(tab.id);
-      ping = await pingTab(tab.id);
+      ping = await askContent(tab.id, { op: "ping" });
     }
     // In Safari's Tab Overview the active page reports itself hidden — the
     // only overview signal an extension gets. A click from there means "chat
     // about all my tabs", so the panel opens with every tab attached.
     const fromOverview = !!(ping && ping.hidden);
-    await browser.tabs.sendMessage(tab.id, { op: "togglePanel", withAllTabs: fromOverview });
+    const r = await askContent(tab.id, { op: "togglePanel", withAllTabs: fromOverview });
     pollBadge("");
+    return r;
   } catch (e) {
     // Badge as the only in-chrome signal we have; the title carries the why.
     // Through pollBadge so the poll loop and the click handler share one idea
     // of what the badge currently says.
     pollBadge("!", "Claude: " + String((e && e.message) || e));
+    throw e;
   }
-});
+}
+// The promise is returned rather than dropped: Safari ignores it, and a test
+// (and the hub's toolbar op) can await the click it just made.
+browser.browserAction.onClicked.addListener((tab) => toolbarClick(tab).catch(() => {}));
 
 browser.runtime.onMessage.addListener((msg) => {
   if (!msg) return undefined;
