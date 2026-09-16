@@ -165,6 +165,16 @@ whatever panel the unreachable one had left. The toolbar click no longer
 depends on the hub at all — the `/relay` hand-off is the last resort now, not
 the first step.
 
+One more thing that world holds: MORE THAN ONE BUILD's content script. Measured
+2026-09-16 on a page whose world had been injected into by two contexts of this
+extension — the run-once guard let the newer file run (it publishes the world
+route the older one lacks), and a `ping` through the message channel came back
+from the older one, `v: 5`, because listeners answer in registration order.
+Which script serves a page is therefore Safari's race, not a choice available
+here; what 0.40 guarantees is that the page answers SOMEONE and that the panel
+opens, rather than the page going silent because the only listener belongs to a
+background page that is not being asked.
+
 **The host element carries its own armour.** A shadow root keeps the page's CSS
 out of the panel; it does nothing about the page's CSS reaching the HOST. A
 page with `div:empty { display: none !important }` — the host has no light-DOM
