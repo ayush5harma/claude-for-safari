@@ -227,8 +227,13 @@ what `tabs.executeScript` sees in the page's content world: the run-once state,
 whether the extension API is present, and — since 0.40 — which context the
 script in that page belongs to (`ctx`), its protocol version and its
 generation. A `ctx` that is not the answering `instance` is the shared-world
-case the panel section describes. It is the first thing to run when a page says
-"content script did not answer after injection".
+case the panel section describes. Since 0.41 it also reports what the answering
+copy knows about itself: `version` (its manifest version), `granted` (whether
+`permissions.contains` says the tab's site is granted to it) and `bundleOk`
+(whether it can still read its own files — `false` means its bundle was
+replaced while Safari kept running it, and only a Safari relaunch clears that).
+It is the first thing to run when a page says "content script did not answer
+after injection".
 
 Limits worth knowing: the extension must be enabled and granted the site in the
 profile you want driven; parallel callers share one queue per extension
@@ -254,7 +259,24 @@ with no `tabId` goes to the copy that owns the active tab, and a toolbar click
 in a copy that cannot reach the page is relayed through the hub (`/relay`) to
 the copy that can. A `tabId` whose copy stopped polling (its profile closed,
 the hub restarted) is refused with a message to list tabs again, never tried on
-another copy. `GET /status` shows one row per polling copy.
+another copy. `GET /status` shows one row per polling copy — with, since 0.41,
+its `version`, its `base` URL and whether it is `current`.
+
+**A copy an update superseded keeps polling (0.41).** Installing a new build
+while Safari runs does not end the old extension context: measured 2026-09-16,
+`POST /call` answered `unknown tool: diag` from a context older than the build
+in `/Applications`, and four contexts of this one extension were alive at once
+(two polling, two still owning the content worlds of pages injected earlier
+that day). Each copy therefore reports its version and its base URL to the hub
+(`x-claude-version`, `x-claude-base`), and everything that CHOOSES a copy —
+a call with no `tabId`, the `tabs` fan-out, the toolbar relay — chooses among
+the copies running the newest version any of them reports. A `tabId` minted by
+a superseded copy is refused by name ("belongs to extension slot 460 (version
+0.37, safari-web-extension://…), which a newer build has superseded"), never
+run in the old build. The repair is a Safari relaunch, and the refusal says so.
+For the same reason an instance id is now stored per context rather than per
+profile: extension storage is per profile, so two contexts of one profile used
+to send the hub one id, which parked one `/pull` between them.
 
 Two things changed in 0.40. A copy that cannot MESSAGE a page can now still
 DRIVE it, through the shared content world (see "How the panel is reached"
@@ -539,13 +561,28 @@ Check the system sees it at all: `pluginkit -m | grep claude`.
 `~/.cache/claude-safari/bridge.launchd.log` — the usual cause is the plist
 naming a `node` that has moved, which `bash install.sh --bridge-only` fixes.
 
-**A `!` badge on the toolbar button.** Hover it: either the page predates the
-extension (reload once) or the site has no website-access grant (Safari >
-Settings > Extensions > Claude for Safari > Always Allow on Every Website).
-Two more reasons it can give since 0.40: "the panel needs an HTML document"
-(a PDF, an `.svg` opened as a page, an XML feed — there is nowhere to put an
-HTML panel), and the hub being unreachable, which no longer stops the panel
-from opening at all.
+**A `!` badge on the toolbar button.** Hover it: since 0.41 the text names the
+ONE condition that holds, because each is checked rather than listed. The
+possibilities, in the order they are ruled out: a scheme Safari runs no
+extension in (`file:`, `about:`, Safari's own pages); a tab whose address this
+copy cannot even see (Safari hides it from an extension with no access to the
+tab — another profile's window, or a revoked site); a site
+`permissions.contains` says is not granted (Safari > Settings > Extensions >
+Claude for Safari > Allow on All Websites); a copy of the extension that can no
+longer read its own files, which is what installing a new build under a running
+Safari leaves behind and which only a Safari relaunch clears; a tab Safari has
+not finished loading; and, when none of those hold, Safari's own reason with
+the relaunch named as the known repair. Two reasons unrelated to injection:
+"the panel needs an HTML document" (an `.svg` opened as a page, an XML feed) or
+"the panel needs a web page" (a PDF — Safari renders it with its own viewer,
+whose whole body is one `<embed>`), and the hub being unreachable, which does
+not stop the panel opening.
+
+Until 0.41 that text named a tab Safari had not loaded and a missing site grant
+together, and on 2026-09-16 it named both when neither held: the page was open
+in front of the user and Safari's own record granted every site, while the copy
+of the extension that took the click had had its bundle replaced under the
+running Safari.
 
 **The panel does not open and nothing happens at all.** `diag` the tab (above).
 `world.run: false` with `state: "ready"` means an old build's content script is
@@ -558,8 +595,12 @@ since restarted — list the tabs again.
 **A tool call says the tab id is stale, repeatedly.** Before 0.40 each
 background-page start minted a new instance id, and Safari restarts that page
 on its own (measured several times an hour on an idle Mac), so every tab id a
-session was holding went stale with it. The id is persisted per profile now;
-only a HUB restart invalidates tab ids, which is the guarantee that matters.
+session was holding went stale with it. The id is persisted per extension
+context now (per profile in 0.40, which gave two contexts of one profile the
+same id and one parked `/pull` between them); only a HUB restart invalidates
+tab ids, which is the guarantee that matters. A tab id refused because a NEWER
+build has superseded the copy that minted it is the other case, and it names
+that copy: relaunch Safari and list the tabs again.
 
 **The hub log shows a flood of `GET /pull`, or the gear's site list says an
 older copy owns the page.** Safari can keep a stale copy of this extension
