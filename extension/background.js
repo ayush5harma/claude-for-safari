@@ -252,8 +252,23 @@ async function ensureContent(tabId) {
   if (m && (m.v || 0) >= CONTENT_V) return { via: "message", ping: m };
   const w = await worldPing(tabId);
   if (w && (w.v || 0) >= CONTENT_V) return { via: "world", ping: w };
-  if (m) return { via: "message", ping: m };
-  if (w) return { via: "world", ping: w };
+  // ONLY AN OLDER SCRIPT ANSWERS. Injecting this build over it is allowed to
+  // work: a script old enough to publish no world route leaves world.run unset,
+  // and the run-once guard in content.js only holds for a run that published
+  // one. So the newest script really does end up serving the page, rather than
+  // the page keeping an old build's panel -- the one without the fixes 0.40 and
+  // 0.41 exist for. If the injection changes nothing, the old script is still
+  // better than nothing.
+  if (m || w) {
+    try {
+      await injectContent(tabId);
+      const m2 = await pingTab(tabId, 3000);
+      if (m2 && (m2.v || 0) >= CONTENT_V) return { via: "message", ping: m2 };
+      const w2 = await worldPing(tabId);
+      if (w2 && (w2.v || 0) >= CONTENT_V) return { via: "world", ping: w2 };
+    } catch (e) {}
+    return m ? { via: "message", ping: m } : { via: "world", ping: w };
+  }
   await injectContent(tabId);
   let p = await pingTab(tabId, 3000);
   if (p) return { via: "message", ping: p };
@@ -597,7 +612,7 @@ let hubUp = false;
 // "unauthorized" while the hub was actually refusing the extension's version.
 let pollBadgeKey = null;
 function pollBadge(text, title) {
-  const key = text + " " + (title || "");
+  const key = text + "\u0000" + (title || "");
   if (pollBadgeKey === key) return;
   pollBadgeKey = key;
   try {

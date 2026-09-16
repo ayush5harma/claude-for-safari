@@ -291,6 +291,28 @@ test("an older copy's script on the message channel loses to this build's in the
   assert.deepEqual(env.injected, [], "an old script that answers is not re-injected over");
 });
 
+test("a page where ONLY an old script answers is injected over, and this build serves it", async () => {
+  // The old script holds the message channel and publishes no world route, so
+  // the run-once guard lets this build's run through and the newest script ends
+  // up serving the page. Before, the click used the old script and the page got
+  // that build's panel -- without the fixes this version exists for.
+  const env = load({ tabs: [T(8, true)], owned: [8], messageV: 4 });
+  await env.click(T(8, true));
+  assert.deepEqual(env.injected, [8], "injected over the old script, once");
+  assert.ok(env.evaluated.some(([id, code]) => id === 8 && code.includes("togglePanel")),
+    "and the fresh run's world route served the click");
+});
+
+test("an old script that survives the injection still serves the page", async () => {
+  // blockInjection models a page where this build's run cannot take the world
+  // (the guard held). Falling back to the old script beats refusing to open.
+  const env = load({ tabs: [T(8, true)], owned: [8], messageV: 4, blockInjection: [8] });
+  await env.click(T(8, true));
+  assert.ok(env.sent.some(([id, m]) => id === 8 && m.op === "togglePanel"), "through the old script");
+  assert.equal(env.evaluated.some(([, code]) => code.includes("'stale'")), false,
+    "and a page that answers is never taken over");
+});
+
 test("a page whose script answers neither route is taken over, then toggled", async () => {
   // An old build's content script: it set the run-once guard and publishes no
   // world route, so the first injection returns at the guard.
