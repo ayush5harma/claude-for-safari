@@ -288,25 +288,35 @@ xcrun safari-web-extension-converter "$STAGE_EXT" \
 
 PROJ="$(find "$APP_DIR" -maxdepth 3 -name '*.xcodeproj' -print -quit)"
 [ -n "$PROJ" ] || { echo "ERROR: converter produced no .xcodeproj" >&2; exit 1; }
+# Xcode 27.2's converter writes the project as project.xcproj (a JSON-shaped
+# file) instead of project.pbxproj; a build from a fresh copy of this repo
+# found only the new file and died reading the old name (measured
+# 2026-09-18, the first fleet rebuild after the Xcode update -- a checkout
+# that had built before still carried a pbxproj under the gitignored app/,
+# which is why the failure only showed from the store copy).
 PBX="$PROJ/project.pbxproj"
+[ -f "$PROJ/project.xcproj" ] && PBX="$PROJ/project.xcproj"
+[ -f "$PBX" ] || { echo "ERROR: $PROJ holds neither project.pbxproj nor project.xcproj" >&2; exit 1; }
 
 # ── 2. Normalize bundle IDs ───────────────────────────────────────────────────
 # Every PRODUCT_BUNDLE_IDENTIFIER ending in .Extension becomes $APP_ID.Extension;
 # everything else becomes $APP_ID. Deterministic regardless of what the
-# converter derived from the (space-containing) app name.
+# converter derived from the (space-containing) app name. Both spellings: the
+# pbxproj's `KEY = "value";` and the xcproj's `"KEY": "value"`.
 /usr/bin/python3 - "$PBX" "$APP_ID" <<'PY'
 import re, sys
 pbx, app_id = sys.argv[1], sys.argv[2]
 s = open(pbx).read()
-def fix(m):
-    val = m.group(1)
-    new = f"{app_id}.Extension" if val.endswith(".Extension") else app_id
-    return f'PRODUCT_BUNDLE_IDENTIFIER = "{new}";'
-s = re.sub(r'PRODUCT_BUNDLE_IDENTIFIER = "?([^";]+)"?;', fix, s)
+def target(val):
+    return f"{app_id}.Extension" if val.endswith(".Extension") else app_id
+s = re.sub(r'PRODUCT_BUNDLE_IDENTIFIER = "?([^";]+)"?;',
+           lambda m: f'PRODUCT_BUNDLE_IDENTIFIER = "{target(m.group(1))}";', s)
+s = re.sub(r'"PRODUCT_BUNDLE_IDENTIFIER": "([^"]+)"',
+           lambda m: f'"PRODUCT_BUNDLE_IDENTIFIER": "{target(m.group(1))}"', s)
 open(pbx, "w").write(s)
 PY
 echo "Bundle IDs normalized:"
-grep -oE 'PRODUCT_BUNDLE_IDENTIFIER = [^;]+;' "$PBX" | sort -u | sed 's/^/  /'
+grep -oE 'PRODUCT_BUNDLE_IDENTIFIER"?[ :=]+"[^";]+"' "$PBX" | sort -u | sed 's/^/  /'
 
 # ── 3. Build ──────────────────────────────────────────────────────────────────
 # MANUAL signing for every identity kind, all with an empty team and no
