@@ -403,7 +403,11 @@ APPEX="$(find "$DEST/Contents/PlugIns" -maxdepth 1 -name '*.appex' -print -quit)
 # pluginkit lists a freshly added extension about a second later (measured
 # 2026-09-18: an immediate check missed it and the fallback launch below ran
 # on every build), so give it a few seconds before concluding anything.
-registered() { pluginkit -m 2>/dev/null | grep -q "$APP_ID.Extension"; }
+# Capture first, never `pluginkit -m | grep -q`: under pipefail grep's exit
+# at the first match hands pluginkit a SIGPIPE and the pipeline reads as
+# "not registered" although it is (measured 2026-09-18 -- the warning below
+# printed on every build while pluginkit -m plainly listed the extension).
+registered() { case "$(pluginkit -m 2>/dev/null)" in *"$APP_ID.Extension"*) return 0 ;; esac; return 1; }
 for _ in 1 2 3 4 5 6 7 8 9 10; do registered && break; sleep 0.5; done
 if ! registered; then
   # The one thing a launch does that registration does not: on a Mac that has
