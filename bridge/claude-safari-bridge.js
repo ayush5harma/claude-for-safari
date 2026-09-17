@@ -43,6 +43,7 @@ const BIND = process.env.BRIDGE_BIND || "127.0.0.1";
 const TOKEN = process.env.BRIDGE_TOKEN || "";
 const HUB = `http://127.0.0.1:${PORT}`;
 const PULL_HOLD_MS = 25000;    // long-poll park time
+const LEGACY_REFUSE_MS = 3000; // how long a pre-0.35 GET /pull is held before its 403
 const CALL_TIMEOUT_MS = 90000; // extension must answer within this
 const CHAT_TIMEOUT_MS = 300000; // a headless claude turn can legitimately take minutes
 const MAX_QUEUE = 100;         // undelivered tool calls kept before dropping the oldest
@@ -108,18 +109,34 @@ function mergeTabListings(listings) {
     return { ...rest, tabId: encodeTabId(slot, t.tabId), windowId: encodeTabId(slot, t.windowId) };
   };
   const primary = live.slice().sort((a, b) => b.tabs.length - a.tabs.length || a.slot - b.slot)[0];
-  const ownedElsewhere = new Map();
+  // Every tab the other instances see, best claim per key: an owner outranks a
+  // listing that merely saw it.
+  const elsewhere = new Map();
   for (const l of live) {
     if (l === primary) continue;
-    l.tabs.forEach((t, pos) => { if (t.owned && !ownedElsewhere.has(key(t, pos))) ownedElsewhere.set(key(t, pos), { slot: l.slot, tab: t }); });
+    l.tabs.forEach((t, pos) => {
+      const k = key(t, pos);
+      const seen = elsewhere.get(k);
+      if (!seen || (t.owned && !seen.tab.owned)) elsewhere.set(k, { slot: l.slot, tab: t });
+    });
   }
   const out = [];
   primary.tabs.forEach((t, pos) => {
-    if (t.owned) { out.push(pub(primary.slot, t)); return; }
-    const o = ownedElsewhere.get(key(t, pos));
-    if (o) { ownedElsewhere.delete(key(t, pos)); out.push(pub(o.slot, o.tab)); } else out.push(pub(primary.slot, t));
+    const k = key(t, pos);
+    const o = elsewhere.get(k);
+    elsewhere.delete(k);          // this tab is accounted for, whoever serves it
+    if (!t.owned && o && o.tab.owned) { out.push(pub(o.slot, o.tab)); return; }
+    out.push(pub(primary.slot, t));
   });
-  for (const o of ownedElsewhere.values()) out.push(pub(o.slot, o.tab));
+  // WHAT IS LEFT IS A WINDOW THE PRIMARY'S LISTING DID NOT CONTAIN, owned or
+  // not. Measured 2026-09-16 on Safari 27: a context lists only the windows of
+  // its OWN profile, so with two profiles open the listings were disjoint (25
+  // tabs in one window, 9 in another) and taking only the OWNED leftovers
+  // dropped the eight tabs of the second profile whose content script had not
+  // run yet -- they simply did not exist for claude_safari_tabs. A duplicate is
+  // still not possible: a tab both listings hold has the same position, url and
+  // title in both, so it was matched and deleted above.
+  for (const o of elsewhere.values()) out.push(pub(o.slot, o.tab));
   return out;
 }
 
@@ -133,6 +150,41 @@ function pickActiveSlot(probes) {
   const best = (probes || []).slice().sort((a, b) => score(b.probe) - score(a.probe) || a.slot - b.slot)[0];
   return best ? best.slot : null;
 }
+
+// ── A context an update has superseded ───────────────────────────────────────
+// Replacing the app while Safari runs does not end the old extension context:
+// measured 2026-09-16, a POST /call answered "unknown tool: diag" and "unknown
+// tool: toggleActive" from a context running a build older than the one in
+// /Applications, on a Mac where the current build had both ops. That copy
+// polls, takes calls, and serves them with code and tab numbering nobody asked
+// for. Each instance reports its manifest version, so the hub can keep to the
+// newest one it can see; instances that report no version at all (an extension
+// older than 0.41) are only used when nothing reports one, because an
+// unversioned copy is by definition not the newest.
+const versionParts = (v) => String(v || "").split(".").map((n) => Number(n) || 0);
+const cmpVersion = (a, b) => {
+  const A = versionParts(a), B = versionParts(b);
+  for (let i = 0; i < Math.max(A.length, B.length); i++) {
+    const d = (A[i] || 0) - (B[i] || 0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return 0;
+};
+// The live instances running the newest version any of them reports. Never
+// empty when `live` is not: an unanswerable filter would turn "a stale copy is
+// polling" into "no extension at all".
+function currentInstances(live) {
+  const best = (live || []).reduce((m, i) => (i.version && cmpVersion(i.version, m) > 0 ? i.version : m), "");
+  if (!best) return live || [];
+  const cur = (live || []).filter((i) => i.version && cmpVersion(i.version, best) === 0);
+  return cur.length ? cur : (live || []);
+}
+// How a refusal names a context: the slot a caller's tab ids carry, the build
+// it runs, and the base URL diag reports as `instance`, so the two can be
+// matched by eye.
+const describeInstance = (i) =>
+  "slot " + i.slot + " (" + (i.version ? "version " + i.version : "version unknown") +
+  (i.base ? ", " + i.base : "") + ")";
 
 // WHICH BROWSER TOOLS A PANEL TURN MAY USE. The panel's `claude -p` is headless
 // and cannot ask, so whatever is listed here is pre-approved for a turn whose
@@ -272,12 +324,48 @@ function runHub() {
 
   // The instance behind a request, registered on first sight. Slots are
   // handed out in polling order and never reused within one hub run.
+  //
+  // The KEY is the id AND the context's base URL, because one id can arrive
+  // from two contexts: an extension's storage is per Safari profile, and a
+  // profile runs a second context for as long as Safari keeps a bundle that
+  // was replaced under it. Two contexts on one slot share a parked /pull and
+  // number tabs differently; on their own slots they behave like the separate
+  // profiles they already are. An extension too old to send the base URL
+  // (before 0.41) has no discriminator here, so parkSplit below is its guard.
   const instanceFor = (req) => {
     const iid = String(req.headers["x-claude-instance"] || "legacy").slice(0, 64);
-    let inst = instances.get(iid);
+    const base = String(req.headers["x-claude-base"] || "").slice(0, 128);
+    const version = String(req.headers["x-claude-version"] || "").slice(0, 32);
+    const key = base ? iid + " " + base : iid;
+    let inst = instances.get(key);
     if (!inst) {
-      inst = { iid, slot: nextSlot++, parked: null, queue: [], lastPullAt: 0 };
-      instances.set(iid, inst);
+      inst = { iid: key, family: key, base, version, slot: nextSlot++, parked: null, parkedAt: 0, queue: [], lastPullAt: 0 };
+      instances.set(key, inst);
+    } else if (version && inst.version !== version) {
+      inst.version = version;   // the same context after an in-place reload
+    }
+    return inst;
+  };
+  // A SECOND PARK UNDER ONE ID IS A SECOND CONTEXT. A healthy instance parks
+  // once per PULL_HOLD_MS, so a second /pull arriving while the first park is
+  // seconds old is another copy carrying the same id, not the same copy
+  // re-polling. Splitting it onto its own slot is what stops the release-and-
+  // re-poll spin (the released copy reads 204 as the idle case and polls
+  // straight back) and keeps the two copies' tab numbering apart.
+  const PARK_SPLIT_MS = 1000;
+  const MAX_SPLITS = 8;
+  const parkSplit = (inst) => {
+    if (!inst.parked || Date.now() - inst.parkedAt >= PARK_SPLIT_MS) return inst;
+    for (let n = 2; n <= MAX_SPLITS; n++) {
+      const key = inst.family + " #" + n;
+      const existing = instances.get(key);
+      if (!existing) {
+        const split = { iid: key, family: inst.family, base: inst.base, version: inst.version,
+          slot: nextSlot++, parked: null, parkedAt: 0, queue: [], lastPullAt: 0 };
+        instances.set(key, split);
+        return split;
+      }
+      if (!existing.parked || Date.now() - existing.parkedAt >= PARK_SPLIT_MS) return existing;
     }
     return inst;
   };
@@ -453,15 +541,19 @@ function runHub() {
   const routeCall = async (tool, args) => {
     pruneInstances();
     const live = liveInstances();
+    // Everything that CHOOSES an instance chooses among the current ones: a
+    // copy an update has superseded answers with an older build's ops and its
+    // own tab numbering (see currentInstances).
+    const current = currentInstances(live);
     const probeArgs = { ...args, probe: true };   // `tabs` marks ownership only when asked
     if (tool === "tabs") {
-      if (live.length <= 1) {
-        const r = await dispatch(live[0] || null, "tabs", probeArgs);
+      if (current.length <= 1) {
+        const r = await dispatch(current[0] || null, "tabs", probeArgs);
         if (r.error || !Array.isArray(r.result)) return r;
         return { ...r, result: mergeTabListings([{ slot: r.inst ? r.inst.slot : SLOT_BASE, tabs: r.result }]) };
       }
-      const rs = await fanOut(live, "tabs", probeArgs);
-      const listings = rs.map((r, i) => ({ slot: live[i].slot, tabs: r && Array.isArray(r.result) ? r.result : null }))
+      const rs = await fanOut(current, "tabs", probeArgs);
+      const listings = rs.map((r, i) => ({ slot: current[i].slot, tabs: r && Array.isArray(r.result) ? r.result : null }))
         .filter((l) => l.tabs);
       // Every instance failed: say so, as one instance always did, rather than
       // report a Safari with no tabs.
@@ -471,17 +563,28 @@ function runHub() {
     if (typeof args.tabId === "number") {
       const { slot, id } = decodeTabId(args.tabId);
       const inst = live.find((i) => i.slot === slot);
-      if (inst) return withSlot(await dispatch(inst, tool, { ...args, tabId: id }));
-      // Not this run's slot, or a slot nobody polls any more: the id is stale.
-      // Never strip the slot and try the raw id on whoever is there -- the
-      // instances number the same tabs one apart, so that runs the call in a
-      // neighbouring tab of another profile.
-      return { error: "tab " + args.tabId + " was listed by an extension instance that is no longer polling (its Safari profile closed, its background page restarted, or the hub restarted); run claude_safari_tabs again" };
+      // The instance that MINTED the id is the one that owns the tab: the
+      // copies number the same tabs differently, so nobody else can serve it.
+      // Never strip the slot and try the raw id on whoever is there -- that
+      // runs the call in a neighbouring tab of another profile.
+      if (inst && current.includes(inst)) return withSlot(await dispatch(inst, tool, { ...args, tabId: id }));
+      const where = current.length
+        ? "live now: " + current.map(describeInstance).join(", ")
+        : "no extension instance is polling";
+      if (inst) {
+        // It still polls, but an update has superseded it: its ops and its
+        // tab numbering are the old build's.
+        return { error: "tab " + args.tabId + " belongs to extension " + describeInstance(inst) +
+          ", which a newer build has superseded (" + where + "); relaunch Safari to retire the old copy, then run claude_safari_tabs again" };
+      }
+      return { error: "tab " + args.tabId + " was listed by an extension instance that is no longer polling " +
+        "(its Safari profile closed, its background page restarted, or the hub restarted); " + where +
+        "; run claude_safari_tabs again" };
     }
-    if (live.length <= 1) return withSlot(await dispatch(live[0] || null, tool, args));
-    const probes = await fanOut(live, "probeActive", {}, (r) => !!(r && r.result && r.result.owned));
-    const slot = pickActiveSlot(live.map((inst, i) => ({ slot: inst.slot, probe: probes[i] && probes[i].result || null })));
-    const inst = live.find((i) => i.slot === slot) || live[0];
+    if (current.length <= 1) return withSlot(await dispatch(current[0] || null, tool, args));
+    const probes = await fanOut(current, "probeActive", {}, (r) => !!(r && r.result && r.result.owned));
+    const slot = pickActiveSlot(current.map((inst, i) => ({ slot: inst.slot, probe: probes[i] && probes[i].result || null })));
+    const inst = current.find((i) => i.slot === slot) || current[0];
     return withSlot(await dispatch(inst, tool, args));
   };
 
@@ -516,20 +619,41 @@ function runHub() {
       // old GET with a reason rather than a bare 404, since a stale extension
       // build hitting a new hub is exactly the case that lands here.
       if (req.method === "GET" && req.url === "/pull") {
-        return json(res, 403, { error: "/pull is POST-only since 0.35 (a GET can be forged by any web page); rebuild the extension" });
+        // Refused SLOWLY, on purpose. An extension old enough to poll with GET
+        // is older than the backoff that 0.36 added, so it re-polls the instant
+        // this answers: measured 2026-09-16, a build left behind in one Safari
+        // profile drove 287 GET /pull per second into this hub (20,669 in 72
+        // seconds) for as long as Safari ran, and no Safari restart cleared it.
+        // Nothing waits on this answer, so holding it turns that spin into one
+        // request every few seconds until the stale copy goes.
+        //
+        // The timer is cleared when the client goes away. A held socket that
+        // is aborted leaves writableEnded false (measured on node 24: the
+        // response is destroyed, the late write is discarded, the server
+        // survives), so that check alone never fired and every refused GET
+        // kept a timer for the full hold -- and a page's no-cors GETs could
+        // park sockets, of which Safari allows about six per origin.
+        const holdTimer = setTimeout(() => {
+          json(res, 403, { error: "/pull is POST-only since 0.35 (a GET can be forged by any web page); rebuild the extension" });
+        }, LEGACY_REFUSE_MS);
+        req.on("close", () => clearTimeout(holdTimer));
+        return;
       }
       if (req.method === "POST" && req.url === "/pull") {
         if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
         pruneInstances();
-        const inst = instanceFor(req);
+        const inst = parkSplit(instanceFor(req));
         inst.lastPullAt = lastPullAt = Date.now();
         // Calls for anyone first, then this instance's own; otherwise park,
-        // one parked /pull per instance (a second one from the same instance
-        // releases the first).
+        // one parked /pull per instance (a second one from the same instance,
+        // arriving after its park has aged past PARK_SPLIT_MS, releases the
+        // first -- a younger one is another context and got its own slot
+        // above).
         const next = anyQueue.length ? anyQueue.shift() : inst.queue.length ? inst.queue.shift() : null;
         if (next) return deliver(inst, res, next);
         if (inst.parked) { const old = inst.parked; inst.parked = null; clearTimeout(old._holdTimer); old.writeHead(204); old.end(); }
         inst.parked = res;
+        inst.parkedAt = Date.now();
         res._holdTimer = setTimeout(() => {
           if (inst.parked === res) { inst.parked = null; res.writeHead(204); res.end(); }
         }, PULL_HOLD_MS);
@@ -539,9 +663,14 @@ function runHub() {
       if (req.method === "POST" && req.url === "/result") {
         if (!extensionOriginOk(req)) return json(res, 403, { error: "forbidden" });
         const body = await readBody(req);
-        // Only the instance a call was routed to may answer it.
+        // Only the instance a call was routed to may answer it -- or the copy
+        // it was split from, since a split shares the id and the headers of a
+        // /result cannot say which of the two is answering. The check still
+        // keeps another PROFILE's context out, which is what it is for.
         const w = waiters.get(body.id);
-        if (w && w.inst && w.inst !== instanceFor(req)) return json(res, 403, { error: "not this instance's call" });
+        if (w && w.inst && w.inst.family !== instanceFor(req).family) {
+          return json(res, 403, { error: "not this instance's call" });
+        }
         settle(body.id, body);
         return json(res, 200, { ok: true });
       }
@@ -560,7 +689,7 @@ function runHub() {
         const sender = instanceFor(req);
         const body = await readBody(req);
         if (body.tool !== "toggleActive") return json(res, 400, { error: "relay: unknown tool" });
-        const others = liveInstances().filter((i) => i !== sender);
+        const others = currentInstances(liveInstances()).filter((i) => i.family !== sender.family);
         const rs = await fanOut(others, "toggleActive", body.args || {}, (r) => !!(r && r.result && r.result.handled));
         return json(res, 200, { handled: rs.some((r) => r && r.result && r.result.handled) });
       }
@@ -657,13 +786,18 @@ function runHub() {
       if (req.method === "GET" && req.url === "/status") {
         if (!cliOriginOk(req)) return json(res, 403, { error: "forbidden" });
         const live = liveInstances();
+        const current = currentInstances(live);
         return json(res, 200, {
           ok: true,
           extensionSeenMsAgo: lastPullAt ? Date.now() - lastPullAt : null,
           panelTools: PANEL_TOOLS,
           queued: anyQueue.length + live.reduce((n, i) => n + i.queue.length, 0),
-          // One row per polling extension instance (one per Safari profile).
-          instances: live.map((i) => ({ slot: i.slot, seenMsAgo: Date.now() - i.lastPullAt, parked: !!i.parked })),
+          // One row per polling extension context. Usually one per Safari
+          // profile; a second row with the same version and a different base
+          // URL is a bundle Safari is still running after it was replaced, and
+          // `current` says which rows a call can be routed to.
+          instances: live.map((i) => ({ slot: i.slot, seenMsAgo: Date.now() - i.lastPullAt, parked: !!i.parked,
+            version: i.version || null, base: i.base || null, current: current.includes(i) })),
         });
       }
       json(res, 404, { error: "not found" });
@@ -805,5 +939,6 @@ if (require.main === module) {
   else runMcp();
 } else {
   // The pure routing pieces, for test/hub-routing.test.js.
-  module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot };
+  module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
+    cmpVersion, currentInstances, describeInstance };
 }

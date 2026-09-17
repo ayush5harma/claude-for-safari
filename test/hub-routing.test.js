@@ -11,6 +11,7 @@ const path = require("node:path");
 
 const {
   TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
+  cmpVersion, currentInstances, describeInstance,
 } = require(path.join(__dirname, "..", "bridge", "claude-safari-bridge.js"));
 
 const tab = (id, index, url, owned, extra = {}) => ({
@@ -82,6 +83,20 @@ test("an owned tab only a smaller listing saw is appended, not lost", () => {
   assert.deepEqual(merged.map((t) => t.tabId), [1, 2, TAB_SLOT + 9]);
 });
 
+test("a second profile's whole window survives the merge, not just the tabs it owns", () => {
+  // Measured 2026-09-16 on Safari 27: a context lists only its OWN profile's
+  // windows, so two profiles give two disjoint listings. Taking only the OWNED
+  // leftovers dropped every tab of the smaller window whose content script had
+  // not run yet -- eight of nine, invisible to claude_safari_tabs.
+  const personal = [tab(1, 0, "https://a/", true), tab(2, 1, "https://b/", false), tab(3, 2, "https://c/", false)];
+  const work = [tab(50, 0, "https://w1/", false, { windowId: 400 }),
+    tab(51, 1, "https://w2/", true, { windowId: 400 })];
+  const merged = mergeTabListings([{ slot: 1, tabs: personal }, { slot: 2, tabs: work }]);
+  assert.deepEqual(merged.map((t) => t.tabId),
+    [TAB_SLOT + 1, TAB_SLOT + 2, TAB_SLOT + 3, 2 * TAB_SLOT + 50, 2 * TAB_SLOT + 51]);
+  assert.equal(merged.filter((t) => t.url === "https://w1/").length, 1, "once, not twice");
+});
+
 test("empty and malformed listings merge to nothing", () => {
   assert.deepEqual(mergeTabListings([]), []);
   assert.deepEqual(mergeTabListings([{ slot: 0, tabs: null }, null]), []);
@@ -95,4 +110,31 @@ test("the active-tab call goes to the owner, else to an instance that sees a tab
   // beats one that did.
   assert.equal(pickActiveSlot([{ slot: 0, probe: null }, { slot: 3, probe: { tabId: 1, owned: false } }]), 3);
   assert.equal(pickActiveSlot([]), null);
+});
+
+test("versions compare component by component, so 0.40 is newer than 0.9", () => {
+  // This project numbers 0.37, 0.38, 0.39, 0.40 -- a string compare would call
+  // 0.9 the newest of those.
+  assert.equal(cmpVersion("0.40", "0.9") > 0, true);
+  assert.equal(cmpVersion("0.37", "0.41") < 0, true);
+  assert.equal(cmpVersion("0.41", "0.41"), 0);
+  assert.equal(cmpVersion("1.0", "0.99") > 0, true);
+  assert.equal(cmpVersion("", "0.41") < 0, true);
+});
+
+test("only contexts running the newest version a live one reports may take a call", () => {
+  const i = (slot, version) => ({ slot, version, base: "safari-web-extension://" + slot + "/" });
+  const live = [i(1, "0.37"), i(2, "0.41"), i(3, "0.41")];
+  assert.deepEqual(currentInstances(live).map((x) => x.slot), [2, 3]);
+  // An extension too old to report a version cannot be the newest -- but if
+  // NOBODY reports one, every instance stays eligible rather than none.
+  assert.deepEqual(currentInstances([i(1, ""), i(2, "0.41")]).map((x) => x.slot), [2]);
+  assert.deepEqual(currentInstances([i(1, ""), i(2, "")]).map((x) => x.slot), [1, 2]);
+  assert.deepEqual(currentInstances([]), []);
+});
+
+test("a refusal names the slot, the build and the context diag reports", () => {
+  assert.equal(describeInstance({ slot: 460, version: "0.41", base: "safari-web-extension://7A6C/" }),
+    "slot 460 (version 0.41, safari-web-extension://7A6C/)");
+  assert.equal(describeInstance({ slot: 3, version: "", base: "" }), "slot 3 (version unknown)");
 });
