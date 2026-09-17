@@ -280,11 +280,14 @@ xcrun --find xcodebuild >/dev/null 2>&1 || { echo "ERROR: xcodebuild not found" 
 # ── 1. Convert ────────────────────────────────────────────────────────────────
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR"
+# --no-open: without it the converter opens the generated project in Xcode's
+# GUI every time, which a build from a switch or a background session has no
+# business doing (the user watched Xcode appear during a rebuild, 2026-09-18).
 xcrun safari-web-extension-converter "$STAGE_EXT" \
   --project-location "$APP_DIR" \
   --app-name "$APP_NAME" \
   --bundle-identifier "$APP_ID" \
-  --macos-only --copy-resources --no-prompt --force
+  --macos-only --copy-resources --no-prompt --no-open --force
 
 PROJ="$(find "$APP_DIR" -maxdepth 3 -name '*.xcodeproj' -print -quit)"
 [ -n "$PROJ" ] || { echo "ERROR: converter produced no .xcodeproj" >&2; exit 1; }
