@@ -461,8 +461,14 @@ const handlers = {
   },
 
   async toggleActive(args) {
-    const tabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
-    if (!tabs.length) return { handled: false };
+    // A caller that names a tab gets that tab: an op that silently ignores an
+    // argument it was given toggled a panel in a tab the caller never named
+    // (measured 2026-09-18, a verification run through the hub). The relay
+    // never names one, and keeps the active-tab contract below.
+    const tabs = args && args.tabId != null
+      ? [await browser.tabs.get(args.tabId)]
+      : await browser.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tabs.length || !tabs[0]) return { handled: false };
     // The relay is "toggle the page that was just clicked", and the only
     // handle every copy shares for it is the active tab of the focused window.
     // When the asking copy could see the url, it sends it, and a copy whose
