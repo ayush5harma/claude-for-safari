@@ -13,8 +13,12 @@
 #      force app = $APP_ID and extension = $APP_ID.Extension.
 #   4. xcodebuild, signed with whatever Apple cert the login keychain has, or
 #      ad-hoc ("-") when there is none.
-#   5. Copy to the install directory, register with LaunchServices, launch once
-#      so Safari discovers the extension (pluginkit then lists it).
+#   5. Copy to the install directory and register it: LaunchServices for the
+#      app, pluginkit for the extension. No launch: the wrapper app's window
+#      ("the extension is currently on") is for a person, and a rebuild from a
+#      switch or a background session used to put it in front of the user on
+#      every run (2026-09-18). Only when pluginkit still does not list the
+#      extension is the app launched -- hidden, and quit again.
 #
 # Re-run after editing ./extension. Idempotent: it rebuilds from scratch.
 #
@@ -30,7 +34,7 @@
 #   --install-dir DIR   where the .app is copied (default: /Applications).
 #                       A scratch directory here is how you build without
 #                       touching an installed copy.
-#   --register          force the LaunchServices registration + first launch
+#   --register          force the LaunchServices + pluginkit registration
 #                       even for a non-default install directory
 #
 # Environment inputs (all optional):
@@ -394,8 +398,17 @@ EOF
 fi
 
 "$LSREGISTER" -f "$DEST"
-open "$DEST"       # launching once is what makes Safari discover the extension
-sleep 3
+APPEX="$(find "$DEST/Contents/PlugIns" -maxdepth 1 -name '*.appex' -print -quit)"
+[ -n "$APPEX" ] && pluginkit -a "$APPEX" 2>/dev/null
+sleep 1
+if ! pluginkit -m 2>/dev/null | grep -q "$APP_ID.Extension"; then
+  # The one thing a launch does that registration does not: on a Mac that has
+  # never run the app, Safari lists the extension only after the app has been
+  # launched once. Hidden (-j) and in the background (-g), then quit.
+  open -g -j "$DEST"
+  sleep 3
+  osascript -e "quit app \"$APP_NAME\"" >/dev/null 2>&1 || true
+fi
 
 # Enable Safari's Develop menu now (persistent) so the unsigned-extension
 # toggle is reachable after the required restart. Harmless when a real cert is
