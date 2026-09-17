@@ -400,8 +400,12 @@ fi
 "$LSREGISTER" -f "$DEST"
 APPEX="$(find "$DEST/Contents/PlugIns" -maxdepth 1 -name '*.appex' -print -quit)"
 [ -n "$APPEX" ] && pluginkit -a "$APPEX" 2>/dev/null
-sleep 1
-if ! pluginkit -m 2>/dev/null | grep -q "$APP_ID.Extension"; then
+# pluginkit lists a freshly added extension about a second later (measured
+# 2026-09-18: an immediate check missed it and the fallback launch below ran
+# on every build), so give it a few seconds before concluding anything.
+registered() { pluginkit -m 2>/dev/null | grep -q "$APP_ID.Extension"; }
+for _ in 1 2 3 4 5 6 7 8 9 10; do registered && break; sleep 0.5; done
+if ! registered; then
   # The one thing a launch does that registration does not: on a Mac that has
   # never run the app, Safari lists the extension only after the app has been
   # launched once. Hidden (-j) and in the background (-g), then quit.
@@ -417,7 +421,8 @@ defaults write com.apple.Safari IncludeDevelopMenu -bool true 2>/dev/null || tru
 defaults write com.apple.Safari WebKitDeveloperExtrasEnabledPreferenceKey -bool true 2>/dev/null || true
 
 echo ""
-if pluginkit -m 2>/dev/null | grep -q "$APP_ID.Extension"; then
+for _ in 1 2 3 4 5 6 7 8 9 10; do registered && break; sleep 0.5; done
+if registered; then
   echo "Registered: pluginkit sees $APP_ID.Extension"
 else
   echo "WARNING: installed to $DEST but pluginkit does not list the extension yet."
