@@ -200,6 +200,7 @@ const describeInstance = (i) =>
 const PANEL_TOOLS = String(process.env.BRIDGE_PANEL_TOOLS || "read").toLowerCase() === "all" ? "all" : "read";
 const PANEL_READ_ONLY_TOOLS = ["claude_safari_tabs", "claude_safari_read", "claude_safari_screenshot"]
   .map((t) => "mcp__claude-safari__" + t);
+const CODEX_PANEL = process.env.BRIDGE_CODEX_PANEL === "1";
 
 // The in-panel chat spawns the REAL claude CLI headless (-p). Resolve the
 // binary defensively: the hub may have been spawned with a sparse env.
@@ -207,6 +208,24 @@ function claudeBin() {
   if (process.env.CLAUDE_BIN && fs.existsSync(process.env.CLAUDE_BIN)) return process.env.CLAUDE_BIN;
   const local = `${process.env.HOME}/.local/bin/claude`;
   return fs.existsSync(local) ? local : "claude";
+}
+
+function codexBin() {
+  if (process.env.CODEX_BIN && fs.existsSync(process.env.CODEX_BIN)) return process.env.CODEX_BIN;
+  const local = `${process.env.HOME}/.local/bin/codex`;
+  return fs.existsSync(local) ? local : which("codex");
+}
+
+function codexReply(stdout) {
+  let reply = "", sessionId = null;
+  for (const line of String(stdout).split("\n")) {
+    if (!line.trim()) continue;
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    if (event.type === "thread.started") sessionId = event.thread_id || sessionId;
+    if (event.type === "item.completed" && event.item?.type === "agent_message") reply = event.item.text || reply;
+  }
+  return { reply: reply || "(no result)", sessionId };
 }
 
 function which(bin) {
@@ -613,7 +632,7 @@ function runHub() {
       if (req.method === "GET" && req.url === "/health") {
         // panelTools rides along so the panel's gear can show which grant the
         // hub it is pointed at gives a chat turn.
-        return json(res, 200, { ok: true, port: PORT, panelTools: PANEL_TOOLS });
+        return json(res, 200, { ok: true, port: PORT, panelTools: PANEL_TOOLS, codexEnabled: CODEX_PANEL && !!codexBin() });
       }
       // /pull is POST-ONLY since 0.35 -- see the caller table above. Answer the
       // old GET with a reason rather than a bare 404, since a stale extension
@@ -703,6 +722,8 @@ function runHub() {
         const body = await readBody(req);
         const prompt = String(body.prompt || "").slice(0, 32000);
         if (!prompt.trim()) return json(res, 400, { error: "empty prompt" });
+        const provider = body.provider === "codex" ? "codex" : "claude";
+        if (provider === "codex" && (!CODEX_PANEL || !codexBin())) return json(res, 403, { error: "Codex panel is unavailable on this Mac" });
         // Shape-check the session id ONCE and use the checked value
         // everywhere below: it reaches a child process's argv, and it also
         // decides whether this is a session's first turn. Checking it only at
@@ -721,9 +742,7 @@ function runHub() {
           ? String(body.sessionId) : null;
 
         const parts = [];
-        if (!sessionId) {
-          parts.push("You are Claude, chatting inside Safari via the 'Claude for Safari' extension's side panel. Keep answers concise for a narrow panel; markdown is rendered.");
-        }
+        if (!sessionId) parts.push(`You are ${provider === "codex" ? "Codex" : "Claude"}, chatting inside Safari. Keep answers concise for a narrow panel; markdown is rendered.`);
         if (body.page && !sessionId) {
           parts.push("The user is looking at this page right now:\n" +
             `URL: ${body.page.url || "?"}\nTITLE: ${body.page.title || "?"}\n` +
@@ -740,6 +759,29 @@ function runHub() {
             attachLines.join("\n"));
         }
         parts.push(parts.length ? "User message:\n" + prompt : prompt);
+
+        if (provider === "codex") {
+          // Keep Safari chat isolated from the user's coding MCP servers and
+          // repository instructions. The fixed empty cwd also bounds context
+          // cost; page and mentioned-tab text are already in this prompt.
+          const cwd = `${process.env.HOME}/.cache/claude-safari/codex-chat`;
+          fs.mkdirSync(cwd, { recursive: true });
+          const model = ["gpt-6-astra", "gpt-5.6-terra"].includes(body.model) ? body.model : "gpt-6-astra";
+          const args = ["exec"];
+          if (sessionId) args.push("resume", sessionId);
+          else args.push("-C", cwd, "-s", "read-only");
+          args.push("--ignore-user-config", "--skip-git-repo-check", "--json", "-m", model,
+            "-c", 'approval_policy="never"', "-c", 'sandbox_mode="read-only"', parts.join("\n\n"));
+          const child = execFile(codexBin(), args, { cwd, timeout: CHAT_TIMEOUT_MS, maxBuffer: 32e6, env: process.env }, (err, stdout) => {
+            if (err && !stdout) return json(res, 500, { error: "codex failed: " + String(err.message || err).slice(0, 400) });
+            const out = codexReply(stdout);
+            if (err && out.reply === "(no result)") return json(res, 500, { error: "codex failed: " + String(err.message || err).slice(0, 400) });
+            return json(res, 200, { reply: out.reply, sessionId: out.sessionId || sessionId || null });
+          });
+          // Codex appends piped stdin to an argv prompt and waits for EOF.
+          child.stdin.end();
+          return;
+        }
 
         const args = ["-p", "--output-format", "json",
           // Only the claude-safari MCP server loads — see writeChatMcpConfig.
@@ -939,6 +981,6 @@ if (require.main === module) {
   else runMcp();
 } else {
   // The pure routing pieces, for test/hub-routing.test.js.
-  module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
+  module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot, codexReply,
     cmpVersion, currentInstances, describeInstance };
 }
