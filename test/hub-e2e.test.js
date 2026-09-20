@@ -151,6 +151,15 @@ test("status shows one row per polling instance", async () => {
   assert.deepEqual(slots, [slots[0], slots[0] + 1, slots[0] + 2]);
 });
 
+test("Codex chat is absent unless this Mac explicitly enables it", async () => {
+  const health = await (await fetch(HUB + "/health")).json();
+  assert.equal(health.codexEnabled, false);
+  const r = await fetch(HUB + "/chat", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ provider: "codex", prompt: "Hello" }) });
+  assert.equal(r.status, 403);
+  assert.match((await r.json()).error, /unavailable/);
+});
+
 test("tabs merges the three listings: each tab once, from the instance that reaches it", async () => {
   const { body } = await call("tabs");
   const tabs = body.result;

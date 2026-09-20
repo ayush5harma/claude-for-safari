@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Claude for Safari",
-  "version": "0.41",
-  "description": "Bridges Safari to Claude Code: a Claude chat panel on any page, plus tab read/click/fill/navigate/eval/screenshot tools for Claude sessions via a local MCP bridge.",
+  "version": "0.42",
+  "description": "Bridges Safari to Claude Code and optional Codex chat: an in-page panel plus tab read/click/fill/navigate/eval/screenshot tools via a local MCP bridge.",
   "icons": {
     "16": "images/icon-16.png",
     "32": "images/icon-32.png",

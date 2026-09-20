@@ -928,7 +928,7 @@ function buildPanel() {
     <div class="scrim" id="scrim"></div>
     <div class="panel">
       <div class="hdr">
-        <img class="spark" src="${SPARK_URL}" alt=""/><b>Claude</b>
+        <img class="spark" src="${SPARK_URL}" alt=""/><b id="assistant-name">Claude</b>
         <button class="ctl" id="hubbtn" title="Settings" aria-label="Settings">${SVG.gear}</button>
         <button class="ctl" id="hist" title="History" aria-label="History">${SVG.clock}</button>
         <button class="ctl" id="fresh" title="New chat" aria-label="New chat">${SVG.fresh}</button>
@@ -936,7 +936,7 @@ function buildPanel() {
       </div>
       <div class="histov" id="histov"></div>
       <div class="hubov" id="hubov">
-        <div class="lede2">Where this panel's Claude runs. Empty = the local
+        <div class="lede2">Where this panel's <span id="hub-provider-name">Claude</span> runs. Empty = the local
           Mac's bridge (127.0.0.1:29170). On iPhone/iPad, point it at a hosted
           or mesh hub — see HOSTING.md — with its token.</div>
         <label>Hub URL
@@ -988,6 +988,10 @@ function buildPanel() {
             <button id="mention" title="Add a tab as context" aria-label="Add a tab as context">${SVG.at}</button>
             <button id="mic" title="Voice input" aria-label="Voice input">${SVG.mic}</button>
             <span class="gap"></span>
+            <select id="provider" title="Assistant" hidden>
+              <option value="claude">Claude</option>
+              <option value="codex">Codex</option>
+            </select>
             <select id="model" title="Model">
               <option value="">Default</option>
               <option value="opus">Opus</option>
@@ -1399,9 +1403,24 @@ function buildPanel() {
     return "c-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
   };
   const HKEY = "chatHistory";
+  const providerName = (provider) => provider === "codex" ? "Codex" : "Claude";
+  let currentProvider = "claude";
+  const setProvider = (provider) => {
+    const codex = provider === "codex";
+    currentProvider = codex ? "codex" : "claude";
+    $('provider').value = currentProvider;
+    $('assistant-name').textContent = providerName(currentProvider);
+    $('hub-provider-name').textContent = providerName(currentProvider);
+    $('model').innerHTML = codex
+      ? '<option value="">Astra</option><option value="gpt-5.6-terra">Terra</option>'
+      : '<option value="">Default</option><option value="opus">Opus</option><option value="sonnet">Sonnet</option><option value="haiku">Haiku</option>';
+  };
+  // null means the hub has not answered yet (or is unreachable), so let its
+  // own error describe that case. false is a confirmed provider mismatch.
+  let codexAvailable = null;
   let convo = null;   // { id, sessionId, title, updatedAt, msgs: [{r,t}] }
   const note = (r, t) => {
-    if (!convo) convo = { id: convoId(), sessionId: null, title: null, msgs: [] };
+    if (!convo) convo = { id: convoId(), sessionId: null, title: null, provider: currentProvider, msgs: [] };
     convo.msgs.push({ r, t: String(t).slice(0, 20000) });
   };
   async function saveConvo() {
@@ -1429,6 +1448,8 @@ function buildPanel() {
   };
   function loadConvo(c) {
     convo = { id: c.id, sessionId: c.sessionId, title: c.title, msgs: [...c.msgs] };
+    setProvider(c.provider || "claude");
+    convo.provider = $('provider').value;
     chatSessionId = c.sessionId || null;   // --resume picks the thread back up
     clearMsgs();
     for (const m of c.msgs) {
@@ -1450,7 +1471,7 @@ function buildPanel() {
     for (const c of h) {
       const d = document.createElement("div");
       d.className = "hi-item";
-      d.innerHTML = `<span class="col"><span class="t"></span><span class="d">${ago(c.updatedAt)} · ${c.msgs.filter((m) => m.r === "u").length} message${c.msgs.filter((m) => m.r === "u").length === 1 ? "" : "s"}</span></span><button title="Delete">${SVG.x}</button>`;
+      d.innerHTML = `<span class="col"><span class="t"></span><span class="d">${providerName(c.provider)} · ${ago(c.updatedAt)} · ${c.msgs.filter((m) => m.r === "u").length} message${c.msgs.filter((m) => m.r === "u").length === 1 ? "" : "s"}</span></span><button title="Delete">${SVG.x}</button>`;
       d.querySelector(".t").textContent = c.title || "Conversation";
       d.querySelector("button").onclick = async (e) => {
         e.stopPropagation();
@@ -1477,8 +1498,16 @@ function buildPanel() {
     const el = $("hubstat");
     el.className = "hubstat"; el.textContent = "checking hub…";
     const r = await browser.runtime.sendMessage({ op: "hubping" }).catch(() => null);
-    if (r && r.ok) { el.className = "hubstat ok"; el.textContent = "hub reachable — " + (r.hub || "local"); }
-    else { el.className = "hubstat bad"; el.textContent = "hub unreachable" + (r && r.error ? " — " + r.error : ""); }
+    if (r && r.ok) {
+      codexAvailable = !!r.codexEnabled;
+      el.className = "hubstat ok"; el.textContent = "hub reachable — " + (r.hub || "local");
+      $('provider').hidden = !codexAvailable;
+      if (!convo) setProvider(codexAvailable ? "codex" : "claude");
+    }
+    else {
+      codexAvailable = null;
+      el.className = "hubstat bad"; el.textContent = "hub unreachable" + (r && r.error ? " — " + r.error : "");
+    }
   }
   // ── the site list ──
   // The list is applied by the BACKGROUND page (declarativeNetRequest rules and
@@ -1566,7 +1595,12 @@ function buildPanel() {
   async function send() {
     const prompt = input.value.trim();
     if (!prompt || chatBusy) return;
-    chatBusy = true; $("send").disabled = true;
+    if (currentProvider === "codex" && codexAvailable === false) {
+      addMsg("err", "This conversation uses Codex, but the selected hub does not offer Codex. Choose a Codex-enabled hub or start a new Claude chat.");
+      msgs.scrollTop = msgs.scrollHeight;
+      return;
+    }
+    chatBusy = true; $("send").disabled = true; $("provider").disabled = true;
     closeMenu();
     const myTabs = tabChips; const myFiles = attachments;
     tabChips = []; attachments = []; drawChips();
@@ -1613,6 +1647,7 @@ function buildPanel() {
       const r = await browser.runtime.sendMessage({
         op: "chat", prompt, sessionId: chatSessionId, page,
         tabs: tabsPayload, attachments: myFiles, model: $("model").value || undefined,
+        provider: currentProvider,
       });
       think.remove();
       if (r && r.error) { addMsg("err", r.error); note("err", r.error); }
@@ -1628,7 +1663,7 @@ function buildPanel() {
       note("err", String((e && e.message) || e));
     }
     saveConvo();
-    chatBusy = false; $("send").disabled = false;
+    chatBusy = false; $("send").disabled = false; $("provider").disabled = false;
     msgs.scrollTop = msgs.scrollHeight;
     focusInput();
   }
@@ -1650,12 +1685,31 @@ function buildPanel() {
     if (e.key === "Enter" && !e.shiftKey && !TOUCH.matches) { e.preventDefault(); send(); }
   });
   $("send").onclick = send;
-  $("fresh").onclick = async () => {
-    await saveConvo();
-    convo = null; chatSessionId = null; chatBusy = false;
-    clearMsgs(); histov.classList.remove("open");
-    updateEmpty(); focusInput();
+  let chatResetting = false;
+  async function newChat(nextProvider = currentProvider) {
+    if (chatBusy || chatResetting) return;
+    chatResetting = true;
+    try {
+      await saveConvo();
+      convo = null; chatSessionId = null;
+      if (codexAvailable === false && nextProvider === "codex") nextProvider = "claude";
+      clearMsgs(); histov.classList.remove("open");
+      setProvider(nextProvider);
+      updateEmpty(); focusInput();
+    } finally {
+      chatResetting = false;
+    }
+  }
+  $("fresh").onclick = () => newChat();
+  $('provider').onchange = async () => {
+    const selected = $('provider').value;
+    // A select updates before its change handler runs. Put it back until the
+    // previous conversation is saved and reset, then switch providers once.
+    if (chatBusy || chatResetting) { $('provider').value = currentProvider; return; }
+    $('provider').value = currentProvider;
+    await newChat(selected);
   };
+  pingHub();
   $("close").onclick = closePanel;
 
   // Attach every open http(s) tab as a context chip — used by the empty-state
