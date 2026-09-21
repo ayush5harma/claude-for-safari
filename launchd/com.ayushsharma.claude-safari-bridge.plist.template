@@ -22,7 +22,8 @@
 
   The __ENV__ token below is replaced with an EnvironmentVariables dict built
   from whatever of BRIDGE_BIND / BRIDGE_TOKEN / BRIDGE_PANEL_TOOLS / BRIDGE_PORT
-  / BRIDGE_CODEX_PANEL / CLAUDE_BIN / CODEX_BIN was set in install.sh's own
+  / BRIDGE_CODEX_PANEL / BRIDGE_CODEX_REQUIRE_API_KEY / CLAUDE_BIN / CODEX_BIN
+  was set in install.sh's own
   environment, so exposing the hub
   (HOSTING.md Path 0) is one command:
 

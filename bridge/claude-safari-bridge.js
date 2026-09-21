@@ -54,6 +54,7 @@ const CODEX_PANEL = process.env.BRIDGE_CODEX_PANEL === "1";
 // only to the selected Codex child for that turn.
 const CODEX_API_KEY = process.env.CODEX_API_KEY || "";
 delete process.env.CODEX_API_KEY;
+const CODEX_REQUIRE_API_KEY = process.env.BRIDGE_CODEX_REQUIRE_API_KEY === "1";
 
 // ── Several extension instances, one hub ──────────────────────────────────────
 // Safari runs one copy of the extension PER PROFILE, and every copy long-polls
@@ -227,7 +228,11 @@ function which(bin) {
   }
   return null;
 }
-const codexAvailable = () => CODEX_PANEL && !!(which(codexBin()) || fs.existsSync(codexBin()));
+// A hosted deployment may not claim the Mac's normal CLI login. Heroku's
+// 2026-09-22 probe found the binary, advertised Codex, then waited for auth;
+// the explicit flag avoids guessing deployment type from its bind address.
+const codexAvailable = () => CODEX_PANEL && (!CODEX_REQUIRE_API_KEY || !!CODEX_API_KEY) &&
+  !!(which(codexBin()) || fs.existsSync(codexBin()));
 const execFileP = (bin, args, opts) => new Promise((resolve, reject) =>
   execFile(bin, args, opts, (err, stdout, stderr) =>
     err ? reject(Object.assign(err, { stdout, stderr })) : resolve({ stdout, stderr })));

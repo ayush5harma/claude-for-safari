@@ -68,3 +68,55 @@ console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",tex
   assert.equal(failed.status, 500);
   assert.match((await failed.json()).error, /simulated auth failure/);
 });
+
+test("an API-key-required hub without a Codex API key does not advertise Codex", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-safari-codex-readiness-"));
+  const fake = path.join(home, "codex");
+  fs.writeFileSync(fake, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(fake, 0o755);
+  const port = 42000 + Math.floor(Math.random() * 1000);
+  const env = { ...process.env, HOME: home, BRIDGE_PORT: String(port), BRIDGE_BIND: "127.0.0.1",
+    BRIDGE_TOKEN: "bridge-test-token", BRIDGE_CODEX_PANEL: "1",
+    BRIDGE_CODEX_REQUIRE_API_KEY: "1", CODEX_BIN: fake };
+  delete env.CODEX_API_KEY;
+  const hub = spawn(process.execPath, [BRIDGE, "--serve"], {
+    env,
+    stdio: ["ignore", "ignore", "inherit"],
+  });
+  t.after(() => { hub.kill(); fs.rmSync(home, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${port}`;
+  const headers = { authorization: "Bearer bridge-test-token" };
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(base + "/health", { headers })).ok) break; } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  const health = await (await fetch(base + "/health", { headers })).json();
+  assert.equal(health.codexEnabled, false);
+  assert.equal(health.providers.codex, false);
+});
+
+test("a mesh-bound local hub can use the CLI login without an API key", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-safari-codex-mesh-"));
+  const fake = path.join(home, "codex");
+  fs.writeFileSync(fake, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(fake, 0o755);
+  const port = 43000 + Math.floor(Math.random() * 1000);
+  const env = { ...process.env, HOME: home, BRIDGE_PORT: String(port), BRIDGE_BIND: "0.0.0.0",
+    BRIDGE_TOKEN: "bridge-test-token", BRIDGE_CODEX_PANEL: "1", CODEX_BIN: fake };
+  delete env.CODEX_API_KEY;
+  delete env.BRIDGE_CODEX_REQUIRE_API_KEY;
+  const hub = spawn(process.execPath, [BRIDGE, "--serve"], {
+    env,
+    stdio: ["ignore", "ignore", "inherit"],
+  });
+  t.after(() => { hub.kill(); fs.rmSync(home, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${port}`;
+  const headers = { authorization: "Bearer bridge-test-token" };
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(base + "/health", { headers })).ok) break; } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  const health = await (await fetch(base + "/health", { headers })).json();
+  assert.equal(health.codexEnabled, true);
+  assert.equal(health.providers.codex, true);
+});

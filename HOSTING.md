@@ -91,6 +91,8 @@ check what your signed-in pack page actually shows.
    passed only to a selected Codex turn. API-key auth is the supported default
    for non-interactive Codex automation; do not copy `~/.codex/auth.json` to a
    public PaaS.
+   The deploy script also sets `BRIDGE_CODEX_REQUIRE_API_KEY=1`, so the panel
+   does not offer Codex until that credential exists.
 5. Panel gear > Hub URL (the `https://...` URL the deploy script printed) +
    the token.
 

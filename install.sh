@@ -110,7 +110,7 @@ if [ "$DO_BRIDGE" -eq 1 ]; then
   # CLAUDE_BIN and CODEX_BIN are free text.
   xml_escape() { printf '%s' "$1" | LC_ALL=C sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
   ENV_XML=""
-  for _v in BRIDGE_BIND BRIDGE_PORT BRIDGE_TOKEN BRIDGE_PANEL_TOOLS BRIDGE_CODEX_PANEL CLAUDE_BIN CODEX_BIN; do
+  for _v in BRIDGE_BIND BRIDGE_PORT BRIDGE_TOKEN BRIDGE_PANEL_TOOLS BRIDGE_CODEX_PANEL BRIDGE_CODEX_REQUIRE_API_KEY CLAUDE_BIN CODEX_BIN; do
     _val="$(eval "printf '%s' \"\${$_v-}\"")"
     [ -n "$_val" ] || continue
     ENV_XML="$ENV_XML
@@ -120,7 +120,7 @@ if [ "$DO_BRIDGE" -eq 1 ]; then
     ENV_XML="<key>EnvironmentVariables</key>
   <dict>$ENV_XML
   </dict>"
-    echo "agent environment: $(for _v in BRIDGE_BIND BRIDGE_PORT BRIDGE_TOKEN BRIDGE_PANEL_TOOLS BRIDGE_CODEX_PANEL CLAUDE_BIN CODEX_BIN; do
+    echo "agent environment: $(for _v in BRIDGE_BIND BRIDGE_PORT BRIDGE_TOKEN BRIDGE_PANEL_TOOLS BRIDGE_CODEX_PANEL BRIDGE_CODEX_REQUIRE_API_KEY CLAUDE_BIN CODEX_BIN; do
       _val="$(eval "printf '%s' \"\${$_v-}\"")"
       [ -n "$_val" ] && printf '%s ' "$_v"; done)"
   fi
