@@ -495,13 +495,18 @@ are optional and every default is the standalone behaviour.
 | `BRIDGE_BIND` | `127.0.0.1` | Hub bind address. Anything else **requires** `BRIDGE_TOKEN`; the hub exits rather than listen exposed without one. |
 | `BRIDGE_TOKEN` | unset | When set, every request must carry `Authorization: Bearer <token>` (constant-time compare). |
 | `BRIDGE_PANEL_TOOLS` | `read` | What a **panel** turn may do in the browser: `read` (tabs/read/screenshot) or `all`. Reported as `panelTools` by `/health` and `/status`. Does not affect the stdio MCP mode. See [Security](#security). |
+| `BRIDGE_CODEX_PANEL` | unset | Set to `1` to offer Codex in the panel. Hosted deployments also need a scoped `CODEX_API_KEY` in their secret store. |
 | `CLAUDE_BIN` | `~/.local/bin/claude`, else `claude` | The CLI the hub spawns for panel turns. |
+| `CODEX_BIN` | `codex` | The Codex CLI the hub spawns for Codex panel turns. |
 
 `install.sh` copies `BRIDGE_BIND`, `BRIDGE_PORT`, `BRIDGE_TOKEN`,
-`BRIDGE_PANEL_TOOLS` and `CLAUDE_BIN` out of its own environment into the
-rendered launchd plist, so `BRIDGE_BIND=… BRIDGE_TOKEN=… bash install.sh
---bridge-only` is how the agent gets them. Every run **re-renders** the plist,
-so hand edits to it are lost — change the environment and re-run instead.
+`BRIDGE_PANEL_TOOLS`, `BRIDGE_CODEX_PANEL`, `CLAUDE_BIN` and `CODEX_BIN` out of
+its own environment into the rendered launchd plist, so `BRIDGE_BIND=…
+BRIDGE_TOKEN=… bash install.sh --bridge-only` is how the agent gets them.
+Every run **re-renders** the plist, so hand edits to it are lost — change the
+environment and re-run instead. `CODEX_API_KEY` is intentionally not copied;
+local Codex uses its own login, while hosted deployments inject a separate key
+from their secret store.
 
 Flags: `build-app.sh [--build-only] [--if-changed] [--install-dir DIR]
 [--register]`. `--if-changed` exits 0 without building when the installed
@@ -644,9 +649,10 @@ install from the background page's console:
 but not the full Xcode, or `xcode-select` points at the wrong developer
 directory: `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`.
 
-**Chat turns fail but the panel is connected.** The hub spawns `claude` with
-its own environment; make sure that CLI is signed in and on the hub's PATH
-(`CLAUDE_BIN` names it explicitly).
+**Chat turns fail but the panel is connected.** The hub spawns the selected
+provider's CLI with a minimal environment. Make sure the local CLI is signed in
+and on the hub's PATH (`CLAUDE_BIN` or `CODEX_BIN` names it explicitly). A
+hosted Codex hub instead needs `CODEX_API_KEY` in the platform's secret store.
 
 ## Security
 

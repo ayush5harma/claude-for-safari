@@ -11,7 +11,7 @@ const path = require("node:path");
 
 const {
   TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
-  cmpVersion, currentInstances, describeInstance,
+  cmpVersion, currentInstances, describeInstance, parseCodexOutput,
 } = require(path.join(__dirname, "..", "bridge", "claude-safari-bridge.js"));
 
 const tab = (id, index, url, owned, extra = {}) => ({
@@ -137,4 +137,16 @@ test("a refusal names the slot, the build and the context diag reports", () => {
   assert.equal(describeInstance({ slot: 460, version: "0.41", base: "safari-web-extension://7A6C/" }),
     "slot 460 (version 0.41, safari-web-extension://7A6C/)");
   assert.equal(describeInstance({ slot: 3, version: "", base: "" }), "slot 3 (version unknown)");
+});
+
+test("Codex JSONL returns the final agent message and resumable thread id", () => {
+  const out = parseCodexOutput([
+    JSON.stringify({ type: "thread.started", thread_id: "0199abcd-1234-7890-abcd-1234567890ab" }),
+    JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "private" } }),
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Answer from Astra" } }),
+  ].join("\n"));
+  assert.deepEqual(out, {
+    reply: "Answer from Astra",
+    sessionId: "0199abcd-1234-7890-abcd-1234567890ab",
+  });
 });

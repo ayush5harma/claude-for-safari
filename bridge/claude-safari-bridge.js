@@ -48,6 +48,12 @@ const CALL_TIMEOUT_MS = 90000; // extension must answer within this
 const CHAT_TIMEOUT_MS = 300000; // a headless claude turn can legitimately take minutes
 const MAX_QUEUE = 100;         // undelivered tool calls kept before dropping the oldest
 const MAX_BODY = 90e6;         // an attachment-carrying /chat turn is the large case
+const CODEX_PANEL = process.env.BRIDGE_CODEX_PANEL === "1";
+// Heroku supplies config vars to the hub process. Capture the Codex credential
+// once and remove it from the ambient environment (2026-09-22), then expose it
+// only to the selected Codex child for that turn.
+const CODEX_API_KEY = process.env.CODEX_API_KEY || "";
+delete process.env.CODEX_API_KEY;
 
 // ── Several extension instances, one hub ──────────────────────────────────────
 // Safari runs one copy of the extension PER PROFILE, and every copy long-polls
@@ -209,6 +215,12 @@ function claudeBin() {
   return fs.existsSync(local) ? local : "claude";
 }
 
+function codexBin() {
+  if (process.env.CODEX_BIN && fs.existsSync(process.env.CODEX_BIN)) return process.env.CODEX_BIN;
+  const local = `${process.env.HOME}/.local/bin/codex`;
+  return fs.existsSync(local) ? local : "codex";
+}
+
 function which(bin) {
   for (const d of (process.env.PATH || "").split(":")) {
     try { if (d && fs.existsSync(`${d}/${bin}`)) return `${d}/${bin}`; } catch {}
@@ -242,6 +254,25 @@ function writeChatMcpConfig() {
       mcpServers: { "claude-safari": { command: process.execPath, args: [__filename] } },
     }, null, 2));
   } catch {}
+}
+
+function parseCodexOutput(stdout, fallbackSessionId = null) {
+  let reply = "";
+  let error = "";
+  let sessionId = fallbackSessionId;
+  for (const line of String(stdout || "").split(/\r?\n/)) {
+    if (!line.trim().startsWith("{")) continue;
+    try {
+      const event = JSON.parse(line);
+      if (event.type === "thread.started" && event.thread_id) sessionId = event.thread_id;
+      if (event.type === "item.completed" && event.item && event.item.type === "agent_message") {
+        reply = String(event.item.text || "");
+      }
+      if (event.type === "error") error = String(event.message || (event.error && event.error.message) || "Codex failed");
+      if (event.type === "turn.failed") error = String((event.error && event.error.message) || event.message || "Codex turn failed");
+    } catch {}
+  }
+  return { reply: reply || "(no result)", sessionId, ...(error ? { error } : {}) };
 }
 
 function pruneAttachments() {
@@ -613,7 +644,8 @@ function runHub() {
       if (req.method === "GET" && req.url === "/health") {
         // panelTools rides along so the panel's gear can show which grant the
         // hub it is pointed at gives a chat turn.
-        return json(res, 200, { ok: true, port: PORT, panelTools: PANEL_TOOLS });
+        return json(res, 200, { ok: true, port: PORT, panelTools: PANEL_TOOLS,
+          providers: { claude: true, codex: CODEX_PANEL && !!(which(codexBin()) || fs.existsSync(codexBin())) } });
       }
       // /pull is POST-ONLY since 0.35 -- see the caller table above. Answer the
       // old GET with a reason rather than a bare 404, since a stale extension
@@ -703,6 +735,10 @@ function runHub() {
         const body = await readBody(req);
         const prompt = String(body.prompt || "").slice(0, 32000);
         if (!prompt.trim()) return json(res, 400, { error: "empty prompt" });
+        const provider = body.provider === "codex" ? "codex" : "claude";
+        if (provider === "codex" && !CODEX_PANEL) {
+          return json(res, 503, { error: "Codex is not enabled on this hub" });
+        }
         // Shape-check the session id ONCE and use the checked value
         // everywhere below: it reaches a child process's argv, and it also
         // decides whether this is a session's first turn. Checking it only at
@@ -722,7 +758,7 @@ function runHub() {
 
         const parts = [];
         if (!sessionId) {
-          parts.push("You are Claude, chatting inside Safari via the 'Claude for Safari' extension's side panel. Keep answers concise for a narrow panel; markdown is rendered.");
+          parts.push(`You are ${provider === "codex" ? "Codex" : "Claude"}, chatting inside Safari via the 'Claude for Safari' extension's side panel. Keep answers concise for a narrow panel; markdown is rendered.`);
         }
         if (body.page && !sessionId) {
           parts.push("The user is looking at this page right now:\n" +
@@ -740,6 +776,40 @@ function runHub() {
             attachLines.join("\n"));
         }
         parts.push(parts.length ? "User message:\n" + prompt : prompt);
+
+        if (provider === "codex") {
+          const args = ["exec"];
+          if (sessionId) args.push("resume", sessionId);
+          // Ignore user configuration so a panel turn cannot start the user's
+          // normal MCP fleet (measured source of OAuth browser tabs for the
+          // Claude path on 2026-09-22). The selected page, explicit tab chips
+          // and attachments are already in the prompt; giving Codex the Safari
+          // MCP would let a hostile page ask it to read unrelated open tabs.
+          // Authentication is still read from the normal CODEX_HOME.
+          args.push("--json", "--ignore-user-config", "--skip-git-repo-check",
+            "-c", 'approval_policy="never"',
+            "-c", 'sandbox_mode="read-only"');
+          const model = body.model && /^[a-z0-9][a-z0-9.-]{1,40}$/i.test(String(body.model))
+            ? String(body.model) : "gpt-6-astra";
+          args.push("--model", model, parts.join("\n\n"));
+          const childEnv = {};
+          for (const name of ["HOME", "PATH", "TMPDIR", "TMP", "TEMP", "USER", "LOGNAME",
+            "LANG", "LC_ALL", "CODEX_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR",
+            "NODE_EXTRA_CA_CERTS", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]) {
+            if (process.env[name]) childEnv[name] = process.env[name];
+          }
+          if (CODEX_API_KEY) childEnv.CODEX_API_KEY = CODEX_API_KEY;
+          execFile(codexBin(), args,
+            { timeout: CHAT_TIMEOUT_MS, maxBuffer: 32e6, env: childEnv },
+            (err, stdout) => {
+              const out = parseCodexOutput(stdout, sessionId);
+              if (err || out.error) {
+                return json(res, 500, { error: "codex failed: " + String(out.error || err.message || err).slice(0, 400) });
+              }
+              json(res, 200, { reply: out.reply, sessionId: out.sessionId });
+            });
+          return;
+        }
 
         const args = ["-p", "--output-format", "json",
           // Only the claude-safari MCP server loads — see writeChatMcpConfig.
@@ -808,6 +878,7 @@ function runHub() {
 
   server.on("error", (e) => {
     // Another hub already listening is the expected race — defer to it.
+    if (e.code !== "EADDRINUSE") process.stderr.write("claude-safari-bridge: " + String(e.stack || e) + "\n");
     process.exit(e.code === "EADDRINUSE" ? 0 : 1);
   });
   // Never expose an unauthenticated hub: it spawns claude with the host's
@@ -940,5 +1011,5 @@ if (require.main === module) {
 } else {
   // The pure routing pieces, for test/hub-routing.test.js.
   module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
-    cmpVersion, currentInstances, describeInstance };
+    cmpVersion, currentInstances, describeInstance, parseCodexOutput };
 }

@@ -201,6 +201,7 @@ let panelApi = null;
 let hostWatch = null;   // watches for a page removing the host (see buildPanel)
 let chatSessionId = null;
 let chatBusy = false;
+let chatProvider = "claude";
 let attachments = [];   // {name, type, dataUrl}
 let tabChips = [];      // {tabId, title, url}
 
@@ -552,7 +553,8 @@ function buildPanel() {
         height: var(--hdr-h); flex: none;
         border-bottom: 1px solid var(--line); }
       .hdr .spark { width: 15px; height: 15px; }
-      .hdr b { font-size: 13px; font-weight: 600; flex: 1; }
+      .hdr b { font-size: 13px; font-weight: 600; }
+      .hdr .provider { flex: 1; text-align: left; color: var(--ink); font-weight: 600; }
       /* Header controls as light-on-dark material chips (Apple's Siri panel),
          not bare strokes: a soft translucent circle with no border, one
          monochrome glyph centred in it. 28px is both the optical size that
@@ -928,7 +930,11 @@ function buildPanel() {
     <div class="scrim" id="scrim"></div>
     <div class="panel">
       <div class="hdr">
-        <img class="spark" src="${SPARK_URL}" alt=""/><b>Claude</b>
+        <img class="spark" src="${SPARK_URL}" alt=""/><b id="brand">Claude</b>
+        <select class="provider" id="provider" title="Provider" aria-label="Provider">
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+        </select>
         <button class="ctl" id="hubbtn" title="Settings" aria-label="Settings">${SVG.gear}</button>
         <button class="ctl" id="hist" title="History" aria-label="History">${SVG.clock}</button>
         <button class="ctl" id="fresh" title="New chat" aria-label="New chat">${SVG.fresh}</button>
@@ -936,9 +942,11 @@ function buildPanel() {
       </div>
       <div class="histov" id="histov"></div>
       <div class="hubov" id="hubov">
-        <div class="lede2">Where this panel's Claude runs. Empty = the local
+        <div class="lede2">Where this panel's selected provider runs. Empty = the local
           Mac's bridge (127.0.0.1:29170). On iPhone/iPad, point it at a hosted
-          or mesh hub — see HOSTING.md — with its token.</div>
+          or mesh hub — see HOSTING.md — with its token. Selecting Codex sends
+          that turn's page, attached-tab and uploaded-file context to OpenAI
+          through the configured hub.</div>
         <label>Hub URL
           <input id="huburl" type="url" placeholder="http://127.0.0.1:29170" autocomplete="off"/>
         </label>
@@ -990,9 +998,6 @@ function buildPanel() {
             <span class="gap"></span>
             <select id="model" title="Model">
               <option value="">Default</option>
-              <option value="opus">Opus</option>
-              <option value="sonnet">Sonnet</option>
-              <option value="haiku">Haiku</option>
             </select>
             <button class="send" id="send" title="Send" aria-label="Send">${SVG.up}</button>
           </div>
@@ -1005,6 +1010,24 @@ function buildPanel() {
   const $ = (id) => root.getElementById(id);
   const msgs = $("msgs"), input = $("in"), chips = $("chips"),
         menu = $("menu"), card = $("card");
+  const MODELS = {
+    claude: [["", "Default"], ["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]],
+    codex: [["gpt-6-astra", "Astra"], ["gpt-5.6-terra", "Terra"], ["gpt-5.6-sol", "Sol"], ["gpt-5.6-luna", "Luna"]],
+  };
+  function drawProvider(provider, model) {
+    chatProvider = provider === "codex" ? "codex" : "claude";
+    $("provider").value = chatProvider;
+    $("brand").textContent = chatProvider === "codex" ? "Codex" : "Claude";
+    const select = $("model");
+    select.textContent = "";
+    for (const [value, label] of MODELS[chatProvider]) {
+      const option = document.createElement("option");
+      option.value = value; option.textContent = label;
+      select.appendChild(option);
+    }
+    if (model && MODELS[chatProvider].some(([value]) => value === model)) select.value = model;
+  }
+  drawProvider(chatProvider);
 
   const updateEmpty = () => { $("empty").style.display = msgs.querySelector(".m") ? "none" : "flex"; };
   const addMsg = (cls, content, html) => {
@@ -1399,13 +1422,15 @@ function buildPanel() {
     return "c-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
   };
   const HKEY = "chatHistory";
-  let convo = null;   // { id, sessionId, title, updatedAt, msgs: [{r,t}] }
+  let convo = null;   // { id, provider, model, sessionId, title, updatedAt, msgs: [{r,t}] }
   const note = (r, t) => {
-    if (!convo) convo = { id: convoId(), sessionId: null, title: null, msgs: [] };
+    if (!convo) convo = { id: convoId(), provider: chatProvider, model: $("model").value, sessionId: null, title: null, msgs: [] };
     convo.msgs.push({ r, t: String(t).slice(0, 20000) });
   };
   async function saveConvo() {
     if (!convo || !convo.msgs.some((m) => m.r === "u")) return;
+    convo.provider = chatProvider;
+    convo.model = $("model").value;
     convo.sessionId = chatSessionId;
     convo.updatedAt = Date.now();
     if (!convo.title) convo.title = (convo.msgs.find((m) => m.r === "u") || { t: "Conversation" }).t.slice(0, 70);
@@ -1428,7 +1453,10 @@ function buildPanel() {
     for (const m of Array.from(msgs.querySelectorAll(".m, .think"))) m.remove();
   };
   function loadConvo(c) {
-    convo = { id: c.id, sessionId: c.sessionId, title: c.title, msgs: [...c.msgs] };
+    if (chatBusy) return;
+    drawProvider(c.provider || "claude", c.model || "");
+    convo = { id: c.id, provider: chatProvider, model: $("model").value,
+      sessionId: c.sessionId, title: c.title, msgs: [...c.msgs] };
     chatSessionId = c.sessionId || null;   // --resume picks the thread back up
     clearMsgs();
     for (const m of c.msgs) {
@@ -1450,10 +1478,11 @@ function buildPanel() {
     for (const c of h) {
       const d = document.createElement("div");
       d.className = "hi-item";
-      d.innerHTML = `<span class="col"><span class="t"></span><span class="d">${ago(c.updatedAt)} · ${c.msgs.filter((m) => m.r === "u").length} message${c.msgs.filter((m) => m.r === "u").length === 1 ? "" : "s"}</span></span><button title="Delete">${SVG.x}</button>`;
+      d.innerHTML = `<span class="col"><span class="t"></span><span class="d">${c.provider === "codex" ? "Codex" : "Claude"} · ${ago(c.updatedAt)} · ${c.msgs.filter((m) => m.r === "u").length} message${c.msgs.filter((m) => m.r === "u").length === 1 ? "" : "s"}</span></span><button title="Delete">${SVG.x}</button>`;
       d.querySelector(".t").textContent = c.title || "Conversation";
       d.querySelector("button").onclick = async (e) => {
         e.stopPropagation();
+        if (chatBusy) return;
         const st2 = await browser.storage.local.get(HKEY);
         await browser.storage.local.set({ [HKEY]: (st2[HKEY] || []).filter((x) => x.id !== c.id) });
         drawHistory();
@@ -1465,6 +1494,21 @@ function buildPanel() {
   $("hist").onclick = () => {
     $("hubov").classList.remove("open");
     if (histov.classList.toggle("open")) drawHistory();
+  };
+  browser.storage.local.get(["chatProvider", "chatModel"]).then((st) => {
+    if (!convo) drawProvider(st.chatProvider || "claude", st.chatModel || "");
+  }).catch(() => {});
+  $("provider").onchange = async () => {
+    if (chatBusy) return;
+    await saveConvo();
+    drawProvider($("provider").value);
+    await browser.storage.local.set({ chatProvider, chatModel: $("model").value }).catch(() => {});
+    convo = null; chatSessionId = null; chatBusy = false;
+    clearMsgs(); histov.classList.remove("open"); updateEmpty(); focusInput();
+  };
+  $("model").onchange = () => {
+    if (chatBusy) return;
+    browser.storage.local.set({ chatProvider, chatModel: $("model").value }).catch(() => {});
   };
 
   // ── hub settings ──
@@ -1567,6 +1611,7 @@ function buildPanel() {
     const prompt = input.value.trim();
     if (!prompt || chatBusy) return;
     chatBusy = true; $("send").disabled = true;
+    $("provider").disabled = true; $("model").disabled = true;
     closeMenu();
     const myTabs = tabChips; const myFiles = attachments;
     tabChips = []; attachments = []; drawChips();
@@ -1611,7 +1656,7 @@ function buildPanel() {
 
     try {
       const r = await browser.runtime.sendMessage({
-        op: "chat", prompt, sessionId: chatSessionId, page,
+        op: "chat", provider: chatProvider, prompt, sessionId: chatSessionId, page,
         tabs: tabsPayload, attachments: myFiles, model: $("model").value || undefined,
       });
       think.remove();
@@ -1629,6 +1674,7 @@ function buildPanel() {
     }
     saveConvo();
     chatBusy = false; $("send").disabled = false;
+    $("provider").disabled = false; $("model").disabled = false;
     msgs.scrollTop = msgs.scrollHeight;
     focusInput();
   }
@@ -1651,8 +1697,9 @@ function buildPanel() {
   });
   $("send").onclick = send;
   $("fresh").onclick = async () => {
+    if (chatBusy) return;
     await saveConvo();
-    convo = null; chatSessionId = null; chatBusy = false;
+    convo = null; chatSessionId = null;
     clearMsgs(); histov.classList.remove("open");
     updateEmpty(); focusInput();
   };

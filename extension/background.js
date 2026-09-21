@@ -790,7 +790,7 @@ browser.runtime.onMessage.addListener((msg) => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        prompt: msg.prompt, sessionId: msg.sessionId, page: msg.page,
+        provider: msg.provider, prompt: msg.prompt, sessionId: msg.sessionId, page: msg.page,
         tabs: msg.tabs, attachments: msg.attachments, model: msg.model,
       }),
     })
@@ -1036,6 +1036,5 @@ applyUaSites();
 // which always say Safari) is one of the reasons the spoof is confined to the
 // few sites that demand it instead of being global. Leaving this comment so
 // the attempt is not repeated.
-
 
 

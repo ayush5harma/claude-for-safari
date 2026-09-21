@@ -2,6 +2,9 @@
   "name": "claude-safari-bridge-hub",
   "private": true,
   "engines": { "node": "24.x" },
-  "dependencies": { "@anthropic-ai/claude-code": "latest" },
+  "dependencies": {
+    "@anthropic-ai/claude-code": "latest",
+    "@openai/codex": "latest"
+  },
   "scripts": { "start": "node claude-safari-bridge.js --serve" }
 }

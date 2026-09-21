@@ -182,15 +182,26 @@ PY
 done < <(find "$APP_DIR" -name manifest.json -path "*Resources*")
 
 # ── 3. Normalize bundle ids (same rule as build-app.sh) ──────────────────────
-/usr/bin/python3 - "$PROJ/project.pbxproj" "$APP_ID" <<'PY'
+# Xcode 27's converter emits the new JSON `project.xcproj` spelling for a
+# cross-platform conversion (measured 2026-09-22); older Xcodes emit the
+# OpenStep `project.pbxproj`. Both carry the same setting under different
+# separators, so keep one normalization path for either representation.
+PROJ_FILE="$PROJ/project.pbxproj"
+[ -f "$PROJ_FILE" ] || PROJ_FILE="$PROJ/project.xcproj"
+/usr/bin/python3 - "$PROJ_FILE" "$APP_ID" <<'PY'
 import re, sys
 pbx, app_id = sys.argv[1], sys.argv[2]
 s = open(pbx).read()
-def fix(m):
+def fix_openstep(m):
     val = m.group(1)
     new = f"{app_id}.Extension" if val.endswith(".Extension") else app_id
     return f'PRODUCT_BUNDLE_IDENTIFIER = "{new}";'
-s = re.sub(r'PRODUCT_BUNDLE_IDENTIFIER = "?([^";]+)"?;', fix, s)
+def fix_json(m):
+    val = m.group(1)
+    new = f"{app_id}.Extension" if val.endswith(".Extension") else app_id
+    return f'"PRODUCT_BUNDLE_IDENTIFIER": "{new}"'
+s = re.sub(r'PRODUCT_BUNDLE_IDENTIFIER = "?([^";]+)"?;', fix_openstep, s)
+s = re.sub(r'"PRODUCT_BUNDLE_IDENTIFIER"\s*:\s*"([^"]+)"', fix_json, s)
 open(pbx, "w").write(s)
 PY
 

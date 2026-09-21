@@ -18,10 +18,12 @@ Everything needed on the extension/bridge side is built in:
   remote hub needs no path back into Safari. (The `claude_safari_*` MCP tools
   used by Mac Claude Code sessions remain a local-Mac feature.)
 
-What remains is choosing where the hub runs. Three options, cheapest first. In
-all of them the hub spawns `claude` under YOUR Claude account — usage bills to
-that plan, and the token is what stands between the internet and it, so make it
-long and random: `openssl rand -hex 24`.
+What remains is choosing where the hub runs. Three options, cheapest first. The
+provider picker sends each turn to `claude` or `codex`; selecting Codex sends
+that turn's page text, attached-tab text and uploaded files to OpenAI through
+the hub. Provider credentials stay on the hub, and the bridge token is what
+stands between the internet and them, so make it long and random:
+`openssl rand -hex 24`.
 
 ## Path 0 — your own Mac over a mesh VPN (free, works tonight)
 
@@ -84,8 +86,18 @@ check what your signed-in pack page actually shows.
    value wraps mid-string and a truncated copy fails as "401 OAuth access
    token is invalid" — which reads like a rejected token rather than a
    mangled one.
-4. Panel gear > Hub URL (the `https://...` URL the deploy script printed) +
+4. In Dashboard > app > Settings > Config Vars, add `CODEX_API_KEY`. The key is
+   captured when the bridge starts, removed from its ambient environment and
+   passed only to a selected Codex turn. API-key auth is the supported default
+   for non-interactive Codex automation; do not copy `~/.codex/auth.json` to a
+   public PaaS.
+5. Panel gear > Hub URL (the `https://...` URL the deploy script printed) +
    the token.
+
+For this fleet, use the same Heroku URL and token on macOS, iPhone and iPad so
+the provider behavior is consistent. Everyone else can still leave the URL
+empty for the local Mac bridge, use the mesh route above, or deploy this hub to
+their own Heroku app or VM.
 
 One trap the script already handles, which cost a stray app on a first run: the
 Heroku CLI writes a git credential helper into the global git config, and if

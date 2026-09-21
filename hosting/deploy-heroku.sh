@@ -63,7 +63,8 @@ if [ -z "$TOKEN" ]; then
   echo "minted a new BRIDGE_TOKEN"
 fi
 
-CFG=(BRIDGE_BIND=0.0.0.0 BRIDGE_TOKEN="$TOKEN" CLAUDE_BIN=/app/node_modules/.bin/claude)
+CFG=(BRIDGE_BIND=0.0.0.0 BRIDGE_TOKEN="$TOKEN" BRIDGE_CODEX_PANEL=1
+  CLAUDE_BIN=/app/node_modules/.bin/claude CODEX_BIN=/app/node_modules/.bin/codex)
 # An `[ test ] && arr+=(...)` one-liner would be a complete AND-OR list whose
 # failure (the common case: token not in this environment) trips `set -e` and
 # kills the deploy. Use a real if.
@@ -101,6 +102,10 @@ for _ in 1 2 3 4 5 6; do
     if ! heroku config:get CLAUDE_CODE_OAUTH_TOKEN -a "$APP" 2>/dev/null | grep -q .; then
       echo "STILL NEEDED for chats: claude setup-token, then"
       echo "  heroku config:set CLAUDE_CODE_OAUTH_TOKEN=<token> -a $APP"
+    fi
+    if ! heroku config -a "$APP" --json 2>/dev/null | jq -e 'has("CODEX_API_KEY")' >/dev/null; then
+      echo "STILL NEEDED for Codex: Dashboard > $APP > Settings > Config Vars"
+      echo "  add CODEX_API_KEY without putting it in a shell command"
     fi
     exit 0
   fi
