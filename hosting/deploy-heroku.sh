@@ -63,7 +63,7 @@ if [ -z "$TOKEN" ]; then
   echo "minted a new BRIDGE_TOKEN"
 fi
 
-CFG=(BRIDGE_BIND=0.0.0.0 BRIDGE_TOKEN="$TOKEN" BRIDGE_CODEX_PANEL=1
+CFG=(BRIDGE_BIND=0.0.0.0 BRIDGE_TOKEN="$TOKEN" BRIDGE_CODEX_PANEL=1 BRIDGE_CODEX_REQUIRE_API_KEY=1
   CLAUDE_BIN=/app/node_modules/.bin/claude CODEX_BIN=/app/node_modules/.bin/codex)
 # An `[ test ] && arr+=(...)` one-liner would be a complete AND-OR list whose
 # failure (the common case: token not in this environment) trips `set -e` and

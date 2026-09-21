@@ -505,11 +505,12 @@ are optional and every default is the standalone behaviour.
 | `BRIDGE_TOKEN` | unset | When set, every request must carry `Authorization: Bearer <token>` (constant-time compare). |
 | `BRIDGE_PANEL_TOOLS` | `read` | What a **panel** turn may do in the browser: `read` (tabs/read/screenshot) or `all`. Reported as `panelTools` by `/health` and `/status`. Does not affect the stdio MCP mode. See [Security](#security). |
 | `BRIDGE_CODEX_PANEL` | unset | Set to `1` to offer Codex in the panel. Hosted deployments also need a scoped `CODEX_API_KEY` in their secret store. |
+| `BRIDGE_CODEX_REQUIRE_API_KEY` | unset | Set to `1` on hosted deployments so Codex is advertised only when `CODEX_API_KEY` is present. Local and mesh-bound Macs leave it unset and use the CLI's normal login. |
 | `CLAUDE_BIN` | `~/.local/bin/claude`, else `claude` | The CLI the hub spawns for panel turns. |
 | `CODEX_BIN` | `codex` | The Codex CLI the hub spawns for Codex panel turns. |
 
 `install.sh` copies `BRIDGE_BIND`, `BRIDGE_PORT`, `BRIDGE_TOKEN`,
-`BRIDGE_PANEL_TOOLS`, `BRIDGE_CODEX_PANEL`, `CLAUDE_BIN` and `CODEX_BIN` out of
+`BRIDGE_PANEL_TOOLS`, `BRIDGE_CODEX_PANEL`, `BRIDGE_CODEX_REQUIRE_API_KEY`, `CLAUDE_BIN` and `CODEX_BIN` out of
 its own environment into the rendered launchd plist, so `BRIDGE_BIND=…
 BRIDGE_TOKEN=… bash install.sh --bridge-only` is how the agent gets them.
 Every run **re-renders** the plist, so hand edits to it are lost — change the
