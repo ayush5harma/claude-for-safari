@@ -54,6 +54,7 @@ const CODEX_PANEL = process.env.BRIDGE_CODEX_PANEL === "1";
 // only to the selected Codex child for that turn.
 const CODEX_API_KEY = process.env.CODEX_API_KEY || "";
 delete process.env.CODEX_API_KEY;
+const REMOTE_HUB = !["127.0.0.1", "::1", "localhost"].includes(BIND);
 
 // ── Several extension instances, one hub ──────────────────────────────────────
 // Safari runs one copy of the extension PER PROFILE, and every copy long-polls
@@ -227,7 +228,11 @@ function which(bin) {
   }
   return null;
 }
-const codexAvailable = () => CODEX_PANEL && !!(which(codexBin()) || fs.existsSync(codexBin()));
+// A local hub may use the CLI's normal login. A remote hub cannot claim that
+// session: the Heroku probe on 2026-09-22 found the binary, advertised Codex,
+// then waited for interactive authentication with no API key.
+const codexAvailable = () => CODEX_PANEL && (!REMOTE_HUB || !!CODEX_API_KEY) &&
+  !!(which(codexBin()) || fs.existsSync(codexBin()));
 const execFileP = (bin, args, opts) => new Promise((resolve, reject) =>
   execFile(bin, args, opts, (err, stdout, stderr) =>
     err ? reject(Object.assign(err, { stdout, stderr })) : resolve({ stdout, stderr })));
