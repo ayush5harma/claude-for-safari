@@ -227,6 +227,7 @@ function which(bin) {
   }
   return null;
 }
+const codexAvailable = () => CODEX_PANEL && !!(which(codexBin()) || fs.existsSync(codexBin()));
 const execFileP = (bin, args, opts) => new Promise((resolve, reject) =>
   execFile(bin, args, opts, (err, stdout, stderr) =>
     err ? reject(Object.assign(err, { stdout, stderr })) : resolve({ stdout, stderr })));
@@ -644,8 +645,9 @@ function runHub() {
       if (req.method === "GET" && req.url === "/health") {
         // panelTools rides along so the panel's gear can show which grant the
         // hub it is pointed at gives a chat turn.
+        const hasCodex = codexAvailable();
         return json(res, 200, { ok: true, port: PORT, panelTools: PANEL_TOOLS,
-          providers: { claude: true, codex: CODEX_PANEL && !!(which(codexBin()) || fs.existsSync(codexBin())) } });
+          codexEnabled: hasCodex, providers: { claude: true, codex: hasCodex } });
       }
       // /pull is POST-ONLY since 0.35 -- see the caller table above. Answer the
       // old GET with a reason rather than a bare 404, since a stale extension
@@ -736,8 +738,8 @@ function runHub() {
         const prompt = String(body.prompt || "").slice(0, 32000);
         if (!prompt.trim()) return json(res, 400, { error: "empty prompt" });
         const provider = body.provider === "codex" ? "codex" : "claude";
-        if (provider === "codex" && !CODEX_PANEL) {
-          return json(res, 503, { error: "Codex is not enabled on this hub" });
+        if (provider === "codex" && !codexAvailable()) {
+          return json(res, 403, { error: "Codex is unavailable on this hub" });
         }
         // Shape-check the session id ONCE and use the checked value
         // everywhere below: it reaches a child process's argv, and it also

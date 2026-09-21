@@ -129,6 +129,15 @@ the first turn of a session automatically.
   **history** (last 30 conversations, kept in the extension's local storage),
   markdown-rendered replies (escape-first mini renderer), voice input (Web
   Speech API; the microphone permission is per site).
+- **Codex on Caraxes**: when the local hub starts with `BRIDGE_CODEX_PANEL=1`
+  and finds the Codex CLI, the panel also offers a Claude/Codex picker. Codex
+  starts new chats with Astra, with Terra, Sol and Luna also available. It
+  receives the current page and attached-tab text, and resumes its own Codex
+  thread for follow-up messages. Codex turns exclude user config and MCP
+  servers while retaining the normal Codex auth and session storage. They can
+  run read-only shell commands and read supplied attachment paths. The
+  system-config flake sets the flag on Caraxes only, so the work Mac keeps the
+  Claude-only panel.
 - **MCP-isolated, and read-only by default**: panel turns run with
   `--strict-mcp-config` and a config that lists only `claude-safari`, so no
   other MCP server loads — turns are fast and can never trigger an OAuth popup.

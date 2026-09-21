@@ -843,7 +843,8 @@ browser.runtime.onMessage.addListener((msg) => {
   if (msg.op === "hubping") {
     return hubFetch("/health")
       .then((r) => r.json())
-      .then((j) => ({ ok: !!j.ok, hub: hub.url === HUB_DEFAULT ? "local Mac" : hub.url }))
+      .then((j) => ({ ok: !!j.ok, hub: hub.url === HUB_DEFAULT ? "local Mac" : hub.url,
+        codexEnabled: !!(j.codexEnabled || (j.providers && j.providers.codex)) }))
       .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
   }
   return undefined;
@@ -1036,5 +1037,4 @@ applyUaSites();
 // which always say Safari) is one of the reasons the spoof is confined to the
 // few sites that demand it instead of being global. Leaving this comment so
 // the attempt is not repeated.
-
 

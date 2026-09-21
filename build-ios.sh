@@ -159,11 +159,14 @@ echo "Devices: ${DEVICES[*]:-none (export only)}  Paired: ${PAIRED[*]:-none}"
 # ── 1. Convert (iOS + macOS project; only the iOS scheme is built) ───────────
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR"
+# The converter opens the generated project unless told not to. That made the
+# unattended iOS export bring Xcode to the foreground (measured 2026-09-22),
+# despite the macOS switch build already carrying the same guard.
 xcrun safari-web-extension-converter "$EXT" \
   --project-location "$APP_DIR" \
   --app-name "$APP_NAME" \
   --bundle-identifier "$APP_ID" \
-  --copy-resources --no-prompt --force
+  --copy-resources --no-prompt --no-open --force
 
 PROJ="$(find "$APP_DIR" -maxdepth 3 -name '*.xcodeproj' -print -quit)"
 [ -n "$PROJ" ] || { echo "ERROR: converter produced no .xcodeproj" >&2; exit 1; }

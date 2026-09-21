@@ -1028,6 +1028,7 @@ function buildPanel() {
     if (model && MODELS[chatProvider].some(([value]) => value === model)) select.value = model;
   }
   drawProvider(chatProvider);
+  let codexAvailable = null;
 
   const updateEmpty = () => { $("empty").style.display = msgs.querySelector(".m") ? "none" : "flex"; };
   const addMsg = (cls, content, html) => {
@@ -1521,9 +1522,16 @@ function buildPanel() {
     const el = $("hubstat");
     el.className = "hubstat"; el.textContent = "checking hub…";
     const r = await browser.runtime.sendMessage({ op: "hubping" }).catch(() => null);
-    if (r && r.ok) { el.className = "hubstat ok"; el.textContent = "hub reachable — " + (r.hub || "local"); }
+    if (r && r.ok) {
+      codexAvailable = !!r.codexEnabled;
+      const codexOption = $("provider").querySelector('option[value="codex"]');
+      if (codexOption) codexOption.disabled = !codexAvailable;
+      if (!convo && chatProvider === "codex" && !codexAvailable) drawProvider("claude");
+      el.className = "hubstat ok"; el.textContent = "hub reachable — " + (r.hub || "local");
+    }
     else { el.className = "hubstat bad"; el.textContent = "hub unreachable" + (r && r.error ? " — " + r.error : ""); }
   }
+  pingHub();
   // ── the site list ──
   // The list is applied by the BACKGROUND page (declarativeNetRequest rules and
   // the MAIN-world script registration are both background-only APIs), so this
@@ -1610,6 +1618,11 @@ function buildPanel() {
   async function send() {
     const prompt = input.value.trim();
     if (!prompt || chatBusy) return;
+    if (chatProvider === "codex" && codexAvailable === false) {
+      addMsg("err", "This hub does not have Codex enabled. Choose Claude or configure a Codex-enabled hub.");
+      msgs.scrollTop = msgs.scrollHeight;
+      return;
+    }
     chatBusy = true; $("send").disabled = true;
     $("provider").disabled = true; $("model").disabled = true;
     closeMenu();
