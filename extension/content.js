@@ -59,7 +59,15 @@ const GEN = (world.gen = (world.gen || 0) + 1);
 // constant, because ensureContent prefers the newest script in the page by
 // this number and two spellings that disagreed would send it silently down the
 // wrong route. background.js's CONTENT_V is its counterpart.
-const V = 6;
+const V = 7;
+// THIS SCRIPT RUNS IN EVERY FRAME since 0.43 (manifest all_frames), so tool
+// calls can reach an iframe. Only the top frame is the page: it alone gets
+// the message listener and the panel. A subframe publishes the world route and
+// stops -- tabs.sendMessage without a frameId reaches every frame's listener
+// and the first answer wins, so a subframe that listened could answer a ping
+// or a togglePanel in the page's place. (A cross-origin parent makes
+// window.top unreadable in some engines; that is a subframe too.)
+const TOP = (() => { try { return window.top === window; } catch (e) { return false; } })();
 
 // ── Tool ops (driven by Claude Code sessions via the bridge) ─────────────────
 
@@ -105,6 +113,11 @@ const ops = {
       links: Array.from(document.querySelectorAll("a[href]")).slice(0, 200)
         .map((a) => ({ text: (a.innerText || "").trim().slice(0, 120), href: a.href }))
         .filter((l) => l.text),
+      // What a caller can pass as frameUrl: this document's own frames, as
+      // their elements name them (a frame's live URL can differ after it
+      // navigates, and frameUrl matches the live one).
+      frames: Array.from(document.querySelectorAll("iframe, frame")).slice(0, 50)
+        .map((f) => ({ src: String(f.src || ""), name: String(f.name || f.id || "") })),
     };
   },
 
@@ -119,14 +132,17 @@ const ops = {
   fill(msg) {
     const el = document.querySelector(msg.selector);
     if (!el) throw new Error("no element matched selector " + JSON.stringify(msg.selector));
+    const value = msg.value == null ? "" : String(msg.value);
+    const isField = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement;
+    if (!isField && el.isContentEditable) return fillEditable(el, value, msg.selector);
     el.focus();
     // Set via the native setter so frameworks (React et al.) see the change.
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, "value");
-    if (setter && setter.set && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
-      setter.set.call(el, msg.value);
+    if (setter && setter.set && isField) {
+      setter.set.call(el, value);
     } else {
-      el.value = msg.value;
+      el.value = value;
     }
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -134,25 +150,127 @@ const ops = {
   },
 
   eval(msg) {
-    // Indirect eval: content-world scope, full DOM access. The result must
-    // survive JSON, so coerce anything exotic to a string.
+    // Indirect eval: content-world scope, full DOM access.
     const value = (0, eval)(msg.code);
-    try {
-      JSON.stringify(value);
-      // undefined would be dropped by JSON on the way back and the caller would
-      // read an empty object rather than "this evaluated to nothing".
-      return { value: value === undefined ? null : value };
-    } catch {
-      return { value: String(value) };
+    // A PROMISE IS PARKED, not returned (0.43). The world route is a
+    // tabs.executeScript, which hands back the last expression's value without
+    // awaiting it -- a promise arrived as {} -- so the promise is kept here
+    // under an id and the background page polls `job` until it settles. The
+    // message route could have awaited it, but one shape for both routes is
+    // what keeps a route change from changing the answer.
+    if (value && typeof value.then === "function") {
+      const jobs = world.jobs || (world.jobs = {});
+      // A job nobody came back for (the caller's wait ran out) is dropped at
+      // the next eval rather than kept for the life of the page. Two minutes
+      // is past the background page's longest wait.
+      const now = Date.now();
+      for (const k of Object.keys(jobs)) if (now - jobs[k].at > 120000) delete jobs[k];
+      const id = "j" + GEN + "-" + (world.jobSeq = (world.jobSeq || 0) + 1);
+      jobs[id] = { done: false, at: now };
+      value.then((v) => { if (jobs[id]) jobs[id] = { done: true, at: now, out: jsonable(v) }; },
+        (e) => { if (jobs[id]) jobs[id] = { done: true, at: now, error: String((e && e.message) || e) }; });
+      return { pending: id };
     }
+    return jsonable(value);
+  },
+
+  // A parked eval's promise: still { pending } while it runs, then its value
+  // or its rejection, once -- the entry is dropped when it is read.
+  job(msg) {
+    const jobs = world.jobs || {};
+    const j = jobs[msg.id];
+    if (!j) throw new Error("no pending eval " + JSON.stringify(msg.id) + " in this page (it was reloaded, or the result was already read)");
+    if (!j.done) return { pending: msg.id };
+    delete jobs[msg.id];
+    if ("error" in j) throw new Error(j.error);
+    return j.out;
+  },
+
+  // Files onto an <input type=file>, from base64 carried in the call (the hub
+  // capped the size). DataTransfer is the one way a page script can build a
+  // FileList; assigning it to .files is what a file picker does, and the
+  // input/change pair is what the page listens for after one.
+  upload(msg) {
+    const el = document.querySelector(msg.selector);
+    if (!el) throw new Error("no element matched selector " + JSON.stringify(msg.selector));
+    if (!(el instanceof HTMLInputElement) || String(el.type).toLowerCase() !== "file") {
+      throw new Error(JSON.stringify(msg.selector) + " is not an <input type=file>");
+    }
+    const files = Array.isArray(msg.files) ? msg.files : [];
+    if (!files.length) throw new Error("upload: no files");
+    if (files.length > 1 && !el.multiple) throw new Error("this input takes one file (no `multiple` attribute); got " + files.length);
+    const dt = new DataTransfer();
+    const done = [];
+    for (const f of files) {
+      const bin = atob(String(f.base64 || ""));
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      dt.items.add(new File([bytes], String(f.name), { type: String(f.type || ""), lastModified: Date.now() }));
+      done.push({ name: String(f.name), size: bytes.length });
+    }
+    el.files = dt.files;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { uploaded: done, count: el.files ? el.files.length : done.length };
   },
 };
+
+// A value that survives JSON on the way back: undefined would be dropped and
+// the caller would read an empty object rather than "this evaluated to
+// nothing", and anything exotic is coerced to a string.
+function jsonable(value) {
+  try {
+    JSON.stringify(value);
+    return { value: value === undefined ? null : value };
+  } catch {
+    return { value: String(value) };
+  }
+}
+
+// A contenteditable host (0.43). Rich editors (ProseMirror, Lexical, Draft,
+// Gmail's compose) keep their own model and ignore a bare DOM write, but they
+// all handle the beforeinput/input pair a real edit produces -- which is what
+// execCommand("insertText") generates, on a selection covering the old text so
+// the value REPLACES it, as fill does for an input. Only where the command is
+// REFUSED is the DOM set directly, with an input event: an editor that took the
+// command may render a tick later (Lexical batches), and overwriting it then
+// would break its model or double the text. `via` says which happened, and
+// `matches` whether the text read back equal straight away.
+function fillEditable(el, value, selector) {
+  el.focus();
+  let via = "insertText";
+  let ok = false;
+  try {
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    ok = document.execCommand("insertText", false, value) === true;
+  } catch (e) { ok = false; }
+  if (!ok) {
+    via = "textContent";
+    el.textContent = value;
+    const ev = typeof InputEvent === "function"
+      ? new InputEvent("input", { bubbles: true, inputType: "insertText", data: value })
+      : new Event("input", { bubbles: true });
+    el.dispatchEvent(ev);
+  }
+  // Whitespace and zero-width characters are compared loosely: an editor
+  // splits lines into blocks, which drops the newlines from textContent, and
+  // some pad empty blocks with U+200B.
+  const squash = (s) => String(s || "").replace(/[\s​-‍﻿]+/g, "");
+  return { filled: selector, via, matches: squash(el.textContent) === squash(value) };
+}
 
 // One entry point for every op, messaged or not. Synchronous on purpose: the
 // world route below is a tabs.executeScript, whose value is the last
 // expression and which does not await a promise.
 function runOp(msg) {
-  if (msg && msg.op === "togglePanel") return togglePanel(msg);
+  if (msg && msg.op === "togglePanel") {
+    if (!TOP) throw new Error("the panel lives in the top frame, not in a subframe");
+    return togglePanel(msg);
+  }
   const fn = msg && ops[msg.op];
   if (!fn) throw new Error("unknown op " + ((msg && msg.op) || ""));
   return fn(msg);
@@ -168,7 +286,7 @@ function runOp(msg) {
 // listeners answering one togglePanel would open the panel and close it again
 // in a single click. Returning undefined is what a listener says for a message
 // that is not its own, so the current run's answer is still the one delivered.
-browser.runtime.onMessage.addListener((msg) => {
+if (TOP) browser.runtime.onMessage.addListener((msg) => {
   if (world.gen !== GEN) return undefined;
   if (!msg || (msg.op !== "togglePanel" && !ops[msg.op])) return undefined;   // not ours
   // Through runOp, and INSIDE the try: togglePanel used to be dispatched ahead
@@ -189,6 +307,9 @@ world.v = V;
 world.ctx = CTX;
 world.run = (msg) => (world.gen === GEN ? runOp(msg) : undefined);
 window.__claudeSafariContent = "ready";
+// A subframe is done: it serves tool ops through the world route and nothing
+// else. Nothing below -- the panel, its styles, its listeners -- belongs in it.
+if (!TOP) return;
 
 // ── Chat panel ───────────────────────────────────────────────────────────────
 // Design matched to Claude for Chrome: near-black ground, assistant text with

@@ -100,6 +100,25 @@ const instanceReady = (async () => {
     await browser.storage.local.set({ [INSTANCE_KEY]: kept });
   } catch (e) {}
 })();
+// The Safari profile this copy runs in, as a person named it (0.43). No
+// WebExtension API tells a copy which profile it belongs to, and its windows
+// carry no title, so the name is GIVEN -- on the Settings page, or through the
+// hub's setProfile op -- and kept in storage.local, which is per profile. The
+// hub uses it to route a call that says `profile: "..."` and to label each tab
+// in claude_safari_tabs. Unnamed is the default and changes nothing.
+const PROFILE_KEY = "profileName";
+const PROFILE_MAX = 40;
+const cleanProfileName = (v) => String(v == null ? "" : v).replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, PROFILE_MAX);
+let PROFILE = "";
+// The first poll waits for this too: a poll sent before the name is read would
+// park for 25s unnamed, and a call routed by profile in that window would be
+// refused.
+const profileReady = (async () => {
+  try { PROFILE = cleanProfileName((await browser.storage.local.get(PROFILE_KEY))[PROFILE_KEY]); } catch (e) {}
+})();
+browser.storage.onChanged.addListener((ch, area) => {
+  if (area === "local" && ch[PROFILE_KEY]) PROFILE = cleanProfileName(ch[PROFILE_KEY].newValue);
+});
 const hubFetch = (path, opts = {}) => {
   // The version and the base URL ride along so the hub can tell a context an
   // update has superseded from the current one, and name it in a refusal the
@@ -107,6 +126,8 @@ const hubFetch = (path, opts = {}) => {
   const headers = { ...(opts.headers || {}), "x-claude-instance": INSTANCE };
   if (EXT_VERSION) headers["x-claude-version"] = EXT_VERSION;
   if (CTX_BASE) headers["x-claude-base"] = CTX_BASE;
+  // URI-encoded: a header value is ASCII and a profile name need not be.
+  if (PROFILE) headers["x-claude-profile"] = encodeURIComponent(PROFILE);
   const o = { ...opts, headers };
   if (hub.token) o.headers.authorization = "Bearer " + hub.token;
   return fetch(hub.url + path, o);
@@ -137,8 +158,19 @@ const INJECT_TIMED_OUT = Symbol("inject-timed-out");
 const WORLD_TIMED_OUT = Symbol("world-call-timed-out");
 // The content-script protocol version THIS build ships: content.js's ping
 // answers with it on both routes. Keep the two in step -- it is how a page
-// holding an older copy's script is recognised (see ensureContent).
-const CONTENT_V = 6;
+// holding an older copy's script is recognised (see ensureContent). 7 (0.43)
+// added the `job` and `upload` ops and contenteditable fill; a page still
+// holding a 6 is re-injected, so those ops exist wherever a call lands.
+const CONTENT_V = 7;
+// An awaited eval (0.43). A promise cannot come back through
+// tabs.executeScript, which returns the last expression's value without
+// awaiting it, so content.js parks the promise under a job id and this page
+// polls for it. The default wait is well under the hub's 90s call timeout,
+// and the cap keeps it under, so an eval that overruns is reported by name
+// rather than as the hub's generic "did not respond".
+const EVAL_WAIT_MS = 30000;
+const EVAL_WAIT_MAX_MS = 60000;
+const EVAL_POLL_MS = 100;
 
 // The content script's answer to a ping, or null: absent (Safari resolves a
 // sendMessage nobody receives with undefined), another instance's, or a page
@@ -176,14 +208,42 @@ async function relayToggle(url) {
 }
 
 // Default target: the active tab of the last focused window; a call may pin
-// an explicit tabId instead (from claude_safari_tabs).
+// an explicit tabId instead (from claude_safari_tabs), or a windowId (that
+// window's showing tab), or a profile (see profileTab).
 async function targetTab(args) {
   if (args && args.tabId != null) {
     return browser.tabs.get(args.tabId);
   }
+  if (args && typeof args.windowId === "number") {
+    const [t] = await browser.tabs.query({ active: true, windowId: args.windowId });
+    if (!t) throw new Error("window " + args.windowId + " has no showing tab");
+    return t;
+  }
+  if (args && typeof args.profile === "string" && args.profile.trim()) return profileTab();
   const tabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tabs.length) throw new Error("no active Safari tab");
   return tabs[0];
+}
+
+// A call the hub routed here BY PROFILE, naming no tab or window. The front
+// tab of the last-focused window is not necessarily this profile's: on Safari
+// 27 on 2026-09-15 every copy listed every profile's windows (a day later only
+// its own -- see the bridge's mergeTabListings), so "active in the last-focused
+// window" could be the owner's tab in another profile. The tab has to be one
+// this copy can prove is its own, by its ping answering; with none, the caller
+// is asked for an id rather than handed a guess.
+async function profileTab() {
+  const front = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+  const showing = await browser.tabs.query({ active: true });
+  const seen = new Set();
+  for (const t of [...front, ...showing]) {
+    if (seen.has(t.id)) continue;
+    seen.add(t.id);
+    if (await pingTab(t.id)) return t;
+  }
+  throw new Error("no showing tab here is one this profile's copy of the extension can reach" +
+    (PROFILE ? " (profile " + JSON.stringify(PROFILE) + ")" : "") +
+    "; pass a tabId or windowId from claude_safari_tabs");
 }
 
 // THE WORLD ROUTE. tabs.sendMessage only reaches a content script that
@@ -198,12 +258,26 @@ async function targetTab(args) {
 //
 // Returns the op's value, undefined when no script is published there, and
 // throws what the op threw.
-async function worldCall(tabId, msg, boundMs = WORLD_CALL_MS) {
+//
+// FRAMES (0.43). content.js now runs in every frame (manifest all_frames), and
+// each frame has its own window and so its own world. With no `frame` this is
+// the top frame, as it always was: executeScript's default. A `frame` of
+// { frameId } asks Safari for that one frame; { frameTag } -- what
+// resolveFrameUrl turns a frameUrl into -- runs the code in every frame and
+// lets exactly the one frame carrying that tag act. Safari gives this page no
+// frame list without the webNavigation permission, which the extension does
+// not ask for, so a frame is picked out from inside the frames themselves.
+async function worldCall(tabId, msg, boundMs = WORLD_CALL_MS, frame = null) {
+  const byTag = frame && typeof frame.frameTag === "string";
   const code =
     "(() => { var w = window.__claudeSafari;" +
+    (byTag ? " if (window.__claudeSafariFrameTag !== " + JSON.stringify(frame.frameTag) + ") return { skip: true };" : "") +
     " if (!w || typeof w.run !== 'function') return { absent: true };" +
     " try { var v = w.run(" + JSON.stringify(msg) + "); return v === undefined ? { absent: true } : { value: v }; }" +
     " catch (e) { return { failed: String((e && e.message) || e) }; } })()";
+  const details = { code };
+  if (byTag) details.allFrames = true;
+  else if (frame && typeof frame.frameId === "number") details.frameId = frame.frameId;
   // BOUNDED, like pingTab. executeScript runs on the page's main thread and
   // does not settle while that thread is blocked -- an undismissed alert(), a
   // long synchronous script -- and an unbounded probe would hang the toolbar
@@ -211,14 +285,88 @@ async function worldCall(tabId, msg, boundMs = WORLD_CALL_MS) {
   // A timeout reads as "nothing answered here", which is what the caller does
   // with it anyway.
   const r = await Promise.race([
-    browser.tabs.executeScript(tabId, { code }),
+    browser.tabs.executeScript(tabId, details),
     sleep(boundMs).then(() => WORLD_TIMED_OUT),
   ]);
   if (r === WORLD_TIMED_OUT) return undefined;
-  const out = Array.isArray(r) ? r[0] : r;
+  const out = byTag
+    ? (Array.isArray(r) ? r : [r]).find((x) => x && !x.skip)
+    : (Array.isArray(r) ? r[0] : r);
   if (!out || out.absent) return undefined;
   if (out.failed) throw new Error(out.failed);
   return out.value;
+}
+
+// A frameUrl, resolved to the ONE frame it names, as a tag that frame keeps in
+// its world. Two steps, because a match made while running the op would run it
+// in every frame that matched: a page can embed any frame it likes, and one
+// whose URL merely contains the caller's text (a fragment will do) would
+// receive the fill value or the uploaded files meant for another. So every
+// frame is first asked only for its URL and a tag it mints once, the match
+// must be unique, and only then does worldCall run the op -- in the frame with
+// that tag and no other.
+async function resolveFrameUrl(tabId, frameUrl) {
+  const code =
+    "(() => { var t = window.__claudeSafariFrameTag ||" +
+    " (window.__claudeSafariFrameTag = Math.random().toString(36).slice(2) + Date.now().toString(36));" +
+    " return { href: String(location.href), tag: t }; })()";
+  const r = await Promise.race([
+    browser.tabs.executeScript(tabId, { code, allFrames: true }),
+    sleep(WORLD_CALL_MS).then(() => WORLD_TIMED_OUT),
+  ]);
+  if (r === WORLD_TIMED_OUT) throw new Error("the page did not answer a frame probe within " + WORLD_CALL_MS + "ms");
+  const all = (Array.isArray(r) ? r : [r]).filter((x) => x && typeof x.href === "string");
+  const hits = all.filter((x) => x.href.indexOf(frameUrl) >= 0);
+  if (hits.length === 1) return { frameTag: hits[0].tag };
+  const list = all.map((x) => x.href).join(", ") || "none reachable";
+  throw new Error(hits.length
+    ? hits.length + " frames' URLs contain " + JSON.stringify(frameUrl) + "; give a longer frameUrl that names one (" + list + ")"
+    : "no frame's URL contains " + JSON.stringify(frameUrl) + " (frames here: " + list + ")");
+}
+
+// A call's frame target, or null for the top frame.
+function frameOf(args) {
+  if (args && typeof args.frameUrl === "string" && args.frameUrl) return { frameUrl: args.frameUrl };
+  if (args && typeof args.frameId === "number" && args.frameId !== 0) return { frameId: args.frameId };
+  return null;
+}
+
+// One op in one frame. Subframes are reached ONLY through the world route:
+// content.js registers no message listener there (see its TOP guard), because
+// tabs.sendMessage without a frameId reaches every frame and the first answer
+// wins -- a subframe's would stand in for the page's. A frame whose script is
+// absent (it loaded before this build, or nothing has injected it) is injected
+// once and asked again; the takeover ladder is for the top frame's panel and
+// stays there.
+async function askFrame(tabId, target, msg) {
+  const frame = target.frameUrl ? await resolveFrameUrl(tabId, target.frameUrl) : target;
+  let v = await worldCall(tabId, msg, WORLD_CALL_MS, frame);
+  if (v !== undefined) return v;
+  // undefined is "no script" OR "no answer within the bound", and only the
+  // first may be retried: a busy frame may still run the op it was given, and
+  // a retry would run a click or an upload twice.
+  if (await worldCall(tabId, { op: "ping" }, WORLD_CALL_MS, frame).catch(() => undefined)) {
+    throw new Error("the frame's content script did not answer op " + msg.op + " within " + WORLD_CALL_MS +
+      "ms (a busy page?); not retried, since it may still run");
+  }
+  const inject = { file: "content.js" };
+  if (frame.frameTag) inject.allFrames = true;
+  else inject.frameId = frame.frameId;
+  try {
+    await Promise.race([browser.tabs.executeScript(tabId, inject), sleep(INJECT_MS)]);
+  } catch (e) {
+    throw new Error("cannot run in that frame: " + String((e && e.message) || e));
+  }
+  v = await worldCall(tabId, msg, WORLD_CALL_MS, frame);
+  if (v === undefined) throw new Error("the content script did not answer in that frame (op " + msg.op + ")");
+  return v;
+}
+
+// Every tool op that runs in the page goes through here: the top frame by the
+// established ladder, a subframe by askFrame.
+async function pageOp(tabId, args, msg) {
+  const frame = frameOf(args);
+  return frame ? askFrame(tabId, frame, msg) : askContent(tabId, msg);
 }
 
 // Clear the run-once guard so the next injection really runs. Only for a page
@@ -546,6 +694,10 @@ const handlers = {
   async read(args) {
     const tab = await targetTab(args);
     const maxChars = (args && args.maxChars) || 120000;
+    const frame = frameOf(args);
+    // A frame has no fetch fallback: its URL is not the tab's, and a frame
+    // that cannot be reached is an answer the caller should see.
+    if (frame) return { tabId: tab.id, url: tab.url, title: tab.title, ...(await askFrame(tab.id, frame, { op: "read", maxChars })) };
     try {
       const page = await askContent(tab.id, { op: "read", maxChars });
       return { tabId: tab.id, url: tab.url, title: tab.title, ...page };
@@ -571,34 +723,112 @@ const handlers = {
 
   async click(args) {
     const tab = await targetTab(args);
-    return askContent(tab.id, { op: "click", selector: args.selector, text: args.text });
+    return pageOp(tab.id, args, { op: "click", selector: args.selector, text: args.text });
   },
 
   async fill(args) {
     const tab = await targetTab(args);
-    return askContent(tab.id, { op: "fill", selector: args.selector, value: args.value });
+    return pageOp(tab.id, args, { op: "fill", selector: args.selector, value: args.value });
   },
 
+  // A returned promise is awaited: content.js hands back { pending: id } for
+  // one (see EVAL_WAIT_MS), and the job is polled down the route the first
+  // answer came by, so the ladder runs once rather than once per poll.
   async eval(args) {
     const tab = await targetTab(args);
-    return askContent(tab.id, { op: "eval", code: args.code });
+    const frame = frameOf(args);
+    const wait = Math.min(Math.max(Number(args.timeoutMs) || EVAL_WAIT_MS, 0), EVAL_WAIT_MAX_MS);
+    let ask;
+    if (frame) {
+      ask = (msg) => askFrame(tab.id, frame, msg);
+    } else {
+      const { via } = await ensureContent(tab.id);
+      ask = (msg) => sendVia(tab.id, via, msg);
+    }
+    let r = await ask({ op: "eval", code: args.code });
+    const deadline = Date.now() + wait;
+    while (r && r.pending) {
+      if (Date.now() >= deadline) {
+        throw new Error("eval: the returned promise did not settle within " + wait + "ms (raise timeoutMs, at most " + EVAL_WAIT_MAX_MS + ")");
+      }
+      await sleep(EVAL_POLL_MS);
+      r = await ask({ op: "job", id: r.pending });
+    }
+    return r;
   },
 
+  // Files for an <input type=file>, carried in the call as base64. The hub has
+  // already checked and capped them (checkUpload); content.js builds the File
+  // objects in the page, where DataTransfer is.
+  async upload(args) {
+    const tab = await targetTab(args);
+    return pageOp(tab.id, args, { op: "upload", selector: args.selector, files: args.files });
+  },
+
+  // A NEW TAB OPENS IN THE BACKGROUND (0.43) unless the caller asks for
+  // `active: true`, so an agent working in the owner's Safari never changes
+  // which tab a window is showing. With no windowId it opens in the window of
+  // this copy's active tab -- the owner's current window, since the hub
+  // routes an unpinned call to the copy that owns the active tab -- named
+  // explicitly rather than left to tabs.create, whose "current window" for a
+  // background page is whatever Safari last called current.
   async navigate(args) {
     if (args.newTab) {
-      const t = await browser.tabs.create({ url: args.url });
-      return { tabId: t.id, url: args.url, opened: "new tab" };
+      const opts = { url: args.url, active: args.active === true };
+      if (typeof args.windowId === "number") {
+        opts.windowId = args.windowId;
+      } else {
+        // By profile: a window holding a tab this copy can prove is its own.
+        const front = (typeof args.profile === "string" && args.profile.trim())
+          ? await profileTab()
+          : (await browser.tabs.query({ active: true, lastFocusedWindow: true }))[0];
+        if (front && typeof front.windowId === "number") opts.windowId = front.windowId;
+      }
+      const t = await browser.tabs.create(opts);
+      return { tabId: t.id, windowId: t.windowId, url: args.url, opened: "new tab", active: !!t.active };
     }
     const tab = await targetTab(args);
     await browser.tabs.update(tab.id, { url: args.url });
-    return { tabId: tab.id, url: args.url, opened: "current tab" };
+    return { tabId: tab.id, windowId: tab.windowId, url: args.url, opened: "current tab" };
   },
 
+  // captureVisibleTab captures what a WINDOW shows, so a tab that is not the
+  // one its window shows cannot be captured without switching to it -- which
+  // is what this did unconditionally until 0.43, moving the owner's view
+  // under them. Now a background tab is refused unless the caller forces it,
+  // and a forced switch is put back after the capture.
   async screenshot(args) {
     const tab = await targetTab(args);
-    await browser.tabs.update(tab.id, { active: true });
-    const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: "png" });
-    return { tabId: tab.id, dataUrl };
+    let restore = null;
+    if (!tab.active) {
+      if (!args.force) {
+        throw new Error("tab " + tab.id + " is not the tab its window is showing, and a screenshot can only capture " +
+          "what a window shows: taking it would switch the window to it. Use claude_safari_read (text) or " +
+          "claude_safari_eval (DOM, geometry) for a background tab; pass force: true only for a window nobody is looking at.");
+      }
+      const [prev] = await browser.tabs.query({ active: true, windowId: tab.windowId });
+      restore = prev ? prev.id : null;
+      await browser.tabs.update(tab.id, { active: true });
+    }
+    try {
+      const dataUrl = await browser.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      return { tabId: tab.id, dataUrl, switched: restore != null };
+    } finally {
+      if (restore != null && restore !== tab.id) {
+        try { await browser.tabs.update(restore, { active: true }); } catch (e) {}
+      }
+    }
+  },
+
+  // Name this copy's profile (see PROFILE_KEY), for a curl at the hub
+  // (POST /call {"tool":"setProfile","args":{"name":"Agent","windowId":N}});
+  // not an MCP tool. An empty name clears it.
+  async setProfile(args) {
+    const name = cleanProfileName(args && args.name);
+    if (name) await browser.storage.local.set({ [PROFILE_KEY]: name });
+    else await browser.storage.local.remove(PROFILE_KEY);
+    PROFILE = name;
+    return { profile: name || null, instance: CTX_BASE };
   },
 };
 
@@ -656,6 +886,7 @@ async function loop() {
   // The first poll waits for the persisted instance id: polling under the
   // temporary one would take a slot the restored id then has to abandon.
   await instanceReady;
+  await profileReady;
   for (;;) {
     try {
       // POST, not GET, since 0.35. The hub answers /pull to POST only because a

@@ -83,6 +83,9 @@ function load({ ns = XHTML, contentType = "text/html", shadow = "throw", bodyChi
   });
   ctx.window = ctx;
   ctx.globalThis = ctx;
+  // The top frame: since 0.43 the script runs in every frame and only the top
+  // one is the page (see TOP in content.js).
+  ctx.top = ctx;
   vm.runInContext(SRC, ctx, { filename: "content.js" });
   return { ctx, document, documentElement, listeners, made };
 }

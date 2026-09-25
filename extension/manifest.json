@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Claude for Safari",
-  "version": "0.42",
+  "version": "0.43",
   "description": "A Claude or Codex chat panel on any page, plus Safari tab tools for local agent sessions through the bridge.",
   "icons": {
     "16": "images/icon-16.png",
@@ -29,7 +29,9 @@
       "js": [
         "content.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
   "browser_action": {

@@ -23,7 +23,7 @@ const settle = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise(
 // hub says to /relay. `pull` hands the poll loop one call and then parks it
 // forever.
 function load({ tabs = [], owned = [], worldOwned = [], blockInjection = [], injectFails = [],
-  relay = { handled: false }, pull = null, store = {}, messageV = 6,
+  relay = { handled: false }, pull = null, store = {}, messageV = 7,
   // What the failure diagnosis reads: which origins this copy is granted, and
   // whether it can still read its own files (a bundle replaced under a running
   // Safari cannot -- the shape the user hit on 2026-09-16).
@@ -42,8 +42,8 @@ function load({ tabs = [], owned = [], worldOwned = [], blockInjection = [], inj
   const worlds = new Map();
   const publish = (id) => worlds.set(id, {
     __claudeSafariContent: "ready",
-    __claudeSafari: { v: 6, gen: 1, ctx: "safari-web-extension://OTHER/", run: (msg) => {
-      if (msg.op === "ping") return { ok: true, v: 6, hidden: false };
+    __claudeSafari: { v: 7, gen: 1, ctx: "safari-web-extension://OTHER/", run: (msg) => {
+      if (msg.op === "ping") return { ok: true, v: 7, hidden: false };
       if (msg.op === "togglePanel") return { open: true };
       return { ok: true, op: msg.op };
     } },
