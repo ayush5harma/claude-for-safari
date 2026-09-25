@@ -46,3 +46,27 @@ async function run(label, msg) {
 $("uasave").addEventListener("click", () => run("applying…", { op: "uaSitesSet", text: $("uasites").value }));
 $("uareset").addEventListener("click", () => run("restoring…", { op: "uaSitesReset" }));
 run("loading…", { op: "uaSitesGet" });
+
+// The profile name (0.43) is plain storage: background.js watches the key and
+// sends the new name with its next hub request, so nothing here goes through
+// a background op. Storage is per profile, which is the whole point.
+const PROFILE_KEY = "profileName";
+async function drawProfile(note) {
+  let name = "";
+  try { name = String((await browser.storage.local.get(PROFILE_KEY))[PROFILE_KEY] || ""); } catch (e) {}
+  $("profile").value = name;
+  $("profilestat").className = "stat" + (note ? " ok" : "");
+  $("profilestat").textContent = note || (name ? "named " + name : "unnamed");
+}
+$("profilesave").addEventListener("click", async () => {
+  const name = $("profile").value.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 40);
+  try {
+    if (name) await browser.storage.local.set({ [PROFILE_KEY]: name });
+    else await browser.storage.local.remove(PROFILE_KEY);
+    drawProfile(name ? "saved: " + name : "cleared");
+  } catch (e) {
+    $("profilestat").className = "stat bad";
+    $("profilestat").textContent = "could not save — " + String((e && e.message) || e);
+  }
+});
+drawProfile();

@@ -50,6 +50,22 @@
     <button id="uareset" type="button">Restore defaults</button>
     <button id="uasave" type="button" class="primary">Save</button>
   </div>
+
+  <h2>This profile's name</h2>
+  <p>Safari runs one copy of this extension per profile, and no copy can tell
+    which profile it is in. A name given here (the profile's name as Safari
+    shows it, e.g. <code>Personal</code>) labels this profile's tabs in
+    <code>claude_safari_tabs</code> and lets a tool call say
+    <code>profile: "Personal"</code>. Optional; set it once per profile, from a
+    window of that profile.</p>
+  <div class="row">
+    <input id="profile" type="text" maxlength="40" spellcheck="false" autocapitalize="off"
+      autocorrect="off" autocomplete="off" placeholder="unnamed" aria-label="This profile's name"
+      style="flex: 1 1 200px; box-sizing: border-box; padding: 7px 10px; border: 1px solid var(--line);
+             border-radius: 8px; background: var(--field); color: var(--ink); font: inherit;">
+    <button id="profilesave" type="button" class="primary">Save</button>
+  </div>
+  <div class="row"><span class="stat" id="profilestat" role="status" aria-live="polite"></span></div>
 </main>
 <script src="options.js"></script>
 </body>
