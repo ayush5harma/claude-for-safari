@@ -31,6 +31,8 @@ const MODELS = {
   NEW: { tabs: [tab(900, 1, "https://new-context/", true, 700)] },
   OLD: { tabs: [tab(800, 1, "https://superseded-context/", true, 701)] },
   TWIN: { tabs: [tab(700, 1, "https://twin/", true, 702)] },
+  // A copy named for the owner's "Agent" profile (0.43), running the build NEW does.
+  AGENT: { tabs: [tab(600, 1, "https://example.com/", true, 703)] },
   A: {
     tabs: [tab(324, 0, "https://calendar/", false, 312),
       tab(15050, 1, "https://github.com/browserstack/talkback/pull/145", true, 312),
@@ -43,7 +45,7 @@ const MODELS = {
   },
   C: { tabs: [] },
 };
-const served = { A: [], B: [], C: [], NEW: [], OLD: [], TWIN: [] };   // which calls each instance answered
+const served = { A: [], B: [], C: [], NEW: [], OLD: [], TWIN: [], AGENT: [] };   // which calls each instance answered
 
 function model(name, tool, args) {
   const m = MODELS[name];
@@ -75,6 +77,7 @@ function startInstance(name, opts = {}) {
   const headers = { "x-claude-instance": opts.id || "inst-" + name };
   if (opts.base) headers["x-claude-base"] = opts.base;
   if (opts.version) headers["x-claude-version"] = opts.version;
+  if (opts.profile) headers["x-claude-profile"] = encodeURIComponent(opts.profile);
   let polls = 0;
   const self = { ctl, name, polls: () => polls };
   const loop = (async () => {
@@ -313,4 +316,32 @@ test("the merged tab listing leaves out a superseded context's tabs", async () =
   const { body } = await call("tabs");
   assert.ok(body.result.some((t) => t.url === "https://new-context/"));
   assert.equal(body.result.some((t) => t.url === "https://superseded-context/"), false);
+});
+
+test("a named profile is a routing key: its copy takes the call, and its tabs say so", async () => {
+  startInstance("AGENT", { id: "ctx-agent", base: "safari-web-extension://AGENT/", version: "0.41", profile: "Agent" });
+  const st = await waitForStatus((s) => s.instances.some((i) => i.profile === "Agent"));
+  const row = st.instances.find((i) => i.profile === "Agent");
+  assert.ok(row && row.current, "the named copy is listed with its profile, and is current");
+
+  const before = served.NEW.length;
+  const r = await call("eval", { profile: "agent", code: "1" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.match(r.body.result.value, /via AGENT$/);
+  assert.equal(served.NEW.length, before, "no other copy was asked");
+
+  const { body } = await call("tabs", { profile: "Agent" });
+  assert.deepEqual(body.result.map((t) => [t.url, t.profile, t.windowId]),
+    [["https://example.com/", "Agent", row.slot * TAB_SLOT + 703]]);
+  assert.equal(body.result[0].windowTitle, "Agent — T https://example.com/");
+
+  const none = await call("eval", { profile: "Nobody", code: "1" });
+  assert.match(none.body.error, /no Safari extension instance is named profile "Nobody"/);
+});
+
+test("an oversized upload is refused at the hub, before any copy sees it", async () => {
+  const counts = Object.values(served).reduce((n, l) => n + l.length, 0);
+  const r = await call("upload", { selector: "#f", files: [{ name: "big.bin", base64: "A".repeat(12 * 1024 * 1024) }] });
+  assert.match(r.body.error, /MB decoded/);
+  assert.equal(Object.values(served).reduce((n, l) => n + l.length, 0), counts);
 });

@@ -36,7 +36,10 @@ test("a single listing without ownership marks is passed through in order, ids s
   // tab out, in Safari's order, with nothing but the ids changed.
   const legacy = [{ tabId: 3, windowId: 1, active: true, url: "https://a/", title: "A", favIconUrl: "" },
     { tabId: 4, windowId: 1, active: false, url: "https://b/", title: "B", favIconUrl: "" }];
-  assert.deepEqual(mergeTabListings([{ slot: 0, tabs: legacy }]), legacy);
+  // Nothing but the ids changes -- plus the two fields the hub itself derives
+  // (profile, null for an unnamed copy; windowTitle, the showing tab's title).
+  assert.deepEqual(mergeTabListings([{ slot: 0, tabs: legacy }]),
+    legacy.map((t) => ({ ...t, profile: null, windowTitle: "A" })));
   const stamped = mergeTabListings([{ slot: 1, tabs: legacy }]);
   assert.deepEqual(stamped.map((t) => t.tabId), [TAB_SLOT + 3, TAB_SLOT + 4]);
   assert.deepEqual(stamped.map((t) => t.windowId), [TAB_SLOT + 1, TAB_SLOT + 1]);

@@ -107,13 +107,23 @@ const decodeTabId = (n) => ({ slot: Math.floor(n / TAB_SLOT), id: n % TAB_SLOT }
 // enough: two windows both start at index 0). The largest listing sets the
 // order, each of its tabs is taken from the instance that owns it, and owned
 // tabs it never saw are appended.
+//
+// Each tab also says which PROFILE it is in (the name that instance was given,
+// see cleanProfile; null when nobody named it) and a `windowTitle`. Safari's
+// WebExtension windows carry no title, and what Safari itself shows as a
+// window's title -- read over AppleScript on Safari 27, 2026-09-26, as
+// "Personal — Start Page" -- is the profile's name, an em dash, and the title
+// of the tab the window is showing. So the hub builds exactly that from the
+// listing: it is derived, not read, and only as right as the profile's name.
 function mergeTabListings(listings) {
   const live = (listings || []).filter((l) => l && Array.isArray(l.tabs));
   if (!live.length) return [];
   const key = (t, pos) => [pos, t.url || "", t.title || ""].join("\u0000");
+  const profileBySlot = new Map(live.map((l) => [l.slot, l.profile || null]));
   const pub = (slot, t) => {
     const { owned, index, ...rest } = t;
-    return { ...rest, tabId: encodeTabId(slot, t.tabId), windowId: encodeTabId(slot, t.windowId) };
+    return { ...rest, tabId: encodeTabId(slot, t.tabId), windowId: encodeTabId(slot, t.windowId),
+      profile: profileBySlot.get(slot) || null };
   };
   const primary = live.slice().sort((a, b) => b.tabs.length - a.tabs.length || a.slot - b.slot)[0];
   // Every tab the other instances see, best claim per key: an owner outranks a
@@ -144,7 +154,124 @@ function mergeTabListings(listings) {
   // still not possible: a tab both listings hold has the same position, url and
   // title in both, so it was matched and deleted above.
   for (const o of elsewhere.values()) out.push(pub(o.slot, o.tab));
+  const showing = new Map();
+  for (const t of out) if (t.active && !showing.has(t.windowId)) showing.set(t.windowId, t);
+  for (const t of out) {
+    const front = showing.get(t.windowId);
+    const title = front ? String(front.title || "") : "";
+    t.windowTitle = t.profile ? t.profile + " — " + title : title;
+  }
   return out;
+}
+
+// ── Profiles ─────────────────────────────────────────────────────────────────
+// A copy of the extension cannot learn which Safari profile it runs in: no
+// WebExtension API names it, and its windows have no title. What it CAN keep
+// is a name it was given, because storage.local is per profile -- the
+// extension's Settings page, or the hub's setProfile op, writes one, and the
+// background page sends it on every request (x-claude-profile, URI-encoded,
+// since a header is ASCII and a profile name need not be). Names match
+// trimmed and case-folded, which is how a person types one.
+const PROFILE_MAX = 40;
+const cleanProfile = (v) => {
+  let s = "";
+  try { s = decodeURIComponent(String(v || "")); } catch { s = String(v || ""); }
+  s = s.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, PROFILE_MAX);
+  return s || null;
+};
+const sameProfile = (a, b) => !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
+const describeProfiles = (insts) => (insts || []).length
+  ? insts.map((i) => "slot " + i.slot + " " + (i.profile ? "profile " + JSON.stringify(i.profile) : "unnamed")).join(", ")
+  : "no extension instance is polling";
+
+// WHERE A CALL THAT IS NOT `tabs` GOES, decided from its arguments alone.
+// A tabId or windowId from `tabs` pins it to the instance that numbered it --
+// the copies number tabs AND windows differently, so nobody else can serve
+// either -- and that instance is handed Safari's raw id. A profile narrows the
+// choice to the copies carrying that name, and a pinned id outside it is
+// refused rather than run in another profile's tab. Returns { inst, args }
+// for a pinned call, { pool, args } when the caller still has to pick among
+// the pool by the active tab, or { error }.
+function pinRoute(args, live, current) {
+  const a = { ...(args || {}) };
+  const cur = current || [];
+  const want = typeof a.profile === "string" && a.profile.trim() ? a.profile.trim() : null;
+  let pool = cur;
+  if (want) {
+    pool = cur.filter((i) => sameProfile(i.profile, want));
+    if (!pool.length) {
+      return { error: "no Safari extension instance is named profile " + JSON.stringify(want) +
+        " (" + describeProfiles(cur) + "). Open a window of that profile with the extension enabled for it, " +
+        "then name that copy once: the extension's Settings page opened from that profile, or POST /call " +
+        "{\"tool\":\"setProfile\",\"args\":{\"name\":" + JSON.stringify(want) +
+        ",\"windowId\":<one of its windows from claude_safari_tabs>}}" };
+    }
+  }
+  let pinned = null;
+  for (const [field, noun] of [["tabId", "tab"], ["windowId", "window"]]) {
+    if (typeof a[field] !== "number") continue;
+    const { slot, id } = decodeTabId(a[field]);
+    const inst = (live || []).find((i) => i.slot === slot);
+    const where = cur.length ? "live now: " + cur.map(describeInstance).join(", ") : "no extension instance is polling";
+    if (!inst) {
+      return { error: noun + " " + a[field] + " was listed by an extension instance that is no longer polling " +
+        "(its Safari profile closed, its background page restarted, or the hub restarted); " + where +
+        "; run claude_safari_tabs again" };
+    }
+    if (!cur.includes(inst)) {
+      // It still polls, but an update has superseded it: its ops and its tab
+      // numbering are the old build's.
+      return { error: noun + " " + a[field] + " belongs to extension " + describeInstance(inst) +
+        ", which a newer build has superseded (" + where + "); relaunch Safari to retire the old copy, then run claude_safari_tabs again" };
+    }
+    if (pinned && pinned !== inst) {
+      return { error: "tabId " + args.tabId + " and windowId " + args.windowId + " were listed by different " +
+        "extension instances (different Safari profiles); pass one, or both from the same profile" };
+    }
+    if (want && !pool.includes(inst)) {
+      return { error: noun + " " + a[field] + " is in " +
+        (inst.profile ? "profile " + JSON.stringify(inst.profile) : "an unnamed profile") +
+        ", not profile " + JSON.stringify(want) };
+    }
+    pinned = inst;
+    a[field] = id;
+  }
+  return pinned ? { inst: pinned, args: a } : { pool, args: a };
+}
+
+// ── Uploads ──────────────────────────────────────────────────────────────────
+// claude_safari_upload carries its files INSIDE the call, as base64, through
+// this hub, a parked /pull, the background page and -- on the world route --
+// the source text of a tabs.executeScript. Every hop copies the payload, so it
+// is capped here, before any of them, rather than found out as a stalled page.
+// 8 MB decoded covers a screenshot, a PDF or a CSV, which is what a form asks
+// for; anything larger belongs in a real file picker.
+const UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
+const UPLOAD_MAX_FILES = 10;
+// The files an upload call may carry, normalised to bare base64, or { error }.
+function checkUpload(args) {
+  const a = args || {};
+  if (typeof a.selector !== "string" || !a.selector) return { error: "upload: `selector` (the <input type=file>) is required" };
+  const files = a.files;
+  if (!Array.isArray(files) || !files.length) return { error: "upload: `files` must be a non-empty array of {name, base64, type}" };
+  if (files.length > UPLOAD_MAX_FILES) return { error: "upload: at most " + UPLOAD_MAX_FILES + " files per call" };
+  let total = 0;
+  const out = [];
+  for (const f of files) {
+    if (!f || typeof f.name !== "string" || !f.name || typeof f.base64 !== "string") {
+      return { error: "upload: every file needs a `name` and its content as `base64`" };
+    }
+    const b64 = f.base64.replace(/^data:[^,]*,/, "").replace(/\s+/g, "");
+    if (b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
+      return { error: "upload: " + JSON.stringify(f.name) + " is not valid base64" };
+    }
+    total += b64.length / 4 * 3 - (b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0);
+    if (total > UPLOAD_MAX_BYTES) {
+      return { error: "upload: the files come to more than " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded; this tool carries them inline" };
+    }
+    out.push({ name: f.name.slice(0, 200), type: typeof f.type === "string" ? f.type.slice(0, 100) : "", base64: b64 });
+  }
+  return { files: out, bytes: total };
 }
 
 // Which instance takes a call that names no tab: the one that owns the active
@@ -373,13 +500,17 @@ function runHub() {
     const iid = String(req.headers["x-claude-instance"] || "legacy").slice(0, 64);
     const base = String(req.headers["x-claude-base"] || "").slice(0, 128);
     const version = String(req.headers["x-claude-version"] || "").slice(0, 32);
+    // Read on every request, not only at registration: a name given on the
+    // Settings page reaches the hub with that copy's next poll.
+    const profile = cleanProfile(req.headers["x-claude-profile"]);
     const key = base ? iid + " " + base : iid;
     let inst = instances.get(key);
     if (!inst) {
-      inst = { iid: key, family: key, base, version, slot: nextSlot++, parked: null, parkedAt: 0, queue: [], lastPullAt: 0 };
+      inst = { iid: key, family: key, base, version, profile, slot: nextSlot++, parked: null, parkedAt: 0, queue: [], lastPullAt: 0 };
       instances.set(key, inst);
-    } else if (version && inst.version !== version) {
-      inst.version = version;   // the same context after an in-place reload
+    } else {
+      if (version && inst.version !== version) inst.version = version;   // the same context after an in-place reload
+      inst.profile = profile;
     }
     return inst;
   };
@@ -397,7 +528,7 @@ function runHub() {
       const key = inst.family + " #" + n;
       const existing = instances.get(key);
       if (!existing) {
-        const split = { iid: key, family: inst.family, base: inst.base, version: inst.version,
+        const split = { iid: key, family: inst.family, base: inst.base, version: inst.version, profile: inst.profile,
           slot: nextSlot++, parked: null, parkedAt: 0, queue: [], lastPullAt: 0 };
         instances.set(key, split);
         return split;
@@ -571,9 +702,12 @@ function runHub() {
 
   // The routing described at TAB_SLOT. Returns what /call answers with.
   const withSlot = (r) => {
-    if (!r || !r.inst || !r.result || typeof r.result !== "object") return r;
-    if (typeof r.result.tabId !== "number") return r;
-    return { ...r, result: { ...r.result, tabId: encodeTabId(r.inst.slot, r.result.tabId) } };
+    if (!r || !r.inst || !r.result || typeof r.result !== "object" || Array.isArray(r.result)) return r;
+    const out = { ...r.result };
+    if (typeof out.tabId === "number") out.tabId = encodeTabId(r.inst.slot, out.tabId);
+    if (typeof out.windowId === "number") out.windowId = encodeTabId(r.inst.slot, out.windowId);
+    if (r.inst.profile && ("tabId" in out || "windowId" in out)) out.profile = r.inst.profile;
+    return { ...r, result: out };
   };
   const routeCall = async (tool, args) => {
     pruneInstances();
@@ -584,45 +718,42 @@ function runHub() {
     const current = currentInstances(live);
     const probeArgs = { ...args, probe: true };   // `tabs` marks ownership only when asked
     if (tool === "tabs") {
+      // A profile narrows the LISTING, not the fan-out: which copy serves a
+      // tab is decided across every profile's view (see mergeTabListings).
+      const want = typeof args.profile === "string" && args.profile.trim() ? args.profile.trim() : null;
+      const only = (list) => (want ? list.filter((t) => sameProfile(t.profile, want)) : list);
       if (current.length <= 1) {
         const r = await dispatch(current[0] || null, "tabs", probeArgs);
         if (r.error || !Array.isArray(r.result)) return r;
-        return { ...r, result: mergeTabListings([{ slot: r.inst ? r.inst.slot : SLOT_BASE, tabs: r.result }]) };
+        return { ...r, result: only(mergeTabListings([{ slot: r.inst ? r.inst.slot : SLOT_BASE,
+          profile: r.inst ? r.inst.profile : null, tabs: r.result }])) };
       }
       const rs = await fanOut(current, "tabs", probeArgs);
-      const listings = rs.map((r, i) => ({ slot: current[i].slot, tabs: r && Array.isArray(r.result) ? r.result : null }))
+      const listings = rs.map((r, i) => ({ slot: current[i].slot, profile: current[i].profile,
+        tabs: r && Array.isArray(r.result) ? r.result : null }))
         .filter((l) => l.tabs);
       // Every instance failed: say so, as one instance always did, rather than
       // report a Safari with no tabs.
       if (!listings.length) return rs.find((r) => r && r.error) || { error: "no extension instance answered" };
-      return { result: mergeTabListings(listings) };
+      return { result: only(mergeTabListings(listings)) };
     }
-    if (typeof args.tabId === "number") {
-      const { slot, id } = decodeTabId(args.tabId);
-      const inst = live.find((i) => i.slot === slot);
-      // The instance that MINTED the id is the one that owns the tab: the
-      // copies number the same tabs differently, so nobody else can serve it.
-      // Never strip the slot and try the raw id on whoever is there -- that
-      // runs the call in a neighbouring tab of another profile.
-      if (inst && current.includes(inst)) return withSlot(await dispatch(inst, tool, { ...args, tabId: id }));
-      const where = current.length
-        ? "live now: " + current.map(describeInstance).join(", ")
-        : "no extension instance is polling";
-      if (inst) {
-        // It still polls, but an update has superseded it: its ops and its
-        // tab numbering are the old build's.
-        return { error: "tab " + args.tabId + " belongs to extension " + describeInstance(inst) +
-          ", which a newer build has superseded (" + where + "); relaunch Safari to retire the old copy, then run claude_safari_tabs again" };
-      }
-      return { error: "tab " + args.tabId + " was listed by an extension instance that is no longer polling " +
-        "(its Safari profile closed, its background page restarted, or the hub restarted); " + where +
-        "; run claude_safari_tabs again" };
+    if (tool === "upload") {
+      const up = checkUpload(args);
+      if (up.error) return { error: up.error };
+      args = { ...args, files: up.files };
     }
-    if (current.length <= 1) return withSlot(await dispatch(current[0] || null, tool, args));
-    const probes = await fanOut(current, "probeActive", {}, (r) => !!(r && r.result && r.result.owned));
-    const slot = pickActiveSlot(current.map((inst, i) => ({ slot: inst.slot, probe: probes[i] && probes[i].result || null })));
-    const inst = current.find((i) => i.slot === slot) || current[0];
-    return withSlot(await dispatch(inst, tool, args));
+    // The instance that MINTED a tab or window id is the only one that can
+    // serve it; never strip the slot and try the raw id on whoever is there --
+    // that runs the call in a neighbouring tab of another profile.
+    const route = pinRoute(args, live, current);
+    if (route.error) return { error: route.error };
+    if (route.inst) return withSlot(await dispatch(route.inst, tool, route.args));
+    const pool = route.pool;
+    if (pool.length <= 1) return withSlot(await dispatch(pool[0] || null, tool, route.args));
+    const probes = await fanOut(pool, "probeActive", {}, (r) => !!(r && r.result && r.result.owned));
+    const slot = pickActiveSlot(pool.map((inst, i) => ({ slot: inst.slot, probe: probes[i] && probes[i].result || null })));
+    const inst = pool.find((i) => i.slot === slot) || pool[0];
+    return withSlot(await dispatch(inst, tool, route.args));
   };
 
   const readBody = (req) => new Promise((resolve, reject) => {
@@ -874,7 +1005,7 @@ function runHub() {
           // URL is a bundle Safari is still running after it was replaced, and
           // `current` says which rows a call can be routed to.
           instances: live.map((i) => ({ slot: i.slot, seenMsAgo: Date.now() - i.lastPullAt, parked: !!i.parked,
-            version: i.version || null, base: i.base || null, current: current.includes(i) })),
+            version: i.version || null, base: i.base || null, profile: i.profile || null, current: current.includes(i) })),
         });
       }
       json(res, 404, { error: "not found" });
@@ -899,26 +1030,58 @@ function runHub() {
 }
 
 // ── MCP mode ──────────────────────────────────────────────────────────────────
+// The arguments several tools share. A tabId or windowId comes from
+// claude_safari_tabs and pins the call to the profile that listed it; a profile
+// alone targets that profile's active tab; a frame picks one frame of the page.
+const TAB_ARG = { tabId: { type: "number", description: "a tabId from claude_safari_tabs (default: the active tab)" } };
+const PROFILE_ARG = { profile: { type: "string", description: "Safari profile name, e.g. \"Agent\": route the call to that profile's copy of the extension" } };
+const FRAME_ARGS = {
+  frameId: { type: "number", description: "Safari frame id to act in (0 = the top frame, the default)" },
+  frameUrl: { type: "string", description: "act in the first frame whose URL contains this text (read lists the page's frames)" },
+};
 const TOOLS = [
-  { name: "claude_safari_tabs", description: "List every open Safari tab (tabId, url, title, active). Use a tabId to target other tools at a specific tab.",
-    inputSchema: { type: "object", properties: {} } },
-  { name: "claude_safari_read", description: "Read a Safari tab: url, title, rendered text (truncated), current selection, and the first links on the page. Defaults to the active tab.",
+  { name: "claude_safari_tabs", description: "List every open Safari tab: tabId, windowId, windowTitle, profile, active, url, title. " +
+      "Use a tabId (or windowId) to target other tools; ids are opaque and only valid until the bridge restarts.",
+    inputSchema: { type: "object", properties: { ...PROFILE_ARG } } },
+  { name: "claude_safari_read", description: "Read a Safari tab: url, title, rendered text (truncated), current selection, the first links, and the page's frames. " +
+      "Defaults to the active tab's top frame. Reads never change which tab a window shows.",
     inputSchema: { type: "object", properties: {
-      tabId: { type: "number" }, maxChars: { type: "number", description: "truncate rendered text (default 120000)" } } } },
+      ...TAB_ARG, ...PROFILE_ARG, ...FRAME_ARGS,
+      maxChars: { type: "number", description: "truncate rendered text (default 120000)" } } } },
   { name: "claude_safari_click", description: "Click an element in a Safari tab, by CSS selector or by visible text (links, buttons).",
     inputSchema: { type: "object", properties: {
-      selector: { type: "string" }, text: { type: "string" }, tabId: { type: "number" } } } },
-  { name: "claude_safari_fill", description: "Fill an input or textarea (fires input/change events so frameworks notice).",
+      selector: { type: "string" }, text: { type: "string" }, ...TAB_ARG, ...PROFILE_ARG, ...FRAME_ARGS } } },
+  { name: "claude_safari_fill", description: "Fill an input, textarea or contenteditable element. Inputs get the native value setter plus input/change events; " +
+      "contenteditable gets focus and insertText (so editors see a real edit), falling back to textContent plus an input event.",
     inputSchema: { type: "object", properties: {
-      selector: { type: "string" }, value: { type: "string" }, tabId: { type: "number" } }, required: ["selector", "value"] } },
-  { name: "claude_safari_navigate", description: "Navigate the current tab (or open a new one) to a URL.",
+      selector: { type: "string" }, value: { type: "string" }, ...TAB_ARG, ...PROFILE_ARG, ...FRAME_ARGS }, required: ["selector", "value"] } },
+  { name: "claude_safari_navigate", description: "Navigate a tab to a URL, or open a new tab. A new tab opens in the BACKGROUND (active: false) unless asked, " +
+      "so the tab a window is showing never changes under its owner; pass profile (e.g. \"Agent\") or windowId to choose where it opens.",
     inputSchema: { type: "object", properties: {
-      url: { type: "string" }, newTab: { type: "boolean" }, tabId: { type: "number" } }, required: ["url"] } },
-  { name: "claude_safari_eval", description: "Evaluate JavaScript in the tab's content world (full DOM access; result must be JSON-serializable).",
+      url: { type: "string" }, newTab: { type: "boolean" },
+      active: { type: "boolean", description: "make the new tab the one its window shows (default false for newTab)" },
+      windowId: { type: "number", description: "a windowId from claude_safari_tabs to open the new tab in" },
+      ...TAB_ARG, ...PROFILE_ARG }, required: ["url"] } },
+  { name: "claude_safari_eval", description: "Evaluate JavaScript in the tab's content world (full DOM access). A returned promise is awaited, " +
+      "up to timeoutMs; the result must be JSON-serializable.",
     inputSchema: { type: "object", properties: {
-      code: { type: "string" }, tabId: { type: "number" } }, required: ["code"] } },
-  { name: "claude_safari_screenshot", description: "Screenshot the visible viewport of a Safari tab (activates it first).",
-    inputSchema: { type: "object", properties: { tabId: { type: "number" } } } },
+      code: { type: "string" },
+      timeoutMs: { type: "number", description: "how long to wait for a returned promise (default 30000, at most 60000)" },
+      ...TAB_ARG, ...PROFILE_ARG, ...FRAME_ARGS }, required: ["code"] } },
+  { name: "claude_safari_upload", description: "Set files on an <input type=file> from base64 content passed in the call (DataTransfer), then fire input/change. " +
+      "At most " + UPLOAD_MAX_FILES + " files and " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded per call.",
+    inputSchema: { type: "object", properties: {
+      selector: { type: "string", description: "CSS selector of the <input type=file>" },
+      files: { type: "array", items: { type: "object", properties: {
+        name: { type: "string" }, type: { type: "string", description: "MIME type, e.g. image/png" },
+        base64: { type: "string", description: "the file's bytes, base64 (a data: URL prefix is accepted)" } },
+      required: ["name", "base64"] } },
+      ...TAB_ARG, ...PROFILE_ARG, ...FRAME_ARGS }, required: ["selector", "files"] } },
+  { name: "claude_safari_screenshot", description: "Screenshot the visible viewport of a Safari tab. Only a tab its window is already showing can be captured: " +
+      "a background tab is refused (use claude_safari_read or claude_safari_eval instead) unless force: true, which switches to it, captures, and switches back.",
+    inputSchema: { type: "object", properties: {
+      ...TAB_ARG, ...PROFILE_ARG,
+      force: { type: "boolean", description: "switch the window to this tab for the capture (it is switched back after)" } } } },
 ];
 
 // The MCP child talks to its own hub over loopback, and the hub gates EVERY
@@ -1018,5 +1181,6 @@ if (require.main === module) {
 } else {
   // The pure routing pieces, for test/hub-routing.test.js.
   module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
-    cmpVersion, currentInstances, describeInstance, parseCodexOutput };
+    cmpVersion, currentInstances, describeInstance, parseCodexOutput,
+    cleanProfile, sameProfile, pinRoute, checkUpload, UPLOAD_MAX_BYTES, TOOLS };
 }
