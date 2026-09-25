@@ -208,14 +208,42 @@ async function relayToggle(url) {
 }
 
 // Default target: the active tab of the last focused window; a call may pin
-// an explicit tabId instead (from claude_safari_tabs).
+// an explicit tabId instead (from claude_safari_tabs), or a windowId (that
+// window's showing tab), or a profile (see profileTab).
 async function targetTab(args) {
   if (args && args.tabId != null) {
     return browser.tabs.get(args.tabId);
   }
+  if (args && typeof args.windowId === "number") {
+    const [t] = await browser.tabs.query({ active: true, windowId: args.windowId });
+    if (!t) throw new Error("window " + args.windowId + " has no showing tab");
+    return t;
+  }
+  if (args && typeof args.profile === "string" && args.profile.trim()) return profileTab();
   const tabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tabs.length) throw new Error("no active Safari tab");
   return tabs[0];
+}
+
+// A call the hub routed here BY PROFILE, naming no tab or window. The front
+// tab of the last-focused window is not necessarily this profile's: on Safari
+// 27 on 2026-09-15 every copy listed every profile's windows (a day later only
+// its own -- see the bridge's mergeTabListings), so "active in the last-focused
+// window" could be the owner's tab in another profile. The tab has to be one
+// this copy can prove is its own, by its ping answering; with none, the caller
+// is asked for an id rather than handed a guess.
+async function profileTab() {
+  const front = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+  const showing = await browser.tabs.query({ active: true });
+  const seen = new Set();
+  for (const t of [...front, ...showing]) {
+    if (seen.has(t.id)) continue;
+    seen.add(t.id);
+    if (await pingTab(t.id)) return t;
+  }
+  throw new Error("no showing tab here is one this profile's copy of the extension can reach" +
+    (PROFILE ? " (profile " + JSON.stringify(PROFILE) + ")" : "") +
+    "; pass a tabId or windowId from claude_safari_tabs");
 }
 
 // THE WORLD ROUTE. tabs.sendMessage only reaches a content script that
@@ -234,21 +262,21 @@ async function targetTab(args) {
 // FRAMES (0.43). content.js now runs in every frame (manifest all_frames), and
 // each frame has its own window and so its own world. With no `frame` this is
 // the top frame, as it always was: executeScript's default. A `frame` of
-// { frameId } asks Safari for that one frame; { frameUrl } runs the probe in
-// EVERY frame and lets only the first whose location contains the text
-// answer -- Safari gives this page no frame list without the webNavigation
-// permission, which the extension does not ask for, so the match is made
-// inside the frames themselves.
+// { frameId } asks Safari for that one frame; { frameTag } -- what
+// resolveFrameUrl turns a frameUrl into -- runs the code in every frame and
+// lets exactly the one frame carrying that tag act. Safari gives this page no
+// frame list without the webNavigation permission, which the extension does
+// not ask for, so a frame is picked out from inside the frames themselves.
 async function worldCall(tabId, msg, boundMs = WORLD_CALL_MS, frame = null) {
-  const byUrl = frame && typeof frame.frameUrl === "string";
+  const byTag = frame && typeof frame.frameTag === "string";
   const code =
     "(() => { var w = window.__claudeSafari;" +
-    (byUrl ? " if (String(location.href).indexOf(" + JSON.stringify(frame.frameUrl) + ") < 0) return { skip: String(location.href) };" : "") +
+    (byTag ? " if (window.__claudeSafariFrameTag !== " + JSON.stringify(frame.frameTag) + ") return { skip: true };" : "") +
     " if (!w || typeof w.run !== 'function') return { absent: true };" +
     " try { var v = w.run(" + JSON.stringify(msg) + "); return v === undefined ? { absent: true } : { value: v }; }" +
     " catch (e) { return { failed: String((e && e.message) || e) }; } })()";
   const details = { code };
-  if (byUrl) details.allFrames = true;
+  if (byTag) details.allFrames = true;
   else if (frame && typeof frame.frameId === "number") details.frameId = frame.frameId;
   // BOUNDED, like pingTab. executeScript runs on the page's main thread and
   // does not settle while that thread is blocked -- an undismissed alert(), a
@@ -261,20 +289,39 @@ async function worldCall(tabId, msg, boundMs = WORLD_CALL_MS, frame = null) {
     sleep(boundMs).then(() => WORLD_TIMED_OUT),
   ]);
   if (r === WORLD_TIMED_OUT) return undefined;
-  let out;
-  if (byUrl) {
-    const all = (Array.isArray(r) ? r : [r]).filter(Boolean);
-    out = all.find((x) => !x.skip);
-    if (!out) {
-      throw new Error("no frame's URL contains " + JSON.stringify(frame.frameUrl) + " (frames here: " +
-        (all.map((x) => x.skip).join(", ") || "none reachable") + ")");
-    }
-  } else {
-    out = Array.isArray(r) ? r[0] : r;
-  }
+  const out = byTag
+    ? (Array.isArray(r) ? r : [r]).find((x) => x && !x.skip)
+    : (Array.isArray(r) ? r[0] : r);
   if (!out || out.absent) return undefined;
   if (out.failed) throw new Error(out.failed);
   return out.value;
+}
+
+// A frameUrl, resolved to the ONE frame it names, as a tag that frame keeps in
+// its world. Two steps, because a match made while running the op would run it
+// in every frame that matched: a page can embed any frame it likes, and one
+// whose URL merely contains the caller's text (a fragment will do) would
+// receive the fill value or the uploaded files meant for another. So every
+// frame is first asked only for its URL and a tag it mints once, the match
+// must be unique, and only then does worldCall run the op -- in the frame with
+// that tag and no other.
+async function resolveFrameUrl(tabId, frameUrl) {
+  const code =
+    "(() => { var t = window.__claudeSafariFrameTag ||" +
+    " (window.__claudeSafariFrameTag = Math.random().toString(36).slice(2) + Date.now().toString(36));" +
+    " return { href: String(location.href), tag: t }; })()";
+  const r = await Promise.race([
+    browser.tabs.executeScript(tabId, { code, allFrames: true }),
+    sleep(WORLD_CALL_MS).then(() => WORLD_TIMED_OUT),
+  ]);
+  if (r === WORLD_TIMED_OUT) throw new Error("the page did not answer a frame probe within " + WORLD_CALL_MS + "ms");
+  const all = (Array.isArray(r) ? r : [r]).filter((x) => x && typeof x.href === "string");
+  const hits = all.filter((x) => x.href.indexOf(frameUrl) >= 0);
+  if (hits.length === 1) return { frameTag: hits[0].tag };
+  const list = all.map((x) => x.href).join(", ") || "none reachable";
+  throw new Error(hits.length
+    ? hits.length + " frames' URLs contain " + JSON.stringify(frameUrl) + "; give a longer frameUrl that names one (" + list + ")"
+    : "no frame's URL contains " + JSON.stringify(frameUrl) + " (frames here: " + list + ")");
 }
 
 // A call's frame target, or null for the top frame.
@@ -291,11 +338,19 @@ function frameOf(args) {
 // absent (it loaded before this build, or nothing has injected it) is injected
 // once and asked again; the takeover ladder is for the top frame's panel and
 // stays there.
-async function askFrame(tabId, frame, msg) {
+async function askFrame(tabId, target, msg) {
+  const frame = target.frameUrl ? await resolveFrameUrl(tabId, target.frameUrl) : target;
   let v = await worldCall(tabId, msg, WORLD_CALL_MS, frame);
   if (v !== undefined) return v;
+  // undefined is "no script" OR "no answer within the bound", and only the
+  // first may be retried: a busy frame may still run the op it was given, and
+  // a retry would run a click or an upload twice.
+  if (await worldCall(tabId, { op: "ping" }, WORLD_CALL_MS, frame).catch(() => undefined)) {
+    throw new Error("the frame's content script did not answer op " + msg.op + " within " + WORLD_CALL_MS +
+      "ms (a busy page?); not retried, since it may still run");
+  }
   const inject = { file: "content.js" };
-  if (frame.frameUrl) inject.allFrames = true;
+  if (frame.frameTag) inject.allFrames = true;
   else inject.frameId = frame.frameId;
   try {
     await Promise.race([browser.tabs.executeScript(tabId, inject), sleep(INJECT_MS)]);
@@ -723,7 +778,10 @@ const handlers = {
       if (typeof args.windowId === "number") {
         opts.windowId = args.windowId;
       } else {
-        const [front] = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+        // By profile: a window holding a tab this copy can prove is its own.
+        const front = (typeof args.profile === "string" && args.profile.trim())
+          ? await profileTab()
+          : (await browser.tabs.query({ active: true, lastFocusedWindow: true }))[0];
         if (front && typeof front.windowId === "number") opts.windowId = front.windowId;
       }
       const t = await browser.tabs.create(opts);

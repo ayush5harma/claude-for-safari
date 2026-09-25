@@ -231,21 +231,33 @@ the profile that listed it; there is no close-tab tool. Since 0.43:
 
 - **Frames.** `content.js` runs in every frame (`all_frames`,
   `match_about_blank`), and read, click, fill, eval and upload take a frame:
-  `frameUrl` acts in the first frame whose URL contains that text (the probe
-  runs in every frame and only the matching one answers, since Safari gives
-  the extension no frame list without the `webNavigation` permission, which it
-  does not ask for), `frameId` hands Safari a frame id, and neither means the
-  top frame, as before. Subframes serve tool calls only: they register no
-  message listener (a `tabs.sendMessage` without a frame id reaches every
-  frame, and the first answer wins) and never hold the panel.
+  `frameUrl` acts in the ONE frame whose URL contains that text, and is
+  refused when none or several do. Safari gives the extension no frame list
+  without the `webNavigation` permission, which it does not ask for, so every
+  frame is first asked only for its URL and a tag it keeps, and the op then
+  runs in the frame with the matching tag and no other: a page's own embed
+  whose URL happens to contain the same text never receives a fill value or
+  an upload meant for another frame. `frameId` hands Safari a frame id when
+  the caller has one from elsewhere, and neither means the top frame, as
+  before. Subframes serve tool calls only: they register no message listener
+  (a `tabs.sendMessage` without a frame id reaches every frame, and the first
+  answer wins) and never hold the panel.
 - **Profiles.** No WebExtension API tells a copy of the extension which Safari
   profile it runs in, so a profile is **named**: on the extension's Settings
   page, opened from that profile ("This profile's name"), or with
   `curl -s -XPOST 127.0.0.1:29170/call -d '{"tool":"setProfile","args":{"name":"Personal","windowId":N}}'`.
   The name lives in that profile's extension storage, rides every hub request
   (`x-claude-profile`), labels the profile's tabs, shows in `GET /status`, and
-  lets any call say `profile: "Personal"` to be routed to that copy. An
-  unnamed profile works exactly as before; `profile` is never required.
+  lets any call say `profile: "Personal"` to be routed to that copy, which
+  then acts only in a showing tab it can prove is its own (its ping answers)
+  or asks for a `tabId`. A tab is labelled only when its profile is known: the
+  copy that reaches it, or the only copy that lists it; one that two copies
+  list and neither reaches is `null`. An unnamed profile works exactly as
+  before; `profile` is never required.
+- **A copy serving a call stays live.** The extension's poll loop awaits each
+  call before it polls again, and an awaited eval can outlast the hub's 30 s
+  liveness window, so the hub counts a copy with a delivered, unanswered call
+  as live rather than writing it off mid-call.
 - **`windowTitle`** is derived, not read: Safari titles a window
   "&lt;profile&gt; — &lt;showing tab's title&gt;" (read over AppleScript on Safari 27),
   and the WebExtension API has no window title, so the hub composes the same

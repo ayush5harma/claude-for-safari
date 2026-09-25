@@ -160,10 +160,15 @@ const ops = {
     // what keeps a route change from changing the answer.
     if (value && typeof value.then === "function") {
       const jobs = world.jobs || (world.jobs = {});
+      // A job nobody came back for (the caller's wait ran out) is dropped at
+      // the next eval rather than kept for the life of the page. Two minutes
+      // is past the background page's longest wait.
+      const now = Date.now();
+      for (const k of Object.keys(jobs)) if (now - jobs[k].at > 120000) delete jobs[k];
       const id = "j" + GEN + "-" + (world.jobSeq = (world.jobSeq || 0) + 1);
-      jobs[id] = { done: false };
-      value.then((v) => { jobs[id] = { done: true, out: jsonable(v) }; },
-        (e) => { jobs[id] = { done: true, error: String((e && e.message) || e) }; });
+      jobs[id] = { done: false, at: now };
+      value.then((v) => { if (jobs[id]) jobs[id] = { done: true, at: now, out: jsonable(v) }; },
+        (e) => { if (jobs[id]) jobs[id] = { done: true, at: now, error: String((e && e.message) || e) }; });
       return { pending: id };
     }
     return jsonable(value);
@@ -226,9 +231,11 @@ function jsonable(value) {
 // Gmail's compose) keep their own model and ignore a bare DOM write, but they
 // all handle the beforeinput/input pair a real edit produces -- which is what
 // execCommand("insertText") generates, on a selection covering the old text so
-// the value REPLACES it, as fill does for an input. Where the command is
-// refused or leaves different text behind, the DOM is set directly and an
-// input event sent, and `via` says which happened.
+// the value REPLACES it, as fill does for an input. Only where the command is
+// REFUSED is the DOM set directly, with an input event: an editor that took the
+// command may render a tick later (Lexical batches), and overwriting it then
+// would break its model or double the text. `via` says which happened, and
+// `matches` whether the text read back equal straight away.
 function fillEditable(el, value, selector) {
   el.focus();
   let via = "insertText";
@@ -241,10 +248,7 @@ function fillEditable(el, value, selector) {
     sel.addRange(range);
     ok = document.execCommand("insertText", false, value) === true;
   } catch (e) { ok = false; }
-  // Whitespace is compared loosely: an editor splits lines into blocks, which
-  // drops the newlines from textContent without losing the text.
-  const squash = (s) => String(s || "").replace(/\s+/g, "");
-  if (!ok || squash(el.textContent) !== squash(value)) {
+  if (!ok) {
     via = "textContent";
     el.textContent = value;
     const ev = typeof InputEvent === "function"
@@ -252,7 +256,11 @@ function fillEditable(el, value, selector) {
       : new Event("input", { bubbles: true });
     el.dispatchEvent(ev);
   }
-  return { filled: selector, via };
+  // Whitespace and zero-width characters are compared loosely: an editor
+  // splits lines into blocks, which drops the newlines from textContent, and
+  // some pad empty blocks with U+200B.
+  const squash = (s) => String(s || "").replace(/[\s​-‍﻿]+/g, "");
+  return { filled: selector, via, matches: squash(el.textContent) === squash(value) };
 }
 
 // One entry point for every op, messaged or not. Synchronous on purpose: the

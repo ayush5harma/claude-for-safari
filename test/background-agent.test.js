@@ -19,16 +19,30 @@ const plain = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)
 // `tabs` is Safari's view; `pageRun` answers the content-world ops for a tab
 // (it stands in for content.js's world.run), and `frames` lists, per tab, the
 // subframes a world probe with allFrames also runs in.
-function load({ tabs, pageRun = () => ({ ok: true }), frames = {}, store = {} }) {
-  const calls = { create: [], update: [], capture: [], exec: [], hub: [] };
-  const world = (tabId, href) => ({
-    __claudeSafariContent: "ready",
-    __claudeSafari: { v: 7, gen: 1, run: (msg) => (msg.op === "ping" ? { ok: true, v: 7, hidden: false } : pageRun(msg, tabId, href)) },
-  });
+function load({ tabs, pageRun = () => ({ ok: true }), frames = {}, store = {}, owned = [] }) {
+  const calls = { create: [], update: [], capture: [], exec: [], hub: [], ran: [] };
+  // One world per frame, kept across calls as a page keeps it: a tag a probe
+  // leaves in a frame is still there for the next executeScript.
+  const worlds = new Map();
+  const world = (tabId, href) => {
+    const k = tabId + "|" + href;
+    if (!worlds.has(k)) {
+      worlds.set(k, {
+        __claudeSafariContent: "ready",
+        __claudeSafari: { v: 7, gen: 1, run: (msg) => {
+          if (msg.op === "ping") return { ok: true, v: 7, hidden: false };
+          calls.ran.push([href, msg.op]);
+          return pageRun(msg, tabId, href);
+        } },
+      });
+    }
+    return worlds.get(k);
+  };
   const runIn = (code, tabId, href) => {
-    const ctx = vm.createContext({ window: world(tabId, href), location: { href }, document: { readyState: "complete" } });
+    const ctx = vm.createContext({ window: world(tabId, href), location: { href }, document: { readyState: "complete" }, Math, Date, String });
     return plain(vm.runInContext(code, ctx));
   };
+  const ownedSet = new Set(owned);
   let nextId = 500;
   const browser = {
     storage: {
@@ -71,9 +85,11 @@ function load({ tabs, pageRun = () => ({ ok: true }), frames = {}, store = {} })
         calls.capture.push([windowId, showing && showing.id]);
         return "data:image/png;base64,AAAA";
       },
-      // No message route here: every page is reached through the world, which
-      // is the route a frame always takes.
-      async sendMessage() { return undefined; },
+      // The message route answers only a ping, and only in an `owned` tab
+      // (this copy's content script holds its channel): enough for the
+      // ownership checks. Every op goes through the world, which is the route
+      // a frame always takes.
+      async sendMessage(id, msg) { return msg.op === "ping" && ownedSet.has(id) ? { ok: true, v: 7, hidden: false } : undefined; },
       async executeScript(id, opts) {
         calls.exec.push([id, plain({ ...opts, code: undefined })]);
         if (opts.file) return [undefined];
@@ -167,18 +183,51 @@ test("an eval whose promise outlives timeoutMs is reported by name", async () =>
   await assert.rejects(env.run("eval", { code: "new Promise(() => {})", timeoutMs: 250 }), /did not settle within 250ms/);
 });
 
-test("a frameUrl runs the op in the first frame whose URL matches, through every frame", async () => {
+test("a frameUrl runs the op in the one frame it names, and in no other", async () => {
   const env = load({
     tabs: [T(1, 1, true, "https://outer.example/")],
-    frames: { 1: ["https://ads.example/slot", "https://pay.example/checkout"] },
+    // The second frame is a page's own embed whose URL merely CONTAINS the
+    // text another frame is named by: the case a first-match-while-running
+    // design leaked a fill or an upload into.
+    frames: { 1: ["https://pay.example/checkout", "https://ads.example/slot#pay.example/checkout"] },
     pageRun: (msg, tabId, href) => ({ clicked: href }),
   });
-  const r = await env.run("click", { selector: "#go", frameUrl: "pay.example" });
+  const r = await env.run("click", { selector: "#go", frameUrl: "https://pay.example/checkout" });
   assert.deepEqual(r, { clicked: "https://pay.example/checkout" });
-  const probe = env.calls.exec.find(([, o]) => o.allFrames);
-  assert.ok(probe, "the probe ran with allFrames");
+  assert.deepEqual(env.calls.ran, [["https://pay.example/checkout", "click"]], "exactly one frame ran the op");
+  // Ambiguous or absent: refused, and nothing runs anywhere.
+  await assert.rejects(env.run("click", { selector: "#go", frameUrl: "pay.example" }), /2 frames' URLs contain "pay\.example"/);
   await assert.rejects(env.run("click", { selector: "#go", frameUrl: "nowhere" }),
-    /no frame's URL contains "nowhere" \(frames here: https:\/\/outer\.example\/, https:\/\/ads\.example\/slot, https:\/\/pay\.example\/checkout\)/);
+    /no frame's URL contains "nowhere" \(frames here: https:\/\/outer\.example\/, https:\/\/pay\.example\/checkout, /);
+  assert.equal(env.calls.ran.length, 1);
+});
+
+test("a frame whose script is there but slow is not retried, so an action never runs twice", async () => {
+  const env = load({
+    tabs: [T(1, 1, true, "https://outer.example/")],
+    frames: { 1: ["https://inner.example/"] },
+    pageRun: (msg) => (msg.op === "upload" ? undefined : { ok: true }),   // no answer, as a busy frame gives none
+  });
+  await assert.rejects(env.run("upload", { selector: "#f", files: [], frameUrl: "inner.example" }), /not retried/);
+  assert.equal(env.calls.exec.filter(([, o]) => o.file).length, 0, "no re-injection");
+  assert.equal(env.calls.ran.filter(([, op]) => op === "upload").length, 1);
+});
+
+test("a call routed by profile acts in a showing tab this copy can reach, not the owner's front tab", async () => {
+  // Window 1 is the owner's front window, in another profile (this copy's
+  // ping is not answered there); window 2's showing tab is this profile's.
+  const env = load({ tabs: [T(1, 1, true), T(3, 2, true, "https://mine/")], owned: [3], pageRun: (msg, tabId) => ({ tab: tabId }) });
+  assert.deepEqual(await env.run("eval", { code: "1", profile: "Agent" }), { tab: 3 });
+  await env.run("navigate", { url: "https://example.com/", newTab: true, profile: "Agent" });
+  assert.equal(env.calls.create[0].windowId, 2, "the new tab opens in this profile's window");
+  const none = load({ tabs: [T(1, 1, true)], owned: [] });
+  await assert.rejects(none.run("read", { profile: "Agent" }), /pass a tabId or windowId/);
+});
+
+test("a windowId without a tabId means that window's showing tab, not the owner's front tab", async () => {
+  const env = load({ tabs: [T(1, 1, true), T(3, 2, true)] });
+  await env.run("navigate", { url: "https://example.com/", windowId: 2 });
+  assert.deepEqual(env.calls.update, [[3, { url: "https://example.com/" }]]);
 });
 
 test("a frameId is handed to Safari, and frame 0 is the top frame as before", async () => {

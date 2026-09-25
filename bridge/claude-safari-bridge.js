@@ -120,10 +120,14 @@ function mergeTabListings(listings) {
   if (!live.length) return [];
   const key = (t, pos) => [pos, t.url || "", t.title || ""].join("\u0000");
   const profileBySlot = new Map(live.map((l) => [l.slot, l.profile || null]));
-  const pub = (slot, t) => {
+  // A tab is labelled with a profile only when that is KNOWN: its copy reaches
+  // it, or no other copy listed it. A tab two copies list and neither reaches
+  // (not loaded yet, a Safari page) could be either's -- on 2026-09-15 every
+  // copy listed every profile's windows -- so it gets null, not a guess.
+  const pub = (slot, t, sure = true) => {
     const { owned, index, ...rest } = t;
     return { ...rest, tabId: encodeTabId(slot, t.tabId), windowId: encodeTabId(slot, t.windowId),
-      profile: profileBySlot.get(slot) || null };
+      profile: sure ? profileBySlot.get(slot) || null : null };
   };
   const primary = live.slice().sort((a, b) => b.tabs.length - a.tabs.length || a.slot - b.slot)[0];
   // Every tab the other instances see, best claim per key: an owner outranks a
@@ -143,7 +147,7 @@ function mergeTabListings(listings) {
     const o = elsewhere.get(k);
     elsewhere.delete(k);          // this tab is accounted for, whoever serves it
     if (!t.owned && o && o.tab.owned) { out.push(pub(o.slot, o.tab)); return; }
-    out.push(pub(primary.slot, t));
+    out.push(pub(primary.slot, t, !!t.owned || !o));
   });
   // WHAT IS LEFT IS A WINDOW THE PRIMARY'S LISTING DID NOT CONTAIN, owned or
   // not. Measured 2026-09-16 on Safari 27: a context lists only the windows of
@@ -540,9 +544,16 @@ function runHub() {
   // Live: parked right now, or polled within one hold period (an idle
   // instance re-parks every PULL_HOLD_MS; one that stopped -- Safari quit, a
   // background page recycled under a new id -- drops out after one).
+  // A copy that is SERVING a call counts as live too: its poll loop awaits
+  // each call before it polls again, so an awaited eval (0.43, up to 60s)
+  // would otherwise drop it from `tabs` mid-call and turn every id it minted
+  // into "no longer polling" for the other sessions.
+  // Delivered calls only: one still queued for a copy that went away proves
+  // nothing about it.
+  const busy = (inst) => { for (const w of waiters.values()) if (w.inst === inst && w.delivered) return true; return false; };
   const liveInstances = () => {
     const now = Date.now();
-    return [...instances.values()].filter((i) => i.parked || now - i.lastPullAt < LIVE_MS).sort((a, b) => a.slot - b.slot);
+    return [...instances.values()].filter((i) => i.parked || now - i.lastPullAt < LIVE_MS || busy(i)).sort((a, b) => a.slot - b.slot);
   };
   const pruneInstances = () => {
     const now = Date.now();
@@ -642,7 +653,7 @@ function runHub() {
   // Hand one call to one parked /pull, remembering who took it.
   const deliver = (inst, res, call) => {
     const w = waiters.get(call.id);
-    if (w) w.inst = inst;
+    if (w) { w.inst = inst; w.delivered = true; }
     json(res, 200, call);
   };
 
@@ -1036,8 +1047,8 @@ function runHub() {
 const TAB_ARG = { tabId: { type: "number", description: "a tabId from claude_safari_tabs (default: the active tab)" } };
 const PROFILE_ARG = { profile: { type: "string", description: "Safari profile name, e.g. \"Agent\": route the call to that profile's copy of the extension" } };
 const FRAME_ARGS = {
-  frameId: { type: "number", description: "Safari frame id to act in (0 = the top frame, the default)" },
-  frameUrl: { type: "string", description: "act in the first frame whose URL contains this text (read lists the page's frames)" },
+  frameId: { type: "number", description: "a Safari frame id, when you have one from elsewhere (0 = the top frame, the default); the extension cannot list frame ids, so frameUrl is the usual way" },
+  frameUrl: { type: "string", description: "act in the ONE frame whose URL contains this text; refused when none or several match (read lists the page's frames)" },
 };
 const TOOLS = [
   { name: "claude_safari_tabs", description: "List every open Safari tab: tabId, windowId, windowTitle, profile, active, url, title. " +
@@ -1110,6 +1121,11 @@ async function ensureHub() {
 }
 
 async function callTool(name, args) {
+  // Only the listed tools: the hub's own ops (diag, toolbar, setProfile) are
+  // for a curl at /call, and the MCP side used to reach them by name too.
+  if (!TOOLS.some((t) => t.name === name)) {
+    return { content: [{ type: "text", text: "Error: unknown tool " + name }], isError: true };
+  }
   const tool = name.replace(/^claude_safari_/, "");
   const r = await fetch(`${HUB}/call`, {
     method: "POST",
@@ -1182,5 +1198,5 @@ if (require.main === module) {
   // The pure routing pieces, for test/hub-routing.test.js.
   module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
     cmpVersion, currentInstances, describeInstance, parseCodexOutput,
-    cleanProfile, sameProfile, pinRoute, checkUpload, UPLOAD_MAX_BYTES, TOOLS };
+    cleanProfile, sameProfile, pinRoute, checkUpload, UPLOAD_MAX_BYTES, TOOLS, callTool };
 }

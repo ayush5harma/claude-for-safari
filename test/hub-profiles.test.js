@@ -8,7 +8,7 @@ const assert = require("node:assert/strict");
 const path = require("node:path");
 
 const {
-  TAB_SLOT, mergeTabListings, cleanProfile, sameProfile, pinRoute, checkUpload, UPLOAD_MAX_BYTES, TOOLS,
+  TAB_SLOT, mergeTabListings, cleanProfile, sameProfile, pinRoute, checkUpload, UPLOAD_MAX_BYTES, TOOLS, callTool,
 } = require(path.join(__dirname, "..", "bridge", "claude-safari-bridge.js"));
 
 const tab = (id, index, url, owned, extra = {}) => ({
@@ -28,6 +28,21 @@ test("each tab carries its profile, and a windowTitle built the way Safari title
     ["Personal — T https://a/", "Personal — T https://a/",
       "Agent — T https://en.wikipedia.org/", "Agent — T https://en.wikipedia.org/"]);
   assert.deepEqual(merged.map((t) => t.windowId), [TAB_SLOT + 312, TAB_SLOT + 312, 2 * TAB_SLOT + 90, 2 * TAB_SLOT + 90]);
+});
+
+test("a tab two copies list and neither reaches gets no profile, rather than a guess", () => {
+  // The 2026-09-15 shape: both copies list the same window. Only the owned
+  // tab's profile is known; the unloaded one could be either's.
+  const a = [tab(1, 0, "https://owned-by-a/", true, { active: true }), tab(2, 1, "https://nobody/", false)];
+  const b = [tab(11, 0, "https://owned-by-a/", false, { windowId: 313, active: true }), tab(12, 1, "https://nobody/", false, { windowId: 313 })];
+  const merged = mergeTabListings([{ slot: 1, profile: "Personal", tabs: a }, { slot: 2, profile: "Work", tabs: b }]);
+  assert.deepEqual(merged.map((t) => [t.url, t.profile]), [["https://owned-by-a/", "Personal"], ["https://nobody/", null]]);
+});
+
+test("the MCP side refuses a name that is not one of its tools, such as the hub's setProfile", async () => {
+  const r = await callTool("claude_safari_setProfile", { name: "x" });
+  assert.equal(r.isError, true);
+  assert.match(r.content[0].text, /unknown tool claude_safari_setProfile/);
 });
 
 test("profile names are cleaned from the header and matched as a person types them", () => {

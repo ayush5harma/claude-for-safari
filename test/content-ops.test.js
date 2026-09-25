@@ -72,7 +72,7 @@ test("a contenteditable is filled through insertText, replacing what was there",
   const ed = new El("DIV", { isContentEditable: true, textContent: "old draft" });
   const env = load({ elements: { "#ed": ed } });
   const r = plain(env.run({ op: "fill", selector: "#ed", value: "Hello world" }));
-  assert.deepEqual(r, { filled: "#ed", via: "insertText" });
+  assert.deepEqual(r, { filled: "#ed", via: "insertText", matches: true });
   assert.equal(ed.textContent, "Hello world");
   assert.equal(ed.focused, true);
   assert.deepEqual(ed.events, ["beforeinput:insertText", "input:insertText"], "the editor saw a real edit, and only one");
@@ -81,9 +81,21 @@ test("a contenteditable is filled through insertText, replacing what was there",
 test("where insertText is refused, the text is set directly and an input event sent", () => {
   const ed = new El("DIV", { isContentEditable: true, textContent: "old" });
   const env = load({ elements: { "#ed": ed }, execInsert: "refused" });
-  assert.deepEqual(plain(env.run({ op: "fill", selector: "#ed", value: "new text" })), { filled: "#ed", via: "textContent" });
+  assert.deepEqual(plain(env.run({ op: "fill", selector: "#ed", value: "new text" })), { filled: "#ed", via: "textContent", matches: true });
   assert.equal(ed.textContent, "new text");
   assert.deepEqual(ed.events, ["input:insertText"]);
+});
+
+test("an editor that took insertText but renders later is NOT overwritten", () => {
+  // Lexical-style: the command is accepted and the DOM catches up a tick
+  // later. Writing textContent over it would break the editor's model.
+  const ed = new El("DIV", { isContentEditable: true, textContent: "old" });
+  const env = load({ elements: { "#ed": ed }, execInsert: "works" });
+  env.ctx.document.execCommand = () => true;             // accepted, nothing rendered yet
+  const r = plain(env.run({ op: "fill", selector: "#ed", value: "new" }));
+  assert.deepEqual(r, { filled: "#ed", via: "insertText", matches: false });
+  assert.equal(ed.textContent, "old", "left for the editor to render");
+  assert.deepEqual(ed.events, []);
 });
 
 test("a plain input keeps the native-setter path and its input/change pair", () => {
