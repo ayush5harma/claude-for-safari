@@ -215,10 +215,44 @@ have open:
 claude mcp add claude-safari -- node "$PWD/bridge/claude-safari-bridge.js"
 ```
 
-Tools: `claude_safari_tabs`, `claude_safari_read`, `claude_safari_click`,
-`claude_safari_fill`, `claude_safari_navigate` (`newTab: true` opens a tab in
-the current window), `claude_safari_eval`, `claude_safari_screenshot`. A
-`tabId` from `tabs` pins a call to one tab; there is no close-tab tool.
+| Tool | What it does | Arguments |
+|---|---|---|
+| `claude_safari_tabs` | Every open tab: `tabId`, `windowId`, `windowTitle`, `profile`, `active`, `url`, `title`, `favIconUrl`. | `profile` (list only that profile's tabs) |
+| `claude_safari_read` | Rendered text (truncated), selection, the first links, and the page's `frames` (`src`, `name`). Never changes which tab a window shows. | `tabId`, `maxChars`, `profile`, `frameId`, `frameUrl` |
+| `claude_safari_click` | Clicks by CSS selector or by visible text. | `selector` or `text`, `tabId`, `profile`, `frameId`, `frameUrl` |
+| `claude_safari_fill` | An input or textarea through the native value setter plus `input`/`change`; a contenteditable through focus and `insertText` (a real edit, which rich editors see), falling back to `textContent` plus an `input` event. The answer's `via` says which. | `selector`, `value`, `tabId`, `profile`, `frameId`, `frameUrl` |
+| `claude_safari_navigate` | Sends a tab to a URL, or opens a new one. **A new tab opens in the background** (`active: false`) of the owner's current window unless asked otherwise, so the tab a window is showing never changes. | `url`, `newTab`, `active`, `windowId`, `tabId`, `profile` |
+| `claude_safari_eval` | JavaScript in the page's content world. **A returned promise is awaited**, up to `timeoutMs` (default 30 s, at most 60 s); the result must be JSON-serialisable. | `code`, `timeoutMs`, `tabId`, `profile`, `frameId`, `frameUrl` |
+| `claude_safari_upload` | Files onto an `<input type=file>` from base64 in the call (a `DataTransfer`), then `input`/`change`. At most 10 files and 8 MB decoded per call; a single-file input takes one. | `selector`, `files: [{name, type, base64}]`, `tabId`, `profile`, `frameId`, `frameUrl` |
+| `claude_safari_screenshot` | The visible viewport of a tab its window is **already showing**. A background tab is refused, naming `read` and `eval` as the alternatives, unless `force: true`, which switches to it, captures, and switches back. | `tabId`, `profile`, `force` |
+
+A `tabId` or `windowId` from `tabs` pins a call to one tab or window, and to
+the profile that listed it; there is no close-tab tool. Since 0.43:
+
+- **Frames.** `content.js` runs in every frame (`all_frames`,
+  `match_about_blank`), and read, click, fill, eval and upload take a frame:
+  `frameUrl` acts in the first frame whose URL contains that text (the probe
+  runs in every frame and only the matching one answers, since Safari gives
+  the extension no frame list without the `webNavigation` permission, which it
+  does not ask for), `frameId` hands Safari a frame id, and neither means the
+  top frame, as before. Subframes serve tool calls only: they register no
+  message listener (a `tabs.sendMessage` without a frame id reaches every
+  frame, and the first answer wins) and never hold the panel.
+- **Profiles.** No WebExtension API tells a copy of the extension which Safari
+  profile it runs in, so a profile is **named**: on the extension's Settings
+  page, opened from that profile ("This profile's name"), or with
+  `curl -s -XPOST 127.0.0.1:29170/call -d '{"tool":"setProfile","args":{"name":"Personal","windowId":N}}'`.
+  The name lives in that profile's extension storage, rides every hub request
+  (`x-claude-profile`), labels the profile's tabs, shows in `GET /status`, and
+  lets any call say `profile: "Personal"` to be routed to that copy. An
+  unnamed profile works exactly as before; `profile` is never required.
+- **`windowTitle`** is derived, not read: Safari titles a window
+  "&lt;profile&gt; — &lt;showing tab's title&gt;" (read over AppleScript on Safari 27),
+  and the WebExtension API has no window title, so the hub composes the same
+  string from the listing.
+- **Screenshots.** `captureVisibleTab` captures what a window shows, so until
+  0.43 the tool switched the window to the tab first — moving the owner's view
+  under them. It no longer switches anything unless forced.
 
 Two more ops are reachable at the hub but are not MCP tools: `diag` and
 `toolbar`. `curl -s -XPOST 127.0.0.1:29170/call -d '{"tool":"toolbar","args":{"tabId":N}}'`
@@ -680,7 +714,7 @@ So the panel's grant is a setting, `BRIDGE_PANEL_TOOLS`:
 | value | a panel turn may use |
 |---|---|
 | `read` (default) | `claude_safari_tabs`, `claude_safari_read`, `claude_safari_screenshot` |
-| `all` | every `claude_safari_*` tool, including `navigate`, `eval`, `click`, `fill` |
+| `all` | every `claude_safari_*` tool, including `navigate`, `eval`, `click`, `fill`, `upload` |
 
 Opt in per hub, knowing what it means:
 
