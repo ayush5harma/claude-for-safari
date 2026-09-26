@@ -103,6 +103,27 @@ test("the upload schema takes a path or base64 per file, neither required", () =
   assert.match(up.description, /48 MB/);
 });
 
+test("the panel's MCP child refuses a path: a page-driven turn must not read this Mac's files", async () => {
+  // The chat panel's headless turn talks to this same server, started with
+  // --panel from chat-mcp.json; its prompt carries page text nobody vetted.
+  const p = file("secret.txt", "do not upload");
+  const child = spawn(process.execPath, [BRIDGE, "--panel"], { env: { ...process.env, HOME: dir }, stdio: ["pipe", "pipe", "inherit"] });
+  let out = "";
+  child.stdout.setEncoding("utf8");
+  const reply = new Promise((resolve) => child.stdout.on("data", (c) => { out += c; if (out.includes("\n")) resolve(JSON.parse(out.split("\n")[0])); }));
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "claude_safari_upload", arguments: { selector: "#f", files: [{ path: p }] } } }) + "\n");
+  const msg = await reply;
+  child.kill();
+  assert.equal(msg.result.isError, true);
+  assert.match(msg.result.content[0].text, /panel/);
+});
+
+test("the hub writes the panel's MCP config with --panel", async () => {
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, ".cache", "claude-safari", "chat-mcp.json"), "utf8"));
+  assert.deepEqual(cfg.mcpServers["claude-safari"].args.slice(1), ["--panel"]);
+});
+
 // ── Through a real hub ───────────────────────────────────────────────────────
 const seen = [];
 let hub, home, ctl, loop;

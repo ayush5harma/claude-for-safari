@@ -460,13 +460,15 @@ const ATTACH_DIR = `${process.env.HOME}/.cache/claude-safari/attachments`;
 // claude that booted ALL user-scope MCP servers — including any mcp-remote
 // OAuth proxies, whose concurrent spawns race the shared token cache and pop
 // an auth page per message. Isolation also makes panel replies start seconds
-// faster. Written at hub start; points at THIS file.
+// faster. Written at hub start; points at THIS file, with --panel, which keeps
+// that child from reading local files for claude_safari_upload (see
+// PANEL_CHILD).
 const CHAT_MCP_CFG = `${process.env.HOME}/.cache/claude-safari/chat-mcp.json`;
 function writeChatMcpConfig() {
   try {
     fs.mkdirSync(`${process.env.HOME}/.cache/claude-safari`, { recursive: true });
     fs.writeFileSync(CHAT_MCP_CFG, JSON.stringify({
-      mcpServers: { "claude-safari": { command: process.execPath, args: [__filename] } },
+      mcpServers: { "claude-safari": { command: process.execPath, args: [__filename, "--panel"] } },
     }, null, 2));
   } catch {}
 }
@@ -1188,6 +1190,13 @@ const TOOLS = [
 // Claude's every tool call with 401, so "click this / read that tab" failed
 // on the phone while the chat itself worked (found 2026-09-02). The child
 // inherits the hub's environment, so the token is right here.
+// THE PANEL'S CHILD NEVER READS A LOCAL FILE. A chat panel turn talks to this
+// server too (writeChatMcpConfig starts it with --panel), and its prompt
+// carries page text nobody vetted; with BRIDGE_PANEL_TOOLS=all, an upload by
+// `path` would let a page ask for ~/.ssh/id_ed25519 to be put into its own
+// form. That turn is otherwise granted no Read beyond its attachments.
+const PANEL_CHILD = process.argv.includes("--panel");
+
 const hubHeaders = (extra = {}) =>
   TOKEN ? { ...extra, authorization: "Bearer " + TOKEN } : extra;
 
@@ -1215,6 +1224,9 @@ async function callTool(name, args) {
   }
   const tool = name.replace(/^claude_safari_/, "");
   if (tool === "upload") {
+    if (PANEL_CHILD && Array.isArray(args.files) && args.files.some((f) => f && f.path != null)) {
+      return { content: [{ type: "text", text: "Error: upload: `path` is not available to a chat panel turn; pass the file as base64" }], isError: true };
+    }
     const up = resolveUploadPaths(args);
     if (up.error) return { content: [{ type: "text", text: "Error: " + up.error }], isError: true };
     args = up.args;
