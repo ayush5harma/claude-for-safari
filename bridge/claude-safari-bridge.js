@@ -35,6 +35,7 @@
 const http = require("node:http");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const path = require("node:path");
 const { spawn, execFile } = require("node:child_process");
 
 // BRIDGE_PORT wins; bare PORT is what a PaaS (Heroku) injects for its router.
@@ -248,10 +249,68 @@ function pinRoute(args, live, current) {
 // this hub, a parked /pull, the background page and -- on the world route --
 // the source text of a tabs.executeScript. Every hop copies the payload, so it
 // is capped here, before any of them, rather than found out as a stalled page.
-// 8 MB decoded covers a screenshot, a PDF or a CSV, which is what a form asks
-// for; anything larger belongs in a real file picker.
-const UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
+//
+// A file gets into the call one of two ways. Inline base64 goes through the
+// model's context, which is only sensible for a file of a few KB. A `path` is
+// read by the MCP stdio side (resolveUploadPaths), on the caller's own Mac,
+// and the hub only ever sees the base64 it became: a hosted hub has no such
+// file, and must not be handed a local path to go looking for. The path form
+// exists for a real app build: the 20 MB APK this was written for
+// (WikipediaSample.apk, 20,373,104 bytes, 2026-09-26) is far past anything a
+// context can carry as base64.
+//
+// The cap is what one POST /call can carry: 48 MB decoded is 64 MB of base64
+// (67.1e6 characters) inside MAX_BODY's 90e6, leaving room for the JSON around
+// it. It is one total for both forms. Measured as far as the hub and a fake
+// extension (test/upload-paths.test.js, 20 MB intact); whether Safari's
+// background-to-content hop carries that much has not been measured.
+const UPLOAD_MAX_BYTES = 48 * 1024 * 1024;
 const UPLOAD_MAX_FILES = 10;
+const uploadTooBig = () => "upload: the files come to more than " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded";
+// The type a path upload gets when the caller names none. An upload form may
+// check it (a store console accepting only an APK does), and "" is what a file
+// picker gives a file the system cannot type either.
+const UPLOAD_TYPES = {
+  ".apk": "application/vnd.android.package-archive", ".aab": "application/octet-stream",
+  ".ipa": "application/octet-stream", ".pdf": "application/pdf", ".png": "image/png",
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".csv": "text/csv", ".zip": "application/zip",
+  ".json": "application/json", ".txt": "text/plain",
+};
+// Every { path } file of an upload call replaced by { name, type, base64 }
+// read from disk; inline files are left as they are. Returns { args } or
+// { error }. Sizes are summed from stat before anything is read, so an
+// oversized file is refused without loading it; the hub re-checks the total.
+function resolveUploadPaths(args) {
+  const a = args || {};
+  if (!Array.isArray(a.files) || !a.files.some((f) => f && f.path != null)) return { args: a };
+  let total = 0;
+  const files = [];
+  for (const f of a.files) {
+    if (!f || f.path == null) { files.push(f); continue; }
+    const p = f.path;
+    if (f.base64 != null) return { error: "upload: give a file as `base64` or as `path`, not both (" + JSON.stringify(p) + ")" };
+    if (typeof p !== "string" || !path.isAbsolute(p)) {
+      return { error: "upload: `path` must be an absolute path on this Mac (~ is not expanded), got " + JSON.stringify(p) };
+    }
+    let st;
+    try { st = fs.statSync(p); } catch (e) {
+      return { error: "upload: cannot read " + JSON.stringify(p) + ": " + (e.code === "ENOENT" ? "no such file" : e.message) };
+    }
+    if (!st.isFile()) return { error: "upload: " + JSON.stringify(p) + " is not a regular file" };
+    total += st.size;
+    if (total > UPLOAD_MAX_BYTES) return { error: uploadTooBig() };
+    let bytes;
+    try { bytes = fs.readFileSync(p); } catch (e) {
+      return { error: "upload: cannot read " + JSON.stringify(p) + ": " + e.message };
+    }
+    files.push({
+      name: typeof f.name === "string" && f.name ? f.name : path.basename(p),
+      type: typeof f.type === "string" ? f.type : UPLOAD_TYPES[path.extname(p).toLowerCase()] || "",
+      base64: bytes.toString("base64"),
+    });
+  }
+  return { args: { ...a, files } };
+}
 // The files an upload call may carry, normalised to bare base64, or { error }.
 function checkUpload(args) {
   const a = args || {};
@@ -262,6 +321,10 @@ function checkUpload(args) {
   let total = 0;
   const out = [];
   for (const f of files) {
+    if (f && f.path != null && typeof f.base64 !== "string") {
+      return { error: "upload: `path` is read by the MCP server on the caller's Mac, and this call reached the hub " +
+        "without it; a direct /call carries the file as base64" };
+    }
     if (!f || typeof f.name !== "string" || !f.name || typeof f.base64 !== "string") {
       return { error: "upload: every file needs a `name` and its content as `base64`" };
     }
@@ -270,9 +333,7 @@ function checkUpload(args) {
       return { error: "upload: " + JSON.stringify(f.name) + " is not valid base64" };
     }
     total += b64.length / 4 * 3 - (b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0);
-    if (total > UPLOAD_MAX_BYTES) {
-      return { error: "upload: the files come to more than " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded; this tool carries them inline" };
-    }
+    if (total > UPLOAD_MAX_BYTES) return { error: uploadTooBig() };
     out.push({ name: f.name.slice(0, 200), type: typeof f.type === "string" ? f.type.slice(0, 100) : "", base64: b64 });
   }
   return { files: out, bytes: total };
@@ -1079,14 +1140,16 @@ const TOOLS = [
       code: { type: "string" },
       timeoutMs: { type: "number", description: "how long to wait for a returned promise (default 30000, at most 60000)" },
       ...TAB_ARG, ...PROFILE_ARG, ...FRAME_ARGS }, required: ["code"] } },
-  { name: "claude_safari_upload", description: "Set files on an <input type=file> from base64 content passed in the call (DataTransfer), then fire input/change. " +
-      "At most " + UPLOAD_MAX_FILES + " files and " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded per call.",
+  { name: "claude_safari_upload", description: "Set files on an <input type=file> (DataTransfer), then fire input/change. " +
+      "Each file is either { path }, an absolute path to a file on this Mac that the bridge reads and sends (use it for anything but a tiny file, " +
+      "e.g. an APK or IPA), or { name, base64 } inline. At most " + UPLOAD_MAX_FILES + " files and " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded per call.",
     inputSchema: { type: "object", properties: {
       selector: { type: "string", description: "CSS selector of the <input type=file>" },
-      files: { type: "array", items: { type: "object", properties: {
-        name: { type: "string" }, type: { type: "string", description: "MIME type, e.g. image/png" },
-        base64: { type: "string", description: "the file's bytes, base64 (a data: URL prefix is accepted)" } },
-      required: ["name", "base64"] } },
+      files: { type: "array", description: "each item carries `path` or `base64`, not both", items: { type: "object", properties: {
+        path: { type: "string", description: "absolute path to a regular file on this Mac; read here, never sent as a path" },
+        name: { type: "string", description: "the file name the page sees (required with base64; default for a path: its basename)" },
+        type: { type: "string", description: "MIME type, e.g. image/png (default for a path: from its extension, else empty)" },
+        base64: { type: "string", description: "the file's bytes, base64 (a data: URL prefix is accepted); realistic only for small files" } } } },
       ...TAB_ARG, ...PROFILE_ARG, ...FRAME_ARGS }, required: ["selector", "files"] } },
   { name: "claude_safari_screenshot", description: "Screenshot the visible viewport of a Safari tab. Only a tab its window is already showing can be captured: " +
       "a background tab is refused (use claude_safari_read or claude_safari_eval instead) unless force: true, which switches to it, captures, and switches back.",
@@ -1127,6 +1190,11 @@ async function callTool(name, args) {
     return { content: [{ type: "text", text: "Error: unknown tool " + name }], isError: true };
   }
   const tool = name.replace(/^claude_safari_/, "");
+  if (tool === "upload") {
+    const up = resolveUploadPaths(args);
+    if (up.error) return { content: [{ type: "text", text: "Error: " + up.error }], isError: true };
+    args = up.args;
+  }
   const r = await fetch(`${HUB}/call`, {
     method: "POST",
     headers: hubHeaders({ "content-type": "application/json" }),
@@ -1198,5 +1266,5 @@ if (require.main === module) {
   // The pure routing pieces, for test/hub-routing.test.js.
   module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
     cmpVersion, currentInstances, describeInstance, parseCodexOutput,
-    cleanProfile, sameProfile, pinRoute, checkUpload, UPLOAD_MAX_BYTES, TOOLS, callTool };
+    cleanProfile, sameProfile, pinRoute, checkUpload, resolveUploadPaths, UPLOAD_MAX_BYTES, TOOLS, callTool };
 }
