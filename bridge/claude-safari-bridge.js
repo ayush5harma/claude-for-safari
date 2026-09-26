@@ -339,6 +339,23 @@ function checkUpload(args) {
   return { files: out, bytes: total };
 }
 
+// ── A navigate of an existing tab disarms beforeunload first ──────────────────
+// Measured 2026-09-26 on Safari 27: navigating an agent's BACKGROUND tab away
+// from a page with a beforeunload handler (a BrowserStack device session)
+// brought Safari to the front on that tab, because Safari presents the
+// "Leave page?" sheet by activating the tab it belongs to -- the owner's
+// screen changed under them. Measured the same day: this capture listener,
+// installed by claude_safari_eval before the navigate, let the navigate finish
+// with Safari staying in the background and the owner's tab unchanged, on a
+// test page that set both window.onbeforeunload and an addEventListener
+// handler after a click. So the hub sends it to the same copy and tab ahead of
+// every navigate of an existing tab; a new tab has no page to leave. The
+// extension serves one call at a time, so the navigate never overtakes it,
+// and the short wait only bounds how long a slow or vanished copy holds the
+// hub up before it queues the navigate behind it.
+const NAV_GUARD_CODE = "window.addEventListener('beforeunload', e => e.stopImmediatePropagation(), true)";
+const NAV_GUARD_TIMEOUT_MS = 5000;
+
 // Which instance takes a call that names no tab: the one that owns the active
 // tab; failing that, one that at least sees an active tab (a profile with no
 // window sees none and would answer "no active Safari tab"); then the lowest
@@ -819,7 +836,14 @@ function runHub() {
     // that runs the call in a neighbouring tab of another profile.
     const route = pinRoute(args, live, current);
     if (route.error) return { error: route.error };
-    if (route.inst) return withSlot(await dispatch(route.inst, tool, route.args));
+    if (route.inst) {
+      if (tool === "navigate" && typeof route.args.tabId === "number" && route.args.newTab !== true) {
+        // Its failure is ignored: a page content scripts cannot run in has no
+        // handler of the page's to disarm either.
+        await dispatch(route.inst, "eval", { tabId: route.args.tabId, code: NAV_GUARD_CODE }, NAV_GUARD_TIMEOUT_MS);
+      }
+      return withSlot(await dispatch(route.inst, tool, route.args));
+    }
     const pool = route.pool;
     if (pool.length <= 1) return withSlot(await dispatch(pool[0] || null, tool, route.args));
     const probes = await fanOut(pool, "probeActive", {}, (r) => !!(r && r.result && r.result.owned));

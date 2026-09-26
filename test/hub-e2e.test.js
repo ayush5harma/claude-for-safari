@@ -49,7 +49,7 @@ const served = { A: [], B: [], C: [], NEW: [], OLD: [], TWIN: [], AGENT: [] };  
 
 function model(name, tool, args) {
   const m = MODELS[name];
-  served[name].push({ tool, tabId: args.tabId });
+  served[name].push({ tool, tabId: args.tabId, code: args.code, newTab: args.newTab });
   const active = m.tabs.find((t) => t.active) || null;
   const reach = (id) => { const t = m.tabs.find((x) => x.tabId === id); if (!t) throw new Error("Invalid call to tabs.get(). Tab not found."); return t; };
   if (m.fail) throw new Error("simulated: cannot run in this tab");
@@ -62,6 +62,11 @@ function model(name, tool, args) {
       if (!t) throw new Error("no active Safari tab");
       if (!t.owned) throw new Error("content script did not answer after injection (Safari-internal or blocked page?)");
       return { tabId: t.tabId, value: "ran in " + t.url + " via " + name };
+    }
+    case "navigate": {
+      if (args.newTab) return { tabId: 99999, windowId: args.windowId, url: args.url, opened: "new tab", active: false };
+      const t = args.tabId != null ? reach(args.tabId) : active;
+      return { tabId: t.tabId, url: args.url };
     }
     default: throw new Error("unknown tool: " + tool);
   }
@@ -237,6 +242,48 @@ test("a relayed toolbar click is handled by the instance that owns the active ta
   const r2 = await fetch(HUB + "/relay", { method: "POST", headers: { "content-type": "application/json", "x-claude-instance": "inst-A" },
     body: JSON.stringify({ tool: "toggleActive", args: {} }) });
   assert.deepEqual(await r2.json(), { handled: false });
+});
+
+// ── The beforeunload guard on a navigate of an existing tab ─────────────────
+// Measured 2026-09-26: navigating a background tab away from a page with a
+// beforeunload handler brought Safari forward onto that tab to show the
+// "Leave page?" sheet; a capture listener that stops the event, installed by
+// an eval first, let the same navigate finish with Safari in the background.
+
+test("navigating an existing tab first disarms beforeunload in it, through the same copy", async () => {
+  const { body } = await call("tabs");
+  const mobile = body.result[2];
+  const before = served.B.length;
+  const r = await call("navigate", { tabId: mobile.tabId, url: "https://example.com/next" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.result.tabId, mobile.tabId);
+  const calls = served.B.slice(before);
+  assert.deepEqual(calls.map((c) => [c.tool, c.tabId]), [["eval", 29994], ["navigate", 29994]],
+    "one eval, then the navigate, both in B's own tab");
+  assert.match(calls[0].code, /addEventListener\('beforeunload'.*stopImmediatePropagation\(\), true\)/);
+});
+
+test("a guard that fails (a page the content script cannot run in) does not stop the navigate", async () => {
+  // The calendar tab is owned by nobody: the fake's eval throws there, as
+  // Safari's does on a privileged or blank page.
+  const { body } = await call("tabs");
+  const calendar = body.result[0];
+  const r = await call("navigate", { tabId: calendar.tabId, url: "https://example.com/from-calendar" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.result.url, "https://example.com/from-calendar");
+});
+
+test("a new tab has nothing to leave, so it is opened with no guard eval", async () => {
+  const { body } = await call("tabs");
+  const mobile = body.result[2];
+  const before = served.B.length;
+  const r = await call("navigate", { newTab: true, windowId: mobile.windowId, url: "https://example.com/new" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual(served.B.slice(before).map((c) => c.tool), ["navigate"]);
+  // newTab wins even when a tabId rides along.
+  const before2 = served.B.length;
+  await call("navigate", { newTab: true, tabId: mobile.tabId, url: "https://example.com/new2" });
+  assert.deepEqual(served.B.slice(before2).map((c) => c.tool), ["navigate"]);
 });
 
 // ── Two contexts of one profile, and a build that superseded one ─────────────
