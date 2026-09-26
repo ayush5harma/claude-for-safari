@@ -35,6 +35,8 @@
 const http = require("node:http");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { spawn, execFile } = require("node:child_process");
 
 // BRIDGE_PORT wins; bare PORT is what a PaaS (Heroku) injects for its router.
@@ -248,10 +250,125 @@ function pinRoute(args, live, current) {
 // this hub, a parked /pull, the background page and -- on the world route --
 // the source text of a tabs.executeScript. Every hop copies the payload, so it
 // is capped here, before any of them, rather than found out as a stalled page.
-// 8 MB decoded covers a screenshot, a PDF or a CSV, which is what a form asks
-// for; anything larger belongs in a real file picker.
-const UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
+//
+// A file gets into the call one of two ways. Inline base64 goes through the
+// model's context, which is only sensible for a file of a few KB. A `path` is
+// read by the MCP stdio side (resolveUploadPaths), on the caller's own Mac,
+// and the hub only ever sees the base64 it became: a hosted hub has no such
+// file, and must not be handed a local path to go looking for. The path form
+// exists for a real app build: the 20 MB APK this was written for
+// (WikipediaSample.apk, 20,373,104 bytes, 2026-09-26) is far past anything a
+// context can carry as base64.
+//
+// The cap is 24 MB decoded, one total for both forms. Real Safari was
+// measured carrying that 20 MB APK to a page (2026-09-26), and nothing larger
+// has been tried; MAX_BODY alone would admit about 48 MB (64 MB of base64
+// inside 90e6), but every hop after the hub holds a copy, so the cap stays
+// just above what was proven.
+const UPLOAD_MAX_BYTES = 24 * 1024 * 1024;
 const UPLOAD_MAX_FILES = 10;
+const uploadTooBig = () => "upload: the files come to more than " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded";
+// The type a path upload gets when the caller names none. An upload form may
+// check it (a store console accepting only an APK does), and "" is what a file
+// picker gives a file the system cannot type either.
+const UPLOAD_TYPES = {
+  ".apk": "application/vnd.android.package-archive", ".aab": "application/octet-stream",
+  ".ipa": "application/octet-stream", ".pdf": "application/pdf", ".png": "image/png",
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".csv": "text/csv", ".zip": "application/zip",
+  ".json": "application/json", ".txt": "text/plain",
+};
+
+// WHICH FILES A PATH UPLOAD MAY READ. This server reads the file itself, so
+// Claude Code's own Read permissions (a deny on ~/.ssh, say) never see it,
+// and a session in bypass mode or a headless caller is not asked either. So
+// the bridge keeps its own bounds: the file's REAL path (symlinks resolved,
+// so a link inside a root cannot point out of it) must sit under an upload
+// root, and credential locations are refused even inside one. The roots are
+// CLAUDE_SAFARI_UPLOAD_ROOTS (colon-separated absolute directories) or, by
+// default, the places a build or a download lands. A deny entry is checked by
+// its literal and its real path, because ~/.ssh can be a link (this fleet
+// keeps SSH material in iCloud). APFS is case-insensitive by default, so on
+// macOS the comparison is too.
+const UPLOAD_DENY = [".ssh", ".gnupg", ".aws", ".mcp-auth", ".netrc"];
+const foldCase = (p) => (process.platform === "darwin" ? p.toLowerCase() : p);
+const within = (p, dir) => {
+  const a = foldCase(p), d = foldCase(dir);
+  return a === d || a.startsWith(d.endsWith(path.sep) ? d : d + path.sep);
+};
+const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
+function uploadRoots() {
+  const home = os.homedir();
+  const env = process.env.CLAUDE_SAFARI_UPLOAD_ROOTS;
+  const list = env && env.trim() ? env.split(":")
+    : ["Downloads", "Desktop", "Documents", "Github", ".cache/system-config"].map((d) => path.join(home, d)).concat(os.tmpdir());
+  return [...new Set(list.filter((d) => d && path.isAbsolute(d)).map(realOrNull).filter(Boolean))];
+}
+function uploadDenied(given, real) {
+  const home = os.homedir();
+  const blocked = UPLOAD_DENY.map((n) => path.join(home, n)).flatMap((d) => [d, realOrNull(d)]).filter(Boolean);
+  return [path.resolve(given), real].some((p) =>
+    blocked.some((d) => within(p, d)) || p.split(path.sep).some((seg) => /age-key/i.test(seg)));
+}
+
+// Every { path } file of an upload call replaced by { name, type, base64 }
+// read from disk; inline files are left as they are. Returns { args } or
+// { error }. Each file is opened ONCE and judged by that descriptor (so the
+// file checked is the file read), non-blocking so a FIFO cannot hang the
+// open, and its size is added to the total before anything is read; the hub
+// re-checks the total.
+function resolveUploadPaths(args) {
+  const a = args || {};
+  if (!Array.isArray(a.files) || !a.files.some((f) => f && f.path != null)) return { args: a };
+  let total = 0;
+  const files = [];
+  for (const f of a.files) {
+    if (!f || f.path == null) { files.push(f); continue; }
+    const p = f.path;
+    const shown = JSON.stringify(p);
+    if (f.base64 != null) return { error: "upload: give a file as `base64` or as `path`, not both (" + shown + ")" };
+    if (typeof p !== "string" || !path.isAbsolute(p)) {
+      return { error: "upload: `path` must be an absolute path on this Mac (~ is not expanded), got " + shown };
+    }
+    let real;
+    try { real = fs.realpathSync(p); } catch (e) {
+      return { error: "upload: cannot read " + shown + ": " + (e.code === "ENOENT" ? "no such file" : e.message) };
+    }
+    const where = real === p ? shown : shown + " (really " + JSON.stringify(real) + ")";
+    if (uploadDenied(p, real)) {
+      return { error: "upload: " + where + " is in a credentials location (~/" + UPLOAD_DENY.join(", ~/") + ", or an age key) and is never uploaded" };
+    }
+    const roots = uploadRoots();
+    if (!roots.some((d) => within(real, d))) {
+      return { error: "upload: " + where + " is outside the upload roots (" + roots.join(", ") +
+        "); set CLAUDE_SAFARI_UPLOAD_ROOTS (colon-separated absolute directories) for the MCP server to allow another" };
+    }
+    let fd;
+    try {
+      fd = fs.openSync(real, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+      const st = fs.fstatSync(fd);
+      if (!st.isFile()) return { error: "upload: " + where + " is not a regular file" };
+      total += st.size;
+      if (total > UPLOAD_MAX_BYTES) return { error: uploadTooBig() };
+      const bytes = Buffer.alloc(st.size);
+      let got = 0;
+      while (got < st.size) {
+        const n = fs.readSync(fd, bytes, got, st.size - got, got);
+        if (!n) break;
+        got += n;
+      }
+      files.push({
+        name: typeof f.name === "string" && f.name ? f.name : path.basename(p),
+        type: typeof f.type === "string" ? f.type : UPLOAD_TYPES[path.extname(p).toLowerCase()] || "",
+        base64: bytes.subarray(0, got).toString("base64"),
+      });
+    } catch (e) {
+      return { error: "upload: cannot read " + where + ": " + e.message };
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+  }
+  return { args: { ...a, files } };
+}
 // The files an upload call may carry, normalised to bare base64, or { error }.
 function checkUpload(args) {
   const a = args || {};
@@ -262,6 +379,10 @@ function checkUpload(args) {
   let total = 0;
   const out = [];
   for (const f of files) {
+    if (f && f.path != null && typeof f.base64 !== "string") {
+      return { error: "upload: `path` is read by the MCP server on the caller's Mac, and this call reached the hub " +
+        "without it; a direct /call carries the file as base64" };
+    }
     if (!f || typeof f.name !== "string" || !f.name || typeof f.base64 !== "string") {
       return { error: "upload: every file needs a `name` and its content as `base64`" };
     }
@@ -270,13 +391,35 @@ function checkUpload(args) {
       return { error: "upload: " + JSON.stringify(f.name) + " is not valid base64" };
     }
     total += b64.length / 4 * 3 - (b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0);
-    if (total > UPLOAD_MAX_BYTES) {
-      return { error: "upload: the files come to more than " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded; this tool carries them inline" };
-    }
+    if (total > UPLOAD_MAX_BYTES) return { error: uploadTooBig() };
     out.push({ name: f.name.slice(0, 200), type: typeof f.type === "string" ? f.type.slice(0, 100) : "", base64: b64 });
   }
   return { files: out, bytes: total };
 }
+
+// ── A navigate of an existing tab disarms beforeunload first ──────────────────
+// Measured 2026-09-26 on Safari 27: navigating an agent's BACKGROUND tab away
+// from a page with a beforeunload handler (a BrowserStack device session)
+// brought Safari to the front on that tab, because Safari presents the
+// "Leave page?" sheet by activating the tab it belongs to -- the owner's
+// screen changed under them. Measured the same day: this capture listener,
+// installed by claude_safari_eval before the navigate, let the navigate finish
+// with Safari staying in the background and the owner's tab unchanged, on a
+// test page that set both window.onbeforeunload and an addEventListener
+// handler after a click. So the hub sends it to the same copy and tab ahead of
+// every navigate of an existing tab; a new tab has no page to leave.
+//
+// WHAT THAT COSTS: it disarms beforeunload on ANY existing-tab navigate, so a
+// page's "you have unsaved changes" guard no longer asks before the page is
+// left. That is why agents navigate only tabs they opened themselves (the
+// background-tab rule already says so), never the owner's. It is also not a
+// guarantee: a capture-phase listener the page registered earlier on window
+// runs before this one and can still raise the sheet. The
+// extension serves one call at a time, so the navigate never overtakes it,
+// and the short wait only bounds how long a slow or vanished copy holds the
+// hub up before it queues the navigate behind it.
+const NAV_GUARD_CODE = "window.addEventListener('beforeunload', e => e.stopImmediatePropagation(), true)";
+const NAV_GUARD_TIMEOUT_MS = 5000;
 
 // Which instance takes a call that names no tab: the one that owns the active
 // tab; failing that, one that at least sees an active tab (a profile with no
@@ -333,8 +476,11 @@ const describeInstance = (i) =>
 // default and the read-only three are the whole grant.
 //   BRIDGE_PANEL_TOOLS=read   (default) tabs, read, screenshot
 //   BRIDGE_PANEL_TOOLS=all              every claude_safari_* tool
-// The stdio MCP mode is deliberately NOT gated by this: that path runs inside
-// an interactive Claude Code session, which prompts before each call.
+// The stdio MCP mode is NOT gated by this list. It may run in an interactive
+// session that prompts before each call, but it may equally run in bypass
+// mode or under a headless caller that asks nobody, so no safety here rests
+// on a prompt: what a path upload can read is bounded by the bridge itself
+// (uploadRoots, uploadDenied), and a panel turn gets no path at all.
 const PANEL_TOOLS = String(process.env.BRIDGE_PANEL_TOOLS || "read").toLowerCase() === "all" ? "all" : "read";
 const PANEL_READ_ONLY_TOOLS = ["claude_safari_tabs", "claude_safari_read", "claude_safari_screenshot"]
   .map((t) => "mcp__claude-safari__" + t);
@@ -382,13 +528,15 @@ const ATTACH_DIR = `${process.env.HOME}/.cache/claude-safari/attachments`;
 // claude that booted ALL user-scope MCP servers — including any mcp-remote
 // OAuth proxies, whose concurrent spawns race the shared token cache and pop
 // an auth page per message. Isolation also makes panel replies start seconds
-// faster. Written at hub start; points at THIS file.
+// faster. Written at hub start; points at THIS file, with --panel, which keeps
+// that child from reading local files for claude_safari_upload (see
+// PANEL_CHILD).
 const CHAT_MCP_CFG = `${process.env.HOME}/.cache/claude-safari/chat-mcp.json`;
 function writeChatMcpConfig() {
   try {
     fs.mkdirSync(`${process.env.HOME}/.cache/claude-safari`, { recursive: true });
     fs.writeFileSync(CHAT_MCP_CFG, JSON.stringify({
-      mcpServers: { "claude-safari": { command: process.execPath, args: [__filename] } },
+      mcpServers: { "claude-safari": { command: process.execPath, args: [__filename, "--panel"] } },
     }, null, 2));
   } catch {}
 }
@@ -758,7 +906,14 @@ function runHub() {
     // that runs the call in a neighbouring tab of another profile.
     const route = pinRoute(args, live, current);
     if (route.error) return { error: route.error };
-    if (route.inst) return withSlot(await dispatch(route.inst, tool, route.args));
+    if (route.inst) {
+      if (tool === "navigate" && typeof route.args.tabId === "number" && route.args.newTab !== true) {
+        // Its failure is ignored: a page content scripts cannot run in has no
+        // handler of the page's to disarm either.
+        await dispatch(route.inst, "eval", { tabId: route.args.tabId, code: NAV_GUARD_CODE }, NAV_GUARD_TIMEOUT_MS);
+      }
+      return withSlot(await dispatch(route.inst, tool, route.args));
+    }
     const pool = route.pool;
     if (pool.length <= 1) return withSlot(await dispatch(pool[0] || null, tool, route.args));
     const probes = await fanOut(pool, "probeActive", {}, (r) => !!(r && r.result && r.result.owned));
@@ -987,7 +1142,7 @@ function runHub() {
         // otherwise swallow the prompt as another rule, leaving no input.
         args.push("--", parts.join("\n\n"));
         execFile(claudeBin(), args,
-          { timeout: CHAT_TIMEOUT_MS, maxBuffer: 32e6, env: process.env },
+          { timeout: CHAT_TIMEOUT_MS, maxBuffer: 32e6, env: { ...process.env, CLAUDE_SAFARI_PANEL: "1" } },
           (err, stdout) => {
             if (err && !stdout) {
               return json(res, 500, { error: "claude failed: " + String(err.message || err).slice(0, 400) });
@@ -1079,14 +1234,16 @@ const TOOLS = [
       code: { type: "string" },
       timeoutMs: { type: "number", description: "how long to wait for a returned promise (default 30000, at most 60000)" },
       ...TAB_ARG, ...PROFILE_ARG, ...FRAME_ARGS }, required: ["code"] } },
-  { name: "claude_safari_upload", description: "Set files on an <input type=file> from base64 content passed in the call (DataTransfer), then fire input/change. " +
-      "At most " + UPLOAD_MAX_FILES + " files and " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded per call.",
+  { name: "claude_safari_upload", description: "Set files on an <input type=file> (DataTransfer), then fire input/change. " +
+      "Each file is either { path }, an absolute path to a file on this Mac that the bridge reads and sends (use it for anything but a tiny file, " +
+      "e.g. an APK or IPA), or { name, base64 } inline. At most " + UPLOAD_MAX_FILES + " files and " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded per call.",
     inputSchema: { type: "object", properties: {
       selector: { type: "string", description: "CSS selector of the <input type=file>" },
-      files: { type: "array", items: { type: "object", properties: {
-        name: { type: "string" }, type: { type: "string", description: "MIME type, e.g. image/png" },
-        base64: { type: "string", description: "the file's bytes, base64 (a data: URL prefix is accepted)" } },
-      required: ["name", "base64"] } },
+      files: { type: "array", description: "each item carries `path` or `base64`, not both", items: { type: "object", properties: {
+        path: { type: "string", description: "absolute path to a regular file on this Mac under the upload roots (~/Downloads, ~/Desktop, ~/Documents, ~/Github, ~/.cache/system-config, the temp dir, or CLAUDE_SAFARI_UPLOAD_ROOTS); credential locations are refused; read here, never sent as a path" },
+        name: { type: "string", description: "the file name the page sees (required with base64; default for a path: its basename)" },
+        type: { type: "string", description: "MIME type, e.g. image/png (default for a path: from its extension, else empty)" },
+        base64: { type: "string", description: "the file's bytes, base64 (a data: URL prefix is accepted); realistic only for small files" } } } },
       ...TAB_ARG, ...PROFILE_ARG, ...FRAME_ARGS }, required: ["selector", "files"] } },
   { name: "claude_safari_screenshot", description: "Screenshot the visible viewport of a Safari tab. Only a tab its window is already showing can be captured: " +
       "a background tab is refused (use claude_safari_read or claude_safari_eval instead) unless force: true, which switches to it, captures, and switches back.",
@@ -1101,6 +1258,17 @@ const TOOLS = [
 // Claude's every tool call with 401, so "click this / read that tab" failed
 // on the phone while the chat itself worked (found 2026-09-02). The child
 // inherits the hub's environment, so the token is right here.
+// THE PANEL'S CHILD NEVER READS A LOCAL FILE. A chat panel turn talks to this
+// server too (writeChatMcpConfig starts it with --panel), and its prompt
+// carries page text nobody vetted; with BRIDGE_PANEL_TOOLS=all, an upload by
+// `path` would let a page ask for ~/.ssh/id_ed25519 to be put into its own
+// form. That turn is otherwise granted no Read beyond its attachments.
+// Two signals, either enough: the flag chat-mcp.json passes, and the
+// environment the hub gives the panel's claude, which its MCP children
+// inherit -- so a config written by an older hub, without the flag, is
+// still covered once the hub that spawns the turn is this build.
+const PANEL_CHILD = process.argv.includes("--panel") || process.env.CLAUDE_SAFARI_PANEL === "1";
+
 const hubHeaders = (extra = {}) =>
   TOKEN ? { ...extra, authorization: "Bearer " + TOKEN } : extra;
 
@@ -1127,6 +1295,14 @@ async function callTool(name, args) {
     return { content: [{ type: "text", text: "Error: unknown tool " + name }], isError: true };
   }
   const tool = name.replace(/^claude_safari_/, "");
+  if (tool === "upload") {
+    if (PANEL_CHILD && Array.isArray(args.files) && args.files.some((f) => f && f.path != null)) {
+      return { content: [{ type: "text", text: "Error: upload: `path` is not available to a chat panel turn; pass the file as base64" }], isError: true };
+    }
+    const up = resolveUploadPaths(args);
+    if (up.error) return { content: [{ type: "text", text: "Error: " + up.error }], isError: true };
+    args = up.args;
+  }
   const r = await fetch(`${HUB}/call`, {
     method: "POST",
     headers: hubHeaders({ "content-type": "application/json" }),
@@ -1198,5 +1374,5 @@ if (require.main === module) {
   // The pure routing pieces, for test/hub-routing.test.js.
   module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
     cmpVersion, currentInstances, describeInstance, parseCodexOutput,
-    cleanProfile, sameProfile, pinRoute, checkUpload, UPLOAD_MAX_BYTES, TOOLS, callTool };
+    cleanProfile, sameProfile, pinRoute, checkUpload, resolveUploadPaths, UPLOAD_MAX_BYTES, TOOLS, callTool };
 }
