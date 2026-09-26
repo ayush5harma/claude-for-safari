@@ -6,7 +6,7 @@
 
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -22,7 +22,16 @@ const { resolveUploadPaths, checkUpload, callTool, UPLOAD_MAX_BYTES, TOOLS } = r
 const HUB = `http://127.0.0.1:${PORT}`;
 
 let dir;
-const file = (name, content) => { const p = path.join(dir, name); fs.writeFileSync(p, content); return p; };
+const file = (name, content) => { const p = path.join(dir, name); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, content); return p; };
+// Run fn with these environment variables set (undefined removes one), then
+// put them back: the resolver reads HOME and the roots at call time.
+function withEnv(vars, fn) {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  for (const [k, v] of Object.entries(vars)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  try { return fn(); } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+}
 
 test("a path becomes inline base64 with its basename and a type from its extension", () => {
   const p = file("WikipediaSample.apk", Buffer.from([0x50, 0x4b, 0x03, 0x04, 0xff]));
@@ -76,12 +85,66 @@ test("files over the cap are refused from their size, before any is read", () =>
   const big = path.join(dir, "huge.apk");
   fs.closeSync(fs.openSync(big, "w"));
   fs.truncateSync(big, UPLOAD_MAX_BYTES + 1);
-  assert.match(resolveUploadPaths({ files: [{ path: big }] }).error, /more than 48 MB decoded/);
+  assert.match(resolveUploadPaths({ files: [{ path: big }] }).error, /more than 24 MB decoded/);
   // The cap is on the call's total, not per file.
   const half = path.join(dir, "half.apk");
   fs.closeSync(fs.openSync(half, "w"));
   fs.truncateSync(half, UPLOAD_MAX_BYTES / 2 + 1);
-  assert.match(resolveUploadPaths({ files: [{ path: half }, { path: half }] }).error, /more than 48 MB/);
+  assert.match(resolveUploadPaths({ files: [{ path: half }, { path: half }] }).error, /more than 24 MB/);
+});
+
+test("a file outside the upload roots is refused, and a symlink is judged by where it points", () => {
+  const allowed = path.join(dir, "roots", "allowed");
+  const inside = file("roots/allowed/app.apk", "in");
+  const outside = file("roots/elsewhere/secret.txt", "out");
+  const link = path.join(allowed, "innocent.apk");
+  fs.symlinkSync(outside, link);
+  const inLink = path.join(allowed, "alias.apk");
+  fs.symlinkSync(inside, inLink);
+  withEnv({ CLAUDE_SAFARI_UPLOAD_ROOTS: allowed }, () => {
+    assert.equal(resolveUploadPaths({ files: [{ path: inside }] }).args.files[0].base64, "aW4=");
+    assert.match(resolveUploadPaths({ files: [{ path: outside }] }).error, /outside the upload roots.*CLAUDE_SAFARI_UPLOAD_ROOTS/);
+    assert.match(resolveUploadPaths({ files: [{ path: link }] }).error, /outside the upload roots/,
+      "a link inside a root that points out of it is refused");
+    const [viaLink] = resolveUploadPaths({ files: [{ path: inLink }] }).args.files;
+    assert.deepEqual([viaLink.name, viaLink.base64], ["alias.apk", "aW4="], "a link within the roots works, named as given");
+  });
+  // Several roots, colon-separated; a relative entry is ignored rather than
+  // read against whatever the cwd is.
+  withEnv({ CLAUDE_SAFARI_UPLOAD_ROOTS: "relative/dir:" + path.join(dir, "roots", "elsewhere") + ":" + allowed }, () => {
+    assert.equal(resolveUploadPaths({ files: [{ path: outside }] }).error, undefined);
+  });
+});
+
+test("credential locations are refused even inside a root, and through a link", () => {
+  const home = path.join(dir, "fakehome");
+  const ok = file("fakehome/Downloads/ok.txt", "ok");
+  const denied = [file("fakehome/.ssh/id_ed25519", "k"), file("fakehome/.gnupg/secring.gpg", "k"),
+    file("fakehome/.aws/credentials", "k"), file("fakehome/.mcp-auth/token.json", "k"),
+    file("fakehome/.netrc", "k"), file("fakehome/Documents/age-key.txt", "k"), file("fakehome/Documents/keys/my-age-key", "k")];
+  const link = path.join(home, "Downloads", "harmless.txt");
+  fs.symlinkSync(path.join(home, ".ssh", "id_ed25519"), link);
+  // ~/.ssh kept elsewhere (the fleet keeps SSH material in iCloud) and linked in.
+  const cloud = file("cloud/ssh/id_rsa", "k");
+  fs.symlinkSync(path.dirname(cloud), path.join(home, ".ssh-cloud"));
+  withEnv({ HOME: home, CLAUDE_SAFARI_UPLOAD_ROOTS: home + ":" + path.join(dir, "cloud") }, () => {
+    assert.equal(resolveUploadPaths({ files: [{ path: ok }] }).error, undefined);
+    for (const p of [...denied, link]) {
+      assert.match(resolveUploadPaths({ files: [{ path: p }] }).error || "", /credentials .*never uploaded/, p);
+    }
+    fs.renameSync(path.join(home, ".ssh"), path.join(home, ".ssh-local"));
+    fs.symlinkSync(path.dirname(cloud), path.join(home, ".ssh"));
+    try {
+      assert.match(resolveUploadPaths({ files: [{ path: cloud }] }).error || "", /never uploaded/,
+        "a file in the directory ~/.ssh links to is refused by its real path");
+    } finally { fs.unlinkSync(path.join(home, ".ssh")); fs.renameSync(path.join(home, ".ssh-local"), path.join(home, ".ssh")); }
+  });
+});
+
+test("a FIFO is refused as not a regular file, without blocking on the open", () => {
+  const fifo = path.join(dir, "pipe.apk");
+  execFileSync("mkfifo", [fifo]);
+  assert.match(resolveUploadPaths({ files: [{ path: fifo }] }).error, /is not a regular file/);
 });
 
 test("a path that reaches the hub unresolved is refused there, never read", () => {
@@ -100,7 +163,7 @@ test("the upload schema takes a path or base64 per file, neither required", () =
   assert.ok(item.properties.path && item.properties.base64 && item.properties.name && item.properties.type);
   assert.equal(item.required, undefined);
   assert.match(up.description, /path/);
-  assert.match(up.description, /48 MB/);
+  assert.match(up.description, /24 MB/);
 });
 
 test("the panel's MCP child refuses a path: a page-driven turn must not read this Mac's files", async () => {
@@ -119,6 +182,27 @@ test("the panel's MCP child refuses a path: a page-driven turn must not read thi
   assert.match(msg.result.content[0].text, /panel/);
 });
 
+test("a child that inherits CLAUDE_SAFARI_PANEL=1 refuses a path too, flag or not", async () => {
+  const p = file("secret2.txt", "do not upload");
+  const child = spawn(process.execPath, [BRIDGE], { env: { ...process.env, HOME: dir, CLAUDE_SAFARI_PANEL: "1" }, stdio: ["pipe", "pipe", "inherit"] });
+  let out = "";
+  child.stdout.setEncoding("utf8");
+  const reply = new Promise((resolve) => child.stdout.on("data", (c) => { out += c; if (out.includes("\n")) resolve(JSON.parse(out.split("\n")[0])); }));
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "claude_safari_upload", arguments: { selector: "#f", files: [{ path: p }] } } }) + "\n");
+  const msg = await reply;
+  child.kill();
+  assert.equal(msg.result.isError, true);
+  assert.match(msg.result.content[0].text, /panel/);
+});
+
+test("the hub runs the panel's claude with CLAUDE_SAFARI_PANEL=1", async () => {
+  const r = await fetch(HUB + "/chat", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: "hi" }) });
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).reply, "panel=1");
+});
+
 test("the hub writes the panel's MCP config with --panel", async () => {
   const cfg = JSON.parse(fs.readFileSync(path.join(home, ".cache", "claude-safari", "chat-mcp.json"), "utf8"));
   assert.deepEqual(cfg.mcpServers["claude-safari"].args.slice(1), ["--panel"]);
@@ -130,8 +214,12 @@ let hub, home, ctl, loop;
 before(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-safari-upload-test-"));
   home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-safari-hub-test-"));
+  // A stand-in for the claude CLI that answers a panel turn with the marker
+  // it was started with.
+  const fakeClaude = path.join(home, "fake-claude");
+  fs.writeFileSync(fakeClaude, "#!/bin/sh\nprintf '{\"result\":\"panel=%s\"}' \"$CLAUDE_SAFARI_PANEL\"\n", { mode: 0o755 });
   hub = spawn(process.execPath, [BRIDGE, "--serve"],
-    { env: { ...process.env, HOME: home, BRIDGE_PORT: String(PORT), BRIDGE_BIND: "127.0.0.1", BRIDGE_TOKEN: "", BRIDGE_PANEL_TOOLS: "" },
+    { env: { ...process.env, HOME: home, CLAUDE_BIN: fakeClaude, BRIDGE_PORT: String(PORT), BRIDGE_BIND: "127.0.0.1", BRIDGE_TOKEN: "", BRIDGE_PANEL_TOOLS: "" },
       stdio: ["ignore", "ignore", "inherit"] });
   let exited = null;
   hub.on("exit", (code) => { exited = code; });

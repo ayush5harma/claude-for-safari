@@ -35,6 +35,7 @@
 const http = require("node:http");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { spawn, execFile } = require("node:child_process");
 
@@ -259,12 +260,12 @@ function pinRoute(args, live, current) {
 // (WikipediaSample.apk, 20,373,104 bytes, 2026-09-26) is far past anything a
 // context can carry as base64.
 //
-// The cap is what one POST /call can carry: 48 MB decoded is 64 MB of base64
-// (67.1e6 characters) inside MAX_BODY's 90e6, leaving room for the JSON around
-// it. It is one total for both forms. Measured as far as the hub and a fake
-// extension (test/upload-paths.test.js, 20 MB intact); whether Safari's
-// background-to-content hop carries that much has not been measured.
-const UPLOAD_MAX_BYTES = 48 * 1024 * 1024;
+// The cap is 24 MB decoded, one total for both forms. Real Safari was
+// measured carrying that 20 MB APK to a page (2026-09-26), and nothing larger
+// has been tried; MAX_BODY alone would admit about 48 MB (64 MB of base64
+// inside 90e6), but every hop after the hub holds a copy, so the cap stays
+// just above what was proven.
+const UPLOAD_MAX_BYTES = 24 * 1024 * 1024;
 const UPLOAD_MAX_FILES = 10;
 const uploadTooBig = () => "upload: the files come to more than " + UPLOAD_MAX_BYTES / 1048576 + " MB decoded";
 // The type a path upload gets when the caller names none. An upload form may
@@ -276,10 +277,45 @@ const UPLOAD_TYPES = {
   ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".csv": "text/csv", ".zip": "application/zip",
   ".json": "application/json", ".txt": "text/plain",
 };
+
+// WHICH FILES A PATH UPLOAD MAY READ. This server reads the file itself, so
+// Claude Code's own Read permissions (a deny on ~/.ssh, say) never see it,
+// and a session in bypass mode or a headless caller is not asked either. So
+// the bridge keeps its own bounds: the file's REAL path (symlinks resolved,
+// so a link inside a root cannot point out of it) must sit under an upload
+// root, and credential locations are refused even inside one. The roots are
+// CLAUDE_SAFARI_UPLOAD_ROOTS (colon-separated absolute directories) or, by
+// default, the places a build or a download lands. A deny entry is checked by
+// its literal and its real path, because ~/.ssh can be a link (this fleet
+// keeps SSH material in iCloud). APFS is case-insensitive by default, so on
+// macOS the comparison is too.
+const UPLOAD_DENY = [".ssh", ".gnupg", ".aws", ".mcp-auth", ".netrc"];
+const foldCase = (p) => (process.platform === "darwin" ? p.toLowerCase() : p);
+const within = (p, dir) => {
+  const a = foldCase(p), d = foldCase(dir);
+  return a === d || a.startsWith(d.endsWith(path.sep) ? d : d + path.sep);
+};
+const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
+function uploadRoots() {
+  const home = os.homedir();
+  const env = process.env.CLAUDE_SAFARI_UPLOAD_ROOTS;
+  const list = env && env.trim() ? env.split(":")
+    : ["Downloads", "Desktop", "Documents", "Github", ".cache/system-config"].map((d) => path.join(home, d)).concat(os.tmpdir());
+  return [...new Set(list.filter((d) => d && path.isAbsolute(d)).map(realOrNull).filter(Boolean))];
+}
+function uploadDenied(given, real) {
+  const home = os.homedir();
+  const blocked = UPLOAD_DENY.map((n) => path.join(home, n)).flatMap((d) => [d, realOrNull(d)]).filter(Boolean);
+  return [path.resolve(given), real].some((p) =>
+    blocked.some((d) => within(p, d)) || p.split(path.sep).some((seg) => /age-key/i.test(seg)));
+}
+
 // Every { path } file of an upload call replaced by { name, type, base64 }
 // read from disk; inline files are left as they are. Returns { args } or
-// { error }. Sizes are summed from stat before anything is read, so an
-// oversized file is refused without loading it; the hub re-checks the total.
+// { error }. Each file is opened ONCE and judged by that descriptor (so the
+// file checked is the file read), non-blocking so a FIFO cannot hang the
+// open, and its size is added to the total before anything is read; the hub
+// re-checks the total.
 function resolveUploadPaths(args) {
   const a = args || {};
   if (!Array.isArray(a.files) || !a.files.some((f) => f && f.path != null)) return { args: a };
@@ -288,26 +324,48 @@ function resolveUploadPaths(args) {
   for (const f of a.files) {
     if (!f || f.path == null) { files.push(f); continue; }
     const p = f.path;
-    if (f.base64 != null) return { error: "upload: give a file as `base64` or as `path`, not both (" + JSON.stringify(p) + ")" };
+    const shown = JSON.stringify(p);
+    if (f.base64 != null) return { error: "upload: give a file as `base64` or as `path`, not both (" + shown + ")" };
     if (typeof p !== "string" || !path.isAbsolute(p)) {
-      return { error: "upload: `path` must be an absolute path on this Mac (~ is not expanded), got " + JSON.stringify(p) };
+      return { error: "upload: `path` must be an absolute path on this Mac (~ is not expanded), got " + shown };
     }
-    let st;
-    try { st = fs.statSync(p); } catch (e) {
-      return { error: "upload: cannot read " + JSON.stringify(p) + ": " + (e.code === "ENOENT" ? "no such file" : e.message) };
+    let real;
+    try { real = fs.realpathSync(p); } catch (e) {
+      return { error: "upload: cannot read " + shown + ": " + (e.code === "ENOENT" ? "no such file" : e.message) };
     }
-    if (!st.isFile()) return { error: "upload: " + JSON.stringify(p) + " is not a regular file" };
-    total += st.size;
-    if (total > UPLOAD_MAX_BYTES) return { error: uploadTooBig() };
-    let bytes;
-    try { bytes = fs.readFileSync(p); } catch (e) {
-      return { error: "upload: cannot read " + JSON.stringify(p) + ": " + e.message };
+    const where = real === p ? shown : shown + " (really " + JSON.stringify(real) + ")";
+    if (uploadDenied(p, real)) {
+      return { error: "upload: " + where + " is in a credentials location (~/" + UPLOAD_DENY.join(", ~/") + ", or an age key) and is never uploaded" };
     }
-    files.push({
-      name: typeof f.name === "string" && f.name ? f.name : path.basename(p),
-      type: typeof f.type === "string" ? f.type : UPLOAD_TYPES[path.extname(p).toLowerCase()] || "",
-      base64: bytes.toString("base64"),
-    });
+    const roots = uploadRoots();
+    if (!roots.some((d) => within(real, d))) {
+      return { error: "upload: " + where + " is outside the upload roots (" + roots.join(", ") +
+        "); set CLAUDE_SAFARI_UPLOAD_ROOTS (colon-separated absolute directories) for the MCP server to allow another" };
+    }
+    let fd;
+    try {
+      fd = fs.openSync(real, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+      const st = fs.fstatSync(fd);
+      if (!st.isFile()) return { error: "upload: " + where + " is not a regular file" };
+      total += st.size;
+      if (total > UPLOAD_MAX_BYTES) return { error: uploadTooBig() };
+      const bytes = Buffer.alloc(st.size);
+      let got = 0;
+      while (got < st.size) {
+        const n = fs.readSync(fd, bytes, got, st.size - got, got);
+        if (!n) break;
+        got += n;
+      }
+      files.push({
+        name: typeof f.name === "string" && f.name ? f.name : path.basename(p),
+        type: typeof f.type === "string" ? f.type : UPLOAD_TYPES[path.extname(p).toLowerCase()] || "",
+        base64: bytes.subarray(0, got).toString("base64"),
+      });
+    } catch (e) {
+      return { error: "upload: cannot read " + where + ": " + e.message };
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
   }
   return { args: { ...a, files } };
 }
@@ -411,8 +469,11 @@ const describeInstance = (i) =>
 // default and the read-only three are the whole grant.
 //   BRIDGE_PANEL_TOOLS=read   (default) tabs, read, screenshot
 //   BRIDGE_PANEL_TOOLS=all              every claude_safari_* tool
-// The stdio MCP mode is deliberately NOT gated by this: that path runs inside
-// an interactive Claude Code session, which prompts before each call.
+// The stdio MCP mode is NOT gated by this list. It may run in an interactive
+// session that prompts before each call, but it may equally run in bypass
+// mode or under a headless caller that asks nobody, so no safety here rests
+// on a prompt: what a path upload can read is bounded by the bridge itself
+// (uploadRoots, uploadDenied), and a panel turn gets no path at all.
 const PANEL_TOOLS = String(process.env.BRIDGE_PANEL_TOOLS || "read").toLowerCase() === "all" ? "all" : "read";
 const PANEL_READ_ONLY_TOOLS = ["claude_safari_tabs", "claude_safari_read", "claude_safari_screenshot"]
   .map((t) => "mcp__claude-safari__" + t);
@@ -1074,7 +1135,7 @@ function runHub() {
         // otherwise swallow the prompt as another rule, leaving no input.
         args.push("--", parts.join("\n\n"));
         execFile(claudeBin(), args,
-          { timeout: CHAT_TIMEOUT_MS, maxBuffer: 32e6, env: process.env },
+          { timeout: CHAT_TIMEOUT_MS, maxBuffer: 32e6, env: { ...process.env, CLAUDE_SAFARI_PANEL: "1" } },
           (err, stdout) => {
             if (err && !stdout) {
               return json(res, 500, { error: "claude failed: " + String(err.message || err).slice(0, 400) });
@@ -1172,7 +1233,7 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {
       selector: { type: "string", description: "CSS selector of the <input type=file>" },
       files: { type: "array", description: "each item carries `path` or `base64`, not both", items: { type: "object", properties: {
-        path: { type: "string", description: "absolute path to a regular file on this Mac; read here, never sent as a path" },
+        path: { type: "string", description: "absolute path to a regular file on this Mac under the upload roots (~/Downloads, ~/Desktop, ~/Documents, ~/Github, ~/.cache/system-config, the temp dir, or CLAUDE_SAFARI_UPLOAD_ROOTS); credential locations are refused; read here, never sent as a path" },
         name: { type: "string", description: "the file name the page sees (required with base64; default for a path: its basename)" },
         type: { type: "string", description: "MIME type, e.g. image/png (default for a path: from its extension, else empty)" },
         base64: { type: "string", description: "the file's bytes, base64 (a data: URL prefix is accepted); realistic only for small files" } } } },
@@ -1195,7 +1256,11 @@ const TOOLS = [
 // carries page text nobody vetted; with BRIDGE_PANEL_TOOLS=all, an upload by
 // `path` would let a page ask for ~/.ssh/id_ed25519 to be put into its own
 // form. That turn is otherwise granted no Read beyond its attachments.
-const PANEL_CHILD = process.argv.includes("--panel");
+// Two signals, either enough: the flag chat-mcp.json passes, and the
+// environment the hub gives the panel's claude, which its MCP children
+// inherit -- so a config written by an older hub, without the flag, is
+// still covered once the hub that spawns the turn is this build.
+const PANEL_CHILD = process.argv.includes("--panel") || process.env.CLAUDE_SAFARI_PANEL === "1";
 
 const hubHeaders = (extra = {}) =>
   TOKEN ? { ...extra, authorization: "Bearer " + TOKEN } : extra;

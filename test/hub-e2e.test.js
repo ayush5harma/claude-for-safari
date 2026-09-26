@@ -388,8 +388,8 @@ test("a named profile is a routing key: its copy takes the call, and its tabs sa
 
 test("an oversized upload is refused at the hub, before any copy sees it", async () => {
   const counts = Object.values(served).reduce((n, l) => n + l.length, 0);
-  // 66 MiB of base64 is 49.5 MiB decoded: past the cap, still inside MAX_BODY.
-  const r = await call("upload", { selector: "#f", files: [{ name: "big.bin", base64: "A".repeat(66 * 1024 * 1024) }] });
+  // 33 MiB of base64 is 24.75 MiB decoded: just past the cap.
+  const r = await call("upload", { selector: "#f", files: [{ name: "big.bin", base64: "A".repeat(33 * 1024 * 1024) }] });
   assert.match(r.body.error, /MB decoded/);
   assert.equal(Object.values(served).reduce((n, l) => n + l.length, 0), counts);
 });
