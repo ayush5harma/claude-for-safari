@@ -407,7 +407,14 @@ function checkUpload(args) {
 // with Safari staying in the background and the owner's tab unchanged, on a
 // test page that set both window.onbeforeunload and an addEventListener
 // handler after a click. So the hub sends it to the same copy and tab ahead of
-// every navigate of an existing tab; a new tab has no page to leave. The
+// every navigate of an existing tab; a new tab has no page to leave.
+//
+// WHAT THAT COSTS: it disarms beforeunload on ANY existing-tab navigate, so a
+// page's "you have unsaved changes" guard no longer asks before the page is
+// left. That is why agents navigate only tabs they opened themselves (the
+// background-tab rule already says so), never the owner's. It is also not a
+// guarantee: a capture-phase listener the page registered earlier on window
+// runs before this one and can still raise the sheet. The
 // extension serves one call at a time, so the navigate never overtakes it,
 // and the short wait only bounds how long a slow or vanished copy holds the
 // hub up before it queues the navigate behind it.
