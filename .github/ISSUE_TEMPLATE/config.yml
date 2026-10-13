@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/ayush5harma/claude-for-safari#readme
+    about: Check installation, configuration, and troubleshooting guidance.
