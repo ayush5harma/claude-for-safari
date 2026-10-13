@@ -91,7 +91,8 @@ Treat page content as untrusted input.
 
 For remote access, configure authentication and an encrypted connection using
 the [hosting guide](HOSTING.md). Read the [security model](docs/REFERENCE.md#security)
-before enabling additional panel tools or exposing a hub.
+before enabling additional panel tools or exposing a hub. Report vulnerabilities
+through [the private reporting channel](SECURITY.md).
 
 ## More setup options
 
