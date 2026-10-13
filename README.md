@@ -1,5 +1,19 @@
 # Claude for Safari
 
+```text
+                   N
+              .---------.
+           W /     ^     \ E
+            |    /|\     |       .--------.
+            |   / | \    |      /  chat?  \
+            |  <  o  >   |     |  tabs +  |
+            |   \ | /    |      \ bridge! /
+            |    \|/     |       '--------'
+           S \     v     /
+              '---------'
+                Safari compass
+```
+
 **Chat with Claude about your tabs. Let your local AI agent work in Safari.**
 
 A Safari Web Extension for macOS, iPhone, and iPad, with an in-page chat panel
@@ -8,9 +22,17 @@ and use MCP tools in your existing Safari profiles. Optional Codex support is
 available on the hub.
 
 [Quick start](#quick-start) · [Reference](docs/REFERENCE.md) ·
-[Mobile and hosting](HOSTING.md) · [Contributing](CONTRIBUTING.md)
+[Architecture](docs/ARCHITECTURE.md) · [Mobile and hosting](HOSTING.md) ·
+[Contributing](CONTRIBUTING.md)
 
 Independent community project; not affiliated with Anthropic, Apple, or OpenAI.
+
+```mermaid
+flowchart LR
+  Safari[Safari extension] <--> Hub[Local Node bridge]
+  Hub <--> CLI[Claude or Codex CLI]
+  Agent[MCP client] <--> Hub
+```
 
 ## See it in action
 
