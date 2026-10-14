@@ -54,7 +54,7 @@ awake.
 Decide `BRIDGE_PANEL_TOOLS` here too. It defaults to `read`, which is what you
 want for a hub reachable from more than one device; `all` lets a panel turn
 drive the browser, and the prompt of a panel turn contains page text nobody
-vetted (README, "Security").
+vetted (see the [security model](docs/REFERENCE.md#security)).
 
 Plain http is acceptable here only because WireGuard already encrypts the mesh
 path end to end.

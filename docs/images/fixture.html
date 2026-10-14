@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude for Safari screenshot fixture</title>
+<style>
+  body { margin: 0; color: #202124; font: 17px/1.55 -apple-system, BlinkMacSystemFont, sans-serif; background: #fff; }
+  main { max-width: 730px; margin: 88px auto; padding: 0 40px; }
+  h1 { font-size: 42px; letter-spacing: -.03em; margin: 0 0 14px; }
+  .eyebrow { color: #c96442; font-weight: 650; }
+  .card { margin-top: 36px; padding: 24px; background: #f6f4ef; border-radius: 16px; }
+  .fixture { font-size: 14px; color: #67645f; }
+</style>
+<main>
+  <p class="eyebrow">Documentation fixture</p>
+  <h1>Quarterly planning notes</h1>
+  <p>Sample page content used only to show the extension panel in context. It contains no browsing history, account information, or production data.</p>
+  <div class="card"><b>Decision</b><br>Prioritize the onboarding flow and measure completion before adding new acquisition channels.</div>
+  <p class="fixture">The chat transcript, open tabs, and response shown in the screenshot are fixed sample data supplied by this fixture.</p>
+</main>
+<script>
+  (() => {
+    const store = {
+      chatProvider: "codex", chatModel: "gpt-6-astra",
+      chatHistory: [],
+    };
+    const get = async (keys) => {
+      if (Array.isArray(keys)) return Object.fromEntries(keys.map((k) => [k, store[k]]).filter(([, v]) => v !== undefined));
+      if (typeof keys === "string") return store[keys] === undefined ? {} : { [keys]: store[keys] };
+      return { ...store };
+    };
+    const listeners = [];
+    const attachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function (init) {
+      const root = attachShadow.call(this, init);
+      // The production panel intentionally uses a closed root. The fixture
+      // records it only so the capture script can type its sample prompt.
+      this.__fixtureShadow = root;
+      return root;
+    };
+    const reply = "The notes prioritize a focused onboarding improvement. A good next step is to define completion, instrument it, and compare the result before expanding acquisition work.";
+    window.browser = {
+      runtime: {
+        getURL: (path) => "../../extension/" + path,
+        onMessage: { addListener: (fn) => listeners.push(fn) },
+        sendMessage: async (message) => {
+          if (message.op === "hubping") return { ok: true, hub: "sample local hub", codexEnabled: true };
+          if (message.op === "uaSitesGet") return { sites: ["browserstack.com"], usingDefaults: true, status: { dnr: "ok: sample", scope: "ok" } };
+          if (message.op === "tabsList") return [
+            { tabId: 12, title: "Quarterly planning notes", url: "https://docs.example.test/planning" },
+            { tabId: 18, title: "Product metrics", url: "https://metrics.example.test/overview" }
+          ];
+          if (message.op === "readTab") return { url: "https://docs.example.test/planning", title: "Quarterly planning notes", text: "Sample planning notes", via: "sample" };
+          if (message.op === "chat") return { reply, sessionId: "sample-session" };
+          return { ok: true };
+        },
+      },
+      storage: { local: {
+        get,
+        set: async (entries) => Object.assign(store, entries),
+        remove: async (keys) => { for (const key of Array.isArray(keys) ? keys : [keys]) delete store[key]; },
+      } },
+    };
+    window.__screenshotFixture = { open: () => listeners[0]({ op: "togglePanel" }) };
+  })();
+</script>
+<script src="../../extension/content.js"></script>
+</html>
