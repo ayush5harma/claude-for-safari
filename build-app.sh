@@ -348,7 +348,12 @@ if [ "$SIGN_ID" = "-" ]; then
 else
   echo "Building scheme '$SCHEME' (signed: $SIGN_ID — permanent in Safari)..."
 fi
+# Explicit generic macOS destination: without one the multi-platform scheme
+# matches both "My Mac" and "Any Mac" and xcodebuild warns on every build
+# ("Using the first of multiple matching destinations"). Generic, like
+# build-ios.sh, so the build never depends on which Mac runs it.
 xcodebuild -project "$PROJ" -scheme "$SCHEME" -configuration Release \
+  -destination 'generic/platform=macOS' \
   -derivedDataPath "$APP_DIR/build" \
   CODE_SIGN_STYLE=Manual \
   CODE_SIGN_IDENTITY="$SIGN_ID" \
