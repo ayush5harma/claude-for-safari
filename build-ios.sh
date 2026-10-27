@@ -89,12 +89,16 @@ fi
 # PAIRED is kept separately from DEVICES: the profile picker below must cover
 # every device this Mac knows, so that an --export-only .ipa installs on all
 # of them, not just on whichever ones were named for an install.
+# Only iPhones and iPads count, by the model identifier devicectl prints in
+# parentheses: a paired Apple Watch is "available (paired)" and "physical" as
+# well (Watch6,18, seen 2026-10-28), no iOS profile lists it, so counting it
+# left no usable profile and failed every export.
 EXPORT_ONLY=0
 DEVICES=()
 PAIRED=()
 while IFS= read -r u; do PAIRED+=("$u"); done < <(
   xcrun devicectl list devices 2>/dev/null \
-    | awk '/available \(paired\)/ && /physical/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9A-F-]{16,40}$/) print $i }')
+    | awk '/available \(paired\)/ && /physical/ && /\((iPhone|iPad)[0-9]+,[0-9]+\)/ { for (i=1;i<=NF;i++) if ($i ~ /^[0-9A-F-]{16,40}$/) print $i }')
 for a in "$@"; do
   case "$a" in
     --export-only) EXPORT_ONLY=1 ;;
