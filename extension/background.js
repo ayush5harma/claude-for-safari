@@ -1098,7 +1098,8 @@ browser.runtime.onMessage.addListener((msg) => {
 //             main_frame User-Agent was measuring a DYNAMIC rule. Rebuilding
 //             them from a new list therefore changes nothing about that result.
 //
-//   navigator ua-consistency.js and webrtc-legacy-compat.js, registered through
+//   navigator ua-consistency.js, webrtc-legacy-compat.js and media-autoplay-compat.js,
+//             registered through
 //             scripting.registerContentScripts with world "MAIN", document_start
 //             and `matches` built from the same list.
 //
@@ -1132,7 +1133,7 @@ const UA_SITES_KEY = "uaChromeSites";
 const UA_SCRIPT_ID = "ua-chrome-main";
 // ua-chrome-sites.js is deliberately NOT in this list: the registration's
 // `matches` is the scope, so the site list no longer travels into web pages.
-const UA_MAIN_WORLD_JS = ["ua-chrome.js", "ua-consistency.js", "webrtc-legacy-compat.js"];
+const UA_MAIN_WORLD_JS = ["ua-chrome.js", "ua-consistency.js", "webrtc-legacy-compat.js", "media-autoplay-compat.js"];
 
 const uaApi = (typeof browser !== "undefined" ? browser : chrome);
 

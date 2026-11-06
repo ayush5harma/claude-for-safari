@@ -134,7 +134,7 @@ test("with nothing saved, the defaults are applied to both layers", async () => 
   assert.equal(reg.world, "MAIN");
   assert.equal(reg.runAt, "document_start");
   assert.equal(reg.allFrames, true);
-  assert.deepEqual(reg.js, ["ua-chrome.js", "ua-consistency.js", "webrtc-legacy-compat.js"]);
+  assert.deepEqual(reg.js, ["ua-chrome.js", "ua-consistency.js", "webrtc-legacy-compat.js", "media-autoplay-compat.js"]);
   assert.deepEqual(reg.matches, plain(env.get("siteMatchPatterns")(defaults)));
   // Unregister always runs first: register() rejects an id that already exists.
   assert.ok(env.calls.unregister.length >= 1);
