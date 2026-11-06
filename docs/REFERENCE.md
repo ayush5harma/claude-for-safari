@@ -494,6 +494,19 @@ calls as promises with the callbacks wired, patching at `document_start` and
 again at window load, because `webrtc-adapter` otherwise wraps the patch and
 drops the callback above it.
 
+`extension/media-autoplay-compat.js` rides along too. Chrome code paths unmute
+a playing stream once the user has interacted with the page, or with the
+embedding page for an iframe; WebKit only allows unmuted playback while a
+gesture is being handled in the element's own document, and pauses the element
+otherwise. On the App Accessibility scanner the device runs in a cross-origin
+iframe the user never clicked, so the iOS ReplayKit stream froze on its first
+frame the moment the viewer turned its audio on (measured 2026-11-06, Safari
+27.3). For elements whose `srcObject` is a `MediaStream` only, and only when
+Safari actually refuses: a refused unmute is undone (muted, playing again), an
+unmuted `play()` that rejects with `NotAllowedError` is retried muted, and the
+unmute is applied at the first trusted `pointerdown`, `keydown` or `touchend`
+in that document. A page that sets `muted = true` cancels the queued unmute.
+
 ## iPhone and iPad
 
 ```sh
