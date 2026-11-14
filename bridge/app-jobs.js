@@ -235,6 +235,9 @@ const TERMS_SYSTEM = [
   "Units: rate is a fraction (0.05 = 5%). Points are pointsPer points per perINR rupees (4 points per Rs 200 = pointsPer 4, perINR 200).",
   "Cap.percent and Fee.percent are percentages (1 = 1%).",
   "Exactly one earn rule has isBase true: the card's general rate. A category that earns nothing unless another rule matches is a rule with rate 0.",
+  "priority decides which rule applies when several match a transaction, and the HIGHER number wins: the base rule is 0, " +
+    "a rate-0 category rule ranks above it, and each specific merchant or channel rule ranks above the category rules it narrows.",
+  "match.merchants holds lowercase merchant keys (amazon, swiggy, zomato, blinkit, airtel, ...), never display names.",
   "A cap that is a multiple of another rule's capped earnings is kind multipleOfRule with that rule's id in ruleId and the factor in multiple.",
   "Categories that earn nothing and never count toward base spend or milestones go in exclusions.",
   "Keep the id of every rule, cap, milestone and fee that is unchanged from the current rule set; new ids are short kebab-case.",
