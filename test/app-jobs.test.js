@@ -40,7 +40,7 @@ const ruleSet = (url) => ({
     match: { merchants: null, categories: null, channels: null, paidVia: null, international: null },
     rate: 0.01, pointsPer: null, perINR: null, minTxnINR: null, caps: [], creditedTo: "statement",
     countsTowardBase: true, sourceUrl: url, note: null }],
-  exclusions: ["fuel"], cardCaps: [], milestones: [], fees: [], notes: [],
+  exclusions: ["fuel"], cardCaps: [], milestones: [], fees: [], creditLagDays: null, notes: [],
 });
 
 // The stub claude. Markers in stdin choose its answer.
@@ -394,6 +394,149 @@ test("the shape checker is strict on types and lenient on vocabulary", () => {
   };
   walk(toJsonSchema(STATEMENT_SHAPE));
   walk(toJsonSchema(appJobs.TERMS_ANSWER_SHAPE));
+});
+
+// ── Contract with the iPhone app's rule models ───────────────────────────────
+// The app (CardRuleModels.swift) decodes the same CardRuleSet JSON the terms
+// job emits. check() alone cannot see drift: it ignores keys its shape does not
+// name and accepts any vocabulary string, so a field or value the hub cannot
+// express would pass. These helpers close both gaps, for the contract test
+// against the app's own catalog and for the fixture below.
+const Nullable = appJobs.nullable(null).constructor;
+const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+// The terms result is checked against this shape (the bridge stamps schemaVersion).
+const RULE_SET_CHECKED = appJobs.TERMS_RESULT_SHAPE.cards[0].ruleSet.shape;
+
+// The app decodes an absent key to a default, so its bundled catalog omits keys
+// where the hub's shape requires every key. Fill them as the app's decoder does
+// (value(_:or:) in CardRuleModels.swift), so check() sees what the app means.
+const APP_DEFAULTS = { priority: 0, isBase: false, countsTowardBase: true, perMerchant: false, gstOnFee: true };
+function withAppDefaults(shape, value) {
+  if (shape instanceof Nullable) return value === null ? null : withAppDefaults(shape.shape, value);
+  if (Array.isArray(shape)) return Array.isArray(value) ? value.map((v) => withAppDefaults(shape[0], v)) : value;
+  if (!isObject(shape) || !isObject(value)) return value;
+  const out = { ...value };
+  for (const [key, sub] of Object.entries(shape)) {
+    if (key in value) out[key] = withAppDefaults(sub, value[key]);
+    else if (key in APP_DEFAULTS) out[key] = APP_DEFAULTS[key];
+    else if (sub instanceof Nullable || (typeof sub === "string" && sub.endsWith("?"))) out[key] = null;
+    else if (Array.isArray(sub)) out[key] = [];
+    else if (isObject(sub)) out[key] = withAppDefaults(sub, {});
+  }
+  return out;
+}
+
+// Fields the shape has no name for and strings outside a vocabulary it lists.
+function drift(shape, value, at = "") {
+  if (shape instanceof Nullable) return value === null ? [] : drift(shape.shape, value, at);
+  if (Array.isArray(shape)) return Array.isArray(value) ? value.flatMap((v, i) => drift(shape[0], v, at + "[" + i + "]")) : [];
+  if (typeof shape === "string") {
+    const vocabulary = shape.replace(/\?$/, "").split("|");
+    return vocabulary.length > 1 && typeof value === "string" && !vocabulary.includes(value)
+      ? [at + ": " + JSON.stringify(value) + " is not in the hub's vocabulary"] : [];
+  }
+  if (!isObject(value)) return [];
+  const path = (k) => (at ? at + "." + k : k);
+  return Object.keys(value).flatMap((k) => (k in shape ? drift(shape[k], value[k], path(k)) : [path(k) + ": the hub's shape has no such field"]));
+}
+const contractProblems = (ruleSet) =>
+  [...appJobs.check(RULE_SET_CHECKED, withAppDefaults(RULE_SET_CHECKED, ruleSet)), ...drift(RULE_SET_CHECKED, ruleSet)];
+
+const APP_CATALOG = process.env.APP_CARD_CATALOG || path.join(os.homedir(),
+  ".cache/system-config/hub/wt-cards/Core/Sources/AdvikaCore/Resources/CardRulesCatalog.json");
+
+test("every rule set in the app's bundled catalog passes the hub's rule-set checker", (t) => {
+  if (!fs.existsSync(APP_CATALOG)) {
+    return t.skip("the iPhone app's CardRulesCatalog.json is not at " + APP_CATALOG + " (set APP_CARD_CATALOG to its path); " +
+      "this contract test runs only where the app checkout exists, so CI skips it");
+  }
+  const catalog = JSON.parse(fs.readFileSync(APP_CATALOG, "utf8"));
+  assert.ok(Array.isArray(catalog.ruleSets) && catalog.ruleSets.length > 0, "the catalog holds rule sets");
+  for (const rs of catalog.ruleSets) {
+    assert.deepEqual(contractProblems(rs), [], rs.productKey);
+    // Units: rate and reward.rate are fractions, Cap.percent and Fee.percent are percentages. check() cannot see a 25 where
+    // 0.25 is meant, but no real rate exceeds 1 and no real percentage is a tiny fraction.
+    const rates = [...rs.earn.map((e) => e.rate), ...(rs.milestones ?? []).flatMap((m) => [m.reward.rate, m.repeatReward?.rate])];
+    for (const r of rates.filter((v) => v != null)) assert.ok(r >= 0 && r <= 1, rs.productKey + ": rate " + r + " is not a fraction");
+    const percents = [...(rs.cardCaps ?? []), ...rs.earn.flatMap((e) => e.caps ?? []), ...(rs.fees ?? [])].map((x) => x.percent);
+    for (const p of percents.filter((v) => v != null)) assert.ok(p > 0 && p <= 100, rs.productKey + ": percent " + p + " is not a percentage");
+  }
+});
+
+// A rule set that uses every field beyond the original spec: points caps, a card-year cap, notes on
+// caps, milestones and fees, repeatReward, a rate-boost reward, an unknown period, a fee with no
+// stated rate, and creditLagDays. Synthetic.
+const NO_MATCH = { merchants: null, categories: null, channels: null, paidVia: null, international: null };
+const fixtureCap = (over) => ({ period: "cycle", kind: "absolute", amountINR: null, points: null, ruleId: null, multiple: null,
+  percent: null, perMerchant: false, note: null, sourceUrl: null, ...over });
+const fixtureReward = (over) => ({ kind: "points", valueINR: null, points: null, rate: null, note: null, ...over });
+const FIXTURE_RULE_SET = {
+  schemaVersion: 1, productKey: "fixture-points", issuer: "Example Bank", product: "Example Points Card", network: "rupay",
+  rewardCurrency: "points", pointValue: { cashINR: 0.5, bestINR: 1, note: null },
+  effectiveFrom: null, verifiedOn: null, status: "unverified", sources: [],
+  earn: [{ id: "base", label: "4 points per Rs 150", priority: 0, isBase: true, match: NO_MATCH,
+    rate: null, pointsPer: 4, perINR: 150, minTxnINR: null,
+    caps: [fixtureCap({ period: "card-year", points: 20000, note: "20,000 points a card year" })],
+    creditedTo: "points", countsTowardBase: true, sourceUrl: null, note: null }],
+  exclusions: [],
+  cardCaps: [fixtureCap({ points: 50000, note: "50,000 points per cycle" }), fixtureCap({ period: "unknown", kind: "unknown" })],
+  milestones: [
+    { id: "spend", label: "Spend milestone", period: "unknown", thresholdINR: 100000, repeatEveryINR: 50000, maxPerPeriod: 4,
+      reward: fixtureReward({ points: 2000 }), repeatReward: fixtureReward({ points: 1000, note: "per further step" }),
+      eligibleExcludes: [], sourceUrl: null, note: "Period not stated." },
+    { id: "boost", label: "Rate boost", period: "month", thresholdINR: 50000, repeatEveryINR: null, maxPerPeriod: null,
+      reward: fixtureReward({ kind: "rate-boost", rate: 0.03 }), repeatReward: null,
+      eligibleExcludes: ["fuel"], sourceUrl: null, note: null },
+  ],
+  fees: [{ id: "service-fee", label: "Service fee", match: NO_MATCH, percent: null, gstOnFee: true, minTxnINR: null,
+    monthlyThresholdINR: null, sourceUrl: null, note: "Rate not stated." }],
+  creditLagDays: 45, notes: [],
+};
+
+test("a rule set with the app's extra fields passes, and a wrong type in any of them does not", () => {
+  const { check, toJsonSchema } = appJobs;
+  const fixture = () => structuredClone(FIXTURE_RULE_SET);
+  const edit = (fn) => { const rs = fixture(); fn(rs); return check(RULE_SET_CHECKED, rs); };
+  assert.deepEqual(contractProblems(FIXTURE_RULE_SET), []);
+
+  // Every key stays required, null is how a fact is unknown.
+  assert.deepEqual(edit((rs) => delete rs.creditLagDays), ["creditLagDays: missing"]);
+  assert.deepEqual(edit((rs) => { rs.creditLagDays = null; }), []);
+  assert.deepEqual(edit((rs) => delete rs.cardCaps[0].points), ["cardCaps[0].points: missing"]);
+  assert.deepEqual(edit((rs) => delete rs.earn[0].caps[0].note), ["earn[0].caps[0].note: missing"]);
+  assert.deepEqual(edit((rs) => delete rs.milestones[0].repeatReward), ["milestones[0].repeatReward: missing"]);
+  assert.deepEqual(edit((rs) => delete rs.milestones[1].reward.rate), ["milestones[1].reward.rate: missing"]);
+  assert.deepEqual(edit((rs) => delete rs.milestones[0].note), ["milestones[0].note: missing"]);
+  assert.deepEqual(edit((rs) => delete rs.fees[0].note), ["fees[0].note: missing"]);
+
+  // Types are still checked.
+  assert.deepEqual(edit((rs) => { rs.creditLagDays = "45"; }), ["creditLagDays: expected integer, got string"]);
+  assert.deepEqual(edit((rs) => { rs.creditLagDays = 4.5; }), ["creditLagDays: expected integer, got number"]);
+  assert.deepEqual(edit((rs) => { rs.cardCaps[0].points = "50000"; }), ["cardCaps[0].points: expected number, got string"]);
+  assert.deepEqual(edit((rs) => { rs.milestones[0].repeatReward = "none"; }), ["milestones[0].repeatReward: expected object, got string"]);
+  assert.deepEqual(edit((rs) => { rs.milestones[1].reward.rate = "3%"; }), ["milestones[1].reward.rate: expected number, got string"]);
+  assert.deepEqual(edit((rs) => { rs.fees[0].percent = "1"; }), ["fees[0].percent: expected number, got string"]);
+  assert.deepEqual(edit((rs) => { rs.milestones[0].period = 3; }).length, 1);
+
+  // Vocabulary stays lenient: a string the hub has not heard of passes check() ...
+  assert.deepEqual(edit((rs) => { rs.milestones[0].period = "fortnight"; rs.cardCaps[0].period = "lifetime"; }), []);
+  // ... and the drift guard is what names it, along with a field the shape lacks.
+  const stray = fixture();
+  stray.milestones[0].period = "fortnight";
+  stray.cardCaps[0].bonus = 1;
+  assert.deepEqual(drift(RULE_SET_CHECKED, stray), [
+    "cardCaps[0].bonus: the hub's shape has no such field", `milestones[0].period: "fortnight" is not in the hub's vocabulary`]);
+
+  // The generated --json-schema offers the model the new fields and values.
+  const schema = JSON.parse(JSON.stringify(toJsonSchema(appJobs.TERMS_ANSWER_SHAPE)));
+  const rs = schema.properties.ruleSet.anyOf[0].properties;
+  assert.ok("creditLagDays" in rs);
+  assert.ok("points" in rs.cardCaps.items.properties && "note" in rs.cardCaps.items.properties);
+  const milestone = rs.milestones.items.properties;
+  assert.ok("repeatReward" in milestone && "note" in milestone && "rate" in milestone.reward.properties);
+  assert.ok(milestone.period.enum.includes("unknown") && milestone.period.enum.includes("month"));
+  assert.ok(rs.cardCaps.items.properties.period.enum.includes("card-year"));
+  assert.ok("note" in rs.fees.items.properties);
 });
 
 // ── Terms jobs ───────────────────────────────────────────────────────────────

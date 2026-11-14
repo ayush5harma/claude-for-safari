@@ -106,7 +106,20 @@ Conventions the shapes follow:
   percentages (1 = 1%). Points are `pointsPer` per `perINR` rupees.
 - `priority`: the higher number wins. The base rule is 0.
 - `Cap` carries a `sourceUrl` like the other rule parts, so every cap can be
-  cited.
+  cited. A cap limits rupees (`amountINR`) on a cashback rule and points
+  (`points`) on a points rule; the other is `null`.
+- Beyond the original spec, and matching the app's rule models: `Cap.points`
+  and `Cap.note`, `Milestone.repeatReward` (what each further
+  `repeatEveryINR` step pays, `null` when it pays the same as `reward`),
+  `Milestone.note`, `Milestone.reward.rate` (a rate-boost's total cashback rate,
+  a fraction), `Fee.note`, and `creditLagDays` (days after a cycle ends that
+  its reward is normally credited). A `Fee.percent` of `null` is a fee whose
+  rate the sources do not state. A cap or milestone `period` the sources do not
+  give is `unknown`.
+- The app's models and this shape must agree. `test/app-jobs.test.js` reads the
+  app's bundled `CardRulesCatalog.json` and fails if any rule set in it uses a
+  field or vocabulary string this shape lacks. It skips when the file is not
+  there (as in CI); set `APP_CARD_CATALOG` to point at it.
 - In a terms result, `sources` (how each URL was fetched, `direct` or `safari`,
   and why one failed), `checkedOn` and `cardKey` come from the bridge, not
   the model. A card whose sources could not be read at all is
