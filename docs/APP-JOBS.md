@@ -143,7 +143,9 @@ before they reach argv.
 If the answer does not match the schema, the job retries once. The errors are
 appended to stdin, and they name paths and types (`transactions[3].amount:
 expected number, got string`), never values. A CLI error, such as a lost
-login, is not retried; its message is the job's `error`.
+login, is not retried. In a statement job its message becomes the job's
+`error`. In a terms job it fails only that card, with the message in the
+card's `notes`, and the job still ends `done` with the other cards' results.
 
 ### Fetching terms sources
 
