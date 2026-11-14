@@ -96,6 +96,22 @@ check what your signed-in pack page actually shows.
 5. Panel gear > Hub URL (the `https://...` URL the deploy script printed) +
    the token.
 
+**Optional: companion app jobs.** A native companion app can run statement
+and card-terms extraction jobs on this hub. To allow it, set two more config
+vars:
+
+```sh
+heroku config:set BRIDGE_APP_TOKEN="$(openssl rand -hex 24)" \
+  BRIDGE_APP_FETCH_DOMAINS=<host>,<host> -a <app>
+heroku config:get BRIDGE_APP_TOKEN -a <app>   # read it out for the app
+```
+
+`BRIDGE_APP_FETCH_DOMAINS` lists the hosts that terms jobs may fetch from,
+exactly as each host appears in the URLs. The app token opens `/app/*` and
+nothing else, so give it to the app and never to the panel. Re-running the
+deploy script leaves both vars alone. For routes, limits and privacy rules,
+see [docs/APP-JOBS.md](docs/APP-JOBS.md).
+
 For this fleet, use the same Heroku URL and token on macOS, iPhone and iPad so
 the provider behavior is consistent. Everyone else can still leave the URL
 empty for the local Mac bridge, use the mesh route above, or deploy this hub to

@@ -9,9 +9,10 @@
 // app jobs on. Zero npm dependencies, like the bridge.
 //
 // WHY JOBS ARE ASYNCHRONOUS. Heroku's router drops a request that sends no
-// byte for 30 s, and one extraction takes longer than that (2.5 s for a
-// one-line synthetic statement on 2026-11-15, a minute or more for a real one),
-// so POST answers at once with a job id and the app polls GET.
+// byte for 30 s. Measured 2026-11-15 on sonnet: a synthetic ten-transaction
+// statement took 18 s and one card's terms (a single PDF) 23 s, so a real
+// statement or a several-card terms job runs past the cut. POST answers at
+// once with a job id and the app polls GET.
 //
 // WHAT NEVER HAPPENS TO STATEMENT TEXT: it is held in memory while its job
 // lives, handed to the child on stdin (argv is readable by every process on
