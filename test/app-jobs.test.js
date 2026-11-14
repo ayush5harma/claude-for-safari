@@ -39,7 +39,7 @@ const ruleSet = (url) => ({
   earn: [{ id: "base", label: "Base 1%", priority: 0, isBase: true,
     match: { merchants: null, categories: null, channels: null, paidVia: null, international: null },
     rate: 0.01, pointsPer: null, perINR: null, minTxnINR: null, caps: [], creditedTo: "statement",
-    countsTowardBase: true, sourceUrl: url, note: null }],
+    countsTowardBase: true, stacks: false, sourceUrl: url, note: null }],
   exclusions: ["fuel"], cardCaps: [], milestones: [], fees: [], creditLagDays: null, notes: [],
 });
 
@@ -455,7 +455,7 @@ const RULE_SET_CHECKED = appJobs.TERMS_RESULT_SHAPE.cards[0].ruleSet.shape;
 // The app decodes an absent key to a default, so its bundled catalog omits keys
 // where the hub's shape requires every key. Fill them as the app's decoder does
 // (value(_:or:) in CardRuleModels.swift), so check() sees what the app means.
-const APP_DEFAULTS = { priority: 0, isBase: false, countsTowardBase: true, perMerchant: false, gstOnFee: true };
+const APP_DEFAULTS = { priority: 0, isBase: false, countsTowardBase: true, stacks: false, perMerchant: false, gstOnFee: true };
 function withAppDefaults(shape, value) {
   if (shape instanceof Nullable) return value === null ? null : withAppDefaults(shape.shape, value);
   if (Array.isArray(shape)) return Array.isArray(value) ? value.map((v) => withAppDefaults(shape[0], v)) : value;
@@ -522,7 +522,7 @@ const FIXTURE_RULE_SET = {
   earn: [{ id: "base", label: "4 points per Rs 150", priority: 0, isBase: true, match: NO_MATCH,
     rate: null, pointsPer: 4, perINR: 150, minTxnINR: null,
     caps: [fixtureCap({ period: "card-year", points: 20000, note: "20,000 points a card year" })],
-    creditedTo: "points", countsTowardBase: true, sourceUrl: null, note: null }],
+    creditedTo: "points", countsTowardBase: true, stacks: false, sourceUrl: null, note: null }],
   exclusions: [],
   cardCaps: [fixtureCap({ points: 50000, note: "50,000 points per cycle" }), fixtureCap({ period: "unknown", kind: "unknown" })],
   milestones: [

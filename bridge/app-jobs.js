@@ -123,6 +123,9 @@ const RULE_SET_SHAPE = {
     id: "string", label: "string", priority: "integer", isBase: "boolean", match: MATCH,
     rate: "number?", pointsPer: "number?", perINR: "number?", minTxnINR: "number?", caps: [CAP],
     creditedTo: "statement|partner-wallet|amazon-pay-balance|points", countsTowardBase: "boolean",
+    // A stacking rule earns on top of the best non-stacking rule (e.g. a partner
+    // wallet value-back paid in addition to base cashback, which statements showed).
+    stacks: "boolean",
     sourceUrl: "string?", note: "string?",
   }],
   exclusions: [CATEGORY],
@@ -275,6 +278,8 @@ const TERMS_SYSTEM = [
   "A cap on cashback is in rupees (amountINR); a cap on points, on a points rule or card-wide, is in points (points, so " +
     "50,000 points per cycle = kind absolute, points 50000). Of the two, the one that does not apply is null.",
   "Exactly one earn rule has isBase true: the card's general rate. A category that earns nothing unless another rule matches is a rule with rate 0.",
+  "stacks is true only for a benefit paid IN ADDITION to the transaction's normal earn rule (for example a partner-wallet " +
+    "value-back on top of base cashback); every other rule has stacks false.",
   "priority decides which rule applies when several match a transaction, and the HIGHER number wins: the base rule is 0, " +
     "a rate-0 category rule ranks above it, and each specific merchant or channel rule ranks above the category rules it narrows.",
   "match.merchants holds lowercase merchant keys (amazon, swiggy, zomato, blinkit, airtel, ...), never display names.",
