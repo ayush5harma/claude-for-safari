@@ -28,7 +28,7 @@ const STATEMENT = {
   periodStart: "2026-10-01", periodEnd: "2026-10-31", statementDate: "2026-10-31", dueDate: "2026-11-20",
   totals: { openingBalance: 0, totalDue: 1500, minimumDue: 100, creditLimit: null, availableLimit: null, purchases: 1500, payments: 0 },
   transactions: [{ date: "2026-10-05", description: "EXAMPLE STORE", amount: 1500, direction: "debit", kind: "purchase",
-    channel: "online", merchantKey: "example", category: "shopping", international: false, currency: null, foreignAmount: null }],
+    channel: "online", merchantKey: "example", category: "shopping", paidVia: null, international: false, currency: null, foreignAmount: null }],
   rewardLines: [{ kind: "cashback", label: "Base 1%", amount: 15, unit: "INR" }],
   rewardSummary: null, notes: [],
 };
@@ -394,6 +394,51 @@ test("the shape checker is strict on types and lenient on vocabulary", () => {
   };
   walk(toJsonSchema(STATEMENT_SHAPE));
   walk(toJsonSchema(appJobs.TERMS_ANSWER_SHAPE));
+});
+
+// ── The statement prompt and schema carry the extraction rules ───────────────
+// The model is never called here. These pin the text that steers it, so a
+// later edit cannot silently drop a rule that an end-to-end run over real
+// statements showed was needed.
+const statementArg = (flag) => { const a = appJobs.statementArgs("sonnet"); return a[a.indexOf(flag) + 1]; };
+
+test("the statement schema has a nullable paidVia that accepts new vocabulary", () => {
+  const { check, STATEMENT_SHAPE } = appJobs;
+  const withVia = (paidVia) => ({ ...STATEMENT, transactions: [{ ...STATEMENT.transactions[0], paidVia }] });
+  for (const v of ["airtel-thanks", "amazon-pay", "smartbuy", "card-direct", "upi", null, "some-new-route"]) {
+    assert.deepEqual(check(STATEMENT_SHAPE, withVia(v)), [], String(v));
+  }
+  assert.deepEqual(check(STATEMENT_SHAPE, withVia(3)),
+    ["transactions[0].paidVia: expected one of airtel-thanks, amazon-pay, smartbuy, card-direct, upi, got number"]);
+  const { paidVia: _omitted, ...noVia } = STATEMENT.transactions[0];
+  assert.deepEqual(check(STATEMENT_SHAPE, { ...STATEMENT, transactions: [noVia] }), ["transactions[0].paidVia: missing"]);
+
+  const txn = JSON.parse(statementArg("--json-schema")).properties.transactions.items;
+  assert.ok(txn.required.includes("paidVia"), "paidVia is required like every key");
+  assert.deepEqual(txn.properties.paidVia.anyOf, [
+    { type: "string", enum: ["airtel-thanks", "amazon-pay", "smartbuy", "card-direct", "upi"] }, { type: "null" }]);
+});
+
+test("the statement prompt carries each extraction rule", () => {
+  const prompt = statementArg("--system-prompt");
+  const rules = {
+    "dates are filled only when printed, never derived": [/only when the statement prints it/, /Never derive any of them from the transaction dates/],
+    "balance totals are signed from the cardholder's side": [/signed from the cardholder's side/, /\(Cr, "credit balance", "NO PYMT REQD"\) is negative/],
+    "rewardLines are only what this statement earned or credited": [/only rewards earned or credited in this statement/,
+      /Opening, closing and available reward balances are not rewardLines.*only in rewardSummary/],
+    "a UPI row is never unknown and splits online / scan": [/UPI.*is never unknown/, /upi-online when the merchant is an online service or app/,
+      /otherwise upi-scan/],
+    "card rows are online, pos or contactless": [/card not present\) is online/, /card-present payment is pos/, /contactless only when the statement says so/],
+    "paidVia routes": [/airtel-thanks when/, /AIRTEL PAYMENTS BANK/, /amazon-pay for/, /smartbuy for HDFC SmartBuy/, /upi for a row paid by UPI/, /null otherwise/],
+    "Airtel Thanks rows are telecom unless a utility biller": [/category telecom, unless .*electricity, gas or water biller.*utilities/],
+    "merchant keys drop aggregator prefixes": [/"PTM\*ZOMATO", "ZOMATO LIMITED" and "ZOMATO"/, /"zomato"/, /swiggy, blinkit, amazon, apple and airtel/],
+  };
+  for (const [rule, patterns] of Object.entries(rules)) {
+    for (const re of patterns) assert.match(prompt, re, rule);
+  }
+  // The old, looser wording must not come back next to the new rules.
+  assert.doesNotMatch(prompt, /every reward line the statement prints/);
+  assert.doesNotMatch(prompt, /channel is unknown unless/);
 });
 
 // ── Contract with the iPhone app's rule models ───────────────────────────────

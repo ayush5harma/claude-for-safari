@@ -97,6 +97,41 @@ Both shapes are defined once in `app-jobs.js` (`STATEMENT_SHAPE`,
 `RULE_SET_SHAPE`, `TERMS_CARD_SHAPE`), and the same definitions generate the
 CLI's `--json-schema` and drive the bridge's own checker.
 
+Extraction rules for a StatementExtraction. They live in the fixed system
+prompt (`STATEMENT_SYSTEM`) and the schema, and `test/app-jobs.test.js` pins
+each one:
+
+- `periodStart`, `periodEnd`, `statementDate` and `dueDate` are filled only when
+  the statement prints them, and are never derived from transaction dates. A
+  statement with no printed billing period has `null` there.
+- The balance totals (`openingBalance`, `totalDue`, `minimumDue`) are signed
+  from the cardholder's side: an amount the cardholder owes is positive, and a
+  balance printed as credit (`Cr`, "credit balance", "NO PYMT REQD") is
+  negative. `purchases`, `payments`, `creditLimit` and `availableLimit` are
+  positive amounts as printed. A transaction's `amount` is always positive;
+  `direction` carries the sign.
+- `rewardLines` holds only rewards earned or credited in this statement
+  (cashback credited, points earned this period, value-back credited), each as
+  printed. Opening, closing and available balances go only in `rewardSummary`,
+  so a consumer can sum `rewardLines` without counting a balance twice.
+- `channel` for a UPI-paid row is never `unknown`: `upi-online` when the
+  merchant is an online service or app (food delivery, quick commerce,
+  e-commerce, subscriptions, travel booking, bill payments), otherwise
+  `upi-scan` (physical shops, restaurants, fuel stations, small merchants). A
+  card payment made on a website or app is `online`; a card-present payment is
+  `pos`, and `contactless` only when the statement says so.
+- `paidVia` (nullable, one per transaction) is the route a payment took:
+  `airtel-thanks` (the description shows Airtel Thanks or Airtel Payments Bank),
+  `amazon-pay` (a bill or partner payment through Amazon Pay), `smartbuy` (HDFC
+  SmartBuy), `upi` (a UPI-paid row), else `null`. `card-direct` is in the
+  vocabulary but the prompt does not ask for it. Like the other vocabularies the
+  checker accepts a string it does not know. A row paid through Airtel Thanks
+  has category `telecom`, unless its description clearly names an electricity,
+  gas or water biller (`utilities`).
+- `merchantKey` drops payment-aggregator prefixes and legal suffixes, so
+  `PTM*ZOMATO`, `ZOMATO LIMITED` and `ZOMATO` all give `zomato` (likewise
+  swiggy, blinkit, amazon, apple, airtel).
+
 Conventions the shapes follow:
 
 - Every key is present. A fact the source does not state is `null`, never 0.
