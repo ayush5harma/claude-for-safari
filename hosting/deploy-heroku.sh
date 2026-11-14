@@ -18,7 +18,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE_SRC="$HERE/../bridge/claude-safari-bridge.js"
-[ -f "$BRIDGE_SRC" ] || { echo "ERROR: bridge source not found" >&2; exit 1; }
+# The /app/* jobs live beside the bridge; the bridge requires this file only
+# when BRIDGE_APP_TOKEN is set, and fails to start without it then.
+APP_JOBS_SRC="$HERE/../bridge/app-jobs.js"
+[ -f "$BRIDGE_SRC" ] && [ -f "$APP_JOBS_SRC" ] || { echo "ERROR: bridge source not found" >&2; exit 1; }
 command -v heroku >/dev/null 2>&1 || { echo "ERROR: heroku CLI not installed" >&2; exit 1; }
 
 # The Heroku CLI writes a git credential helper into the GLOBAL git config on
@@ -79,6 +82,7 @@ echo "config vars asserted"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"; rm -f "$GIT_CONFIG_GLOBAL"' EXIT
 cp "$BRIDGE_SRC" "$STAGE/claude-safari-bridge.js"
+cp "$APP_JOBS_SRC" "$STAGE/app-jobs.js"
 cp "$HERE/heroku/package.json" "$HERE/heroku/Procfile" "$STAGE/"
 git -C "$STAGE" init -q
 git -C "$STAGE" -c user.email=bridge@local -c user.name=bridge add -A
