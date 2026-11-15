@@ -898,6 +898,7 @@ function createAppJobs(opts = {}) {
   const queue = [];
   let running = 0;
   let termsRunning = 0;
+  let closing = false;
   let cli = { state: opts.cliProbe === false ? "skipped" : "checking", version: null, missing: [], error: null };
   const cliReady = () => cli.state === "ok" || cli.state === "skipped";
 
@@ -1104,6 +1105,7 @@ function createAppJobs(opts = {}) {
   }
 
   function submit(body) {
+    if (closing) return { status: 503, body: { error: "the hub is stopping" } };
     if (cli.state === "unusable") return { status: 503, body: { error: cli.error } };
     const parsed = parseJobRequest(body, allow, cfg.defaultModel);
     if (parsed.error) return { status: parsed.status, body: { error: parsed.error } };
@@ -1164,11 +1166,19 @@ function createAppJobs(opts = {}) {
   }
 
   // For a hub that is stopping: the jobs' own finally blocks will not run once
-  // the process exits, so the temp dirs go here, synchronously.
+  // the process exits, so the temp dirs go here, synchronously. The Safari
+  // tabs are blanked too, which needs the extension's answer: the promise
+  // settles when every release has been answered or has failed, and the caller
+  // bounds the wait (a stuck extension must not keep the hub up). No job is
+  // accepted after the call.
   function close() {
+    closing = true;
     const dirs = [...jobs.values()].map((j) => j.dir).filter(Boolean);
+    const sessions = [...jobs.values()].map((j) => j.safari).filter(Boolean);
+    for (const j of jobs.values()) j.safari = null;   // the job's finally must not release it again
     for (const id of [...jobs.keys()]) remove(id);
     for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+    return Promise.all(sessions.map((x) => Promise.resolve().then(() => x.release()).catch(() => {}))).then(() => {});
   }
 
   if (cli.state === "checking") {

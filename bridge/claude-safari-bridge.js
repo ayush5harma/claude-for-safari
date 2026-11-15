@@ -1070,10 +1070,17 @@ function runHub() {
     } catch (e) {
       refuse(e.message);
     }
-    // Kill the children and remove their temp dirs on the way down, then die
-    // by the same signal so a supervisor sees what it sent.
+    // Kill the children, remove their temp dirs and blank the jobs' Safari
+    // tabs on the way down, then die by the same signal so a supervisor sees
+    // what it sent. The tabs need the extension's answer, so the exit waits
+    // for it, at most APP_CLOSE_WAIT_MS; once() hands a second signal back to
+    // the default action, which ends the wait at once.
+    const APP_CLOSE_WAIT_MS = 2000;
     for (const sig of ["SIGTERM", "SIGINT"]) {
-      process.once(sig, () => { appJobs.close(); process.kill(process.pid, sig); });
+      process.once(sig, () => {
+        const bound = new Promise((r) => setTimeout(r, APP_CLOSE_WAIT_MS).unref());
+        Promise.race([appJobs.close(), bound]).finally(() => process.kill(process.pid, sig));
+      });
     }
   }
   // App responses carry statement-derived data: no cache may keep them.

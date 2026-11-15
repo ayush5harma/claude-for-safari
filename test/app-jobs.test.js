@@ -894,6 +894,25 @@ test("a tab the owner is looking at when the job ends is not blanked", async (t)
   assert.deepEqual(ext.navigations().map((n) => n.url), [src.url("/spa.html")], "no about:blank went to the owner's tab");
 });
 
+test("SIGTERM to the hub blanks a running job's tab before it exits", async (t) => {
+  if (!tls) return t.skip("openssl is not available to mint a test certificate");
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin,
+    BRIDGE_APP_FETCH_DOMAINS: src.host, NODE_EXTRA_CA_CERTS: tls.certFile, BRIDGE_APP_SAFARI_FALLBACK: "1" });
+  // A page that never gets enough text: the job is in its read loop.
+  const ext = fakeExtension(hub, (url) => ({ url, title: null, text: "Loading..." }));
+  t.after(async () => { ext.stop(); await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  await ext.polling();
+  const r = await post(hub.base, { type: "terms-extract", input: { cards: [
+    { cardKey: "spa-card", issuer: "Example Bank", product: "Example Card", sources: [src.url("/spa.html")] }] } });
+  assert.equal(r.status, 202);
+  await until(() => ext.served.some((c) => c.tool === "read"));
+  hub.proc.kill("SIGTERM");
+  const { signal } = await hub.exited;
+  assert.equal(signal, "SIGTERM", "the hub still dies by the signal it was sent");
+  assert.deepEqual(ext.navigations().filter((n) => n.url === "about:blank").map((n) => n.tabId), [7], "the tab was blanked once");
+});
+
 test("DELETE during the Safari phase frees the slot at once and blanks the tab", async (t) => {
   if (!tls) return t.skip("openssl is not available to mint a test certificate");
   const stub = makeStub();
@@ -1059,6 +1078,27 @@ const fails = (kind, status = null) => async (url) => { throw new appJobs.FetchE
 const termsJob = (cards) => ({ type: "terms-extract", input: { cards: cards.map(([cardKey, sources]) => ({ cardKey,
   issuer: "Example Bank", product: "Example Card", sources: sources.map((p) => "https://terms.example" + p) })) } });
 const doneJob = (jobs, id, ms) => until(() => { const j = jobs.get(id); return j && (j.status === "done" || j.status === "failed") ? j : null; }, ms);
+
+test("close() releases a running job's Safari tab once, waits for the answer, and refuses new jobs", async (t) => {
+  const stub = makeStub();
+  const safari = fakeSafari(() => new Promise(() => {}));   // a read that never answers
+  let answered = false;
+  const driver = { ...safari.driver, session: () => {
+    const s = safari.driver.session();
+    return { ...s, release: async () => { await sleep(100); answered = true; return s.release(); } };
+  } };
+  const jobs = inProcess(stub, { safari: driver, fetchSource: fails("no-text") });
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const id = jobs.submit(termsJob([["card-one", ["/a"]]])).body.jobId;
+  assert.ok(await until(() => safari.sessions[0] && safari.sessions[0].reads.length), "the job is reading through Safari");
+  await jobs.close();
+  assert.equal(answered, true, "close() waited for the release to be answered");
+  assert.equal(safari.sessions[0].released, 1);
+  await sleep(100);
+  assert.equal(safari.sessions[0].released, 1, "the job's own finally does not release it a second time");
+  assert.equal(jobs.get(id), null);
+  assert.deepEqual(jobs.submit(termsJob([["card-two", ["/b"]]])), { status: 503, body: { error: "the hub is stopping" } });
+});
 
 test("the fallback runs only for browser-fixable failures, through one session per job, within its page caps", async (t) => {
   const stub = makeStub();

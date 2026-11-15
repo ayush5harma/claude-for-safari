@@ -269,7 +269,9 @@ the bridge lists the open tabs. If the owner has switched to the job's tab
 (it is now the one its window shows) or closed it, the bridge does not touch
 it: the next source opens a fresh background tab, and the blanking is skipped,
 so a page the owner is reading never changes under them. A tab abandoned this
-way is the owner's to close.
+way is the owner's to close. Stopping the hub with SIGTERM or SIGINT blanks
+each running job's tab first and waits up to 2 s for the extension to answer;
+a second signal ends the wait at once.
 
 The fallback helps for bot walls and pages that render only with JavaScript.
 It does not help for a PDF, because Safari's PDF viewer has no page text to
