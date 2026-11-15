@@ -113,7 +113,10 @@ optional: `BRIDGE_APP_SAFARI_FALLBACK=1` lets a terms job read a page the hub
 could not fetch through a background tab of the owner's Safari (off by
 default, because it gives the app token a capped reach into the browser),
 and `BRIDGE_APP_TIME_ZONE` (default `Asia/Kolkata`) is the zone a job's
-"today" is computed in, since a Heroku dyno runs in UTC. Re-running the
+"today" is computed in, since a Heroku dyno runs in UTC. The dyno installs
+the Claude CLI at `latest`; with app jobs on, the hub checks at startup that
+the flags its jobs use are still there, and `GET /app/health` shows the CLI
+version and the result. Re-running the
 deploy script leaves both vars alone. For routes, limits and privacy rules,
 see [docs/APP-JOBS.md](docs/APP-JOBS.md).
 

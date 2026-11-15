@@ -440,6 +440,32 @@ function readRun(r, seconds) {
   return { value };
 }
 
+// THE CLI PROBE. Every job's argv relies on these flags (measured above), and
+// Heroku installs @anthropic-ai/claude-code at "latest", so a release that
+// renames or drops one would turn every job into an opaque cli-exit failure.
+// `claude --help` is read once at startup instead; until it answers, jobs
+// queue, and if a flag is missing they fail with a message that names it and
+// POST /app/jobs answers 503 until the hub restarts on a fixed CLI.
+const REQUIRED_FLAGS = ["--restricted", "--tools", "--json-schema", "--no-session-persistence"];
+const PROBE_TIMEOUT_MS = 30000;
+
+async function probeCli(bin, env, cwd) {
+  const run = (args) => runChild({ bin, args, stdin: "", cwd, env, timeoutMs: PROBE_TIMEOUT_MS, onChild: () => {} });
+  const unusable = (error, version = null, missing = []) => ({ state: "unusable", version, missing, error });
+  const help = await run(["--help"]);
+  if (help.spawnError) return unusable("could not start the claude CLI (" + help.spawnError + "); app jobs are off");
+  if (help.timedOut) return unusable("`claude --help` did not answer within " + PROBE_TIMEOUT_MS / 1000 + " s; app jobs are off");
+  if (help.code !== 0) return unusable("`claude --help` exited with code " + help.code + "; app jobs are off");
+  const v = await run(["--version"]);
+  const version = (!v.spawnError && v.code === 0 && v.stdout.trim().split("\n")[0].slice(0, 100)) || null;
+  const missing = REQUIRED_FLAGS.filter((f) => !new RegExp("(^|\\s)" + f + "(?![\\w-])", "m").test(help.stdout));
+  if (missing.length) {
+    return unusable("the claude CLI" + (version ? " " + version : "") + " has no " + missing.join(", ") +
+      ", which app jobs rely on; app jobs are off until @anthropic-ai/claude-code is updated and the hub restarts", version, missing);
+  }
+  return { state: "ok", version, missing: [], error: null };
+}
+
 const retrySuffix = (errors) => "\n\nYour previous answer did not match the schema. Fix these and answer again with the complete object:\n" +
   errors.map((e) => "- " + e).join("\n") + "\n";
 
@@ -818,6 +844,7 @@ const secs = (ms) => (ms / 1000).toFixed(1) + "s";
 
 // opts: claudeBin (path or function), env (the child's base environment),
 // fetchDomains (string or Set), log (one line), fetchSource (tests), tmpRoot,
+// cliProbe (false skips the startup probe; in-process tests only),
 // any DEFAULTS key, and safari, the fallback's driver or null (off):
 //   available()  is an extension instance polling the hub
 //   session()    one background tab for one job, opened on its first read:
@@ -839,6 +866,8 @@ function createAppJobs(opts = {}) {
   const queue = [];
   let running = 0;
   let termsRunning = 0;
+  let cli = { state: opts.cliProbe === false ? "skipped" : "checking", version: null, missing: [], error: null };
+  const cliReady = () => cli.state === "ok" || cli.state === "skipped";
 
   const say = (job, event, extra = "") => log("app-job " + job.id + " " + job.type + " " + event + (extra ? " " + extra : ""));
 
@@ -1013,6 +1042,7 @@ function createAppJobs(opts = {}) {
   // First come, first served, except that a terms job waits while another
   // runs and the jobs behind it may go first.
   function pump() {
+    if (!cliReady()) return;
     for (let i = 0; i < queue.length && running < cfg.maxRunning;) {
       const job = queue[i];
       const terms = job.type === "terms-extract";
@@ -1028,7 +1058,21 @@ function createAppJobs(opts = {}) {
     }
   }
 
+  // Jobs that queued while the probe ran, when it finds the CLI unusable.
+  function failQueued() {
+    for (const job of queue.splice(0)) {
+      job.status = "failed";
+      job.error = cli.error;
+      job.input = null;
+      job.finishedAt = Date.now();
+      say(job, "failed", "reason=cli-unusable");
+      job.purgeTimer = setTimeout(() => jobs.delete(job.id), cfg.purgeMs);
+      job.purgeTimer.unref();
+    }
+  }
+
   function submit(body) {
+    if (cli.state === "unusable") return { status: 503, body: { error: cli.error } };
     const parsed = parseJobRequest(body, allow, cfg.defaultModel);
     if (parsed.error) return { status: parsed.status, body: { error: parsed.error } };
     if (queue.length >= cfg.maxQueued) {
@@ -1076,7 +1120,9 @@ function createAppJobs(opts = {}) {
   }
 
   function health() {
-    return { ok: true, types: TYPES, defaultModel: cfg.defaultModel, fetchDomains: [...allow], safariFallback: !!safari,
+    return { ok: cli.state !== "unusable", error: cli.error,
+      cli: { state: cli.state, version: cli.version, missing: [...cli.missing] },
+      types: TYPES, defaultModel: cfg.defaultModel, fetchDomains: [...allow], safariFallback: !!safari,
       timeZone: cfg.timeZone,
       running, queued: queue.length,
       limits: { maxRunning: cfg.maxRunning, maxTermsRunning: cfg.maxTermsRunning, maxQueued: cfg.maxQueued, statementTimeoutS: cfg.statementTimeoutMs / 1000,
@@ -1091,6 +1137,16 @@ function createAppJobs(opts = {}) {
     const dirs = [...jobs.values()].map((j) => j.dir).filter(Boolean);
     for (const id of [...jobs.keys()]) remove(id);
     for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+  }
+
+  if (cli.state === "checking") {
+    probeCli(bin(), env, tmpRoot)
+      .catch((e) => ({ state: "unusable", version: null, missing: [], error: "the CLI probe failed (" + e.message + ")" }))
+      .then((r) => {
+        cli = r;
+        log("app-jobs: claude CLI " + (r.version || "(version unknown)") + ": " + (r.state === "ok" ? "every flag app jobs use is there" : r.error));
+        if (r.state === "ok") pump(); else failQueued();
+      });
   }
 
   return { submit, get, remove, health, close, stats: () => ({ running, queued: queue.length, jobs: jobs.size }) };

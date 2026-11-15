@@ -46,12 +46,16 @@ the app needs them in its own environment.
 ## Routes
 
 `GET /app/health` is the app's "test connection". It returns
-`{ ok, types, defaultModel, fetchDomains, safariFallback, timeZone, running, queued, limits }`.
+`{ ok, error, cli, types, defaultModel, fetchDomains, safariFallback, timeZone, running, queued, limits }`.
+`cli` is `{ state, version, missing }`: what the startup probe of the Claude
+CLI found (see [How a job runs](#how-a-job-runs)). `state` is `checking`, `ok`
+or `unusable`; when it is `unusable`, `ok` is false and `error` says why.
 `safariFallback` is true when `BRIDGE_APP_SAFARI_FALLBACK=1`.
 
 `POST /app/jobs` returns `202 {"jobId": "<uuid>", "status": "queued"|"running"}`.
 Validation failures return 400 with an `error` string. An oversized body or
-text returns 413, and a full queue returns 429.
+text returns 413, a full queue returns 429, and a hub whose Claude CLI failed
+the startup probe returns 503 with the probe's error.
 
 A statement job:
 
@@ -184,6 +188,15 @@ claude -p --output-format json --model <model> --restricted
        --strict-mcp-config --mcp-config '{"mcpServers":{}}'
        --no-session-persistence --permission-mode dontAsk
 ```
+
+At startup the hub runs `claude --help` and `claude --version` once and checks
+that `--restricted`, `--tools`, `--json-schema` and `--no-session-persistence`
+are all there. Heroku installs `@anthropic-ai/claude-code` at `latest`, so a
+release that drops or renames one would otherwise fail every job with an
+unexplained CLI exit. Jobs submitted while the probe runs (it took 0.2 s with
+Claude Code 2.1.322) wait in the queue. If a flag is missing, the queued jobs
+fail and every later `POST /app/jobs` gets 503, each with an error that names
+the missing flags, until the CLI is updated and the hub restarts.
 
 The prompt goes on stdin and never in argv. With `--restricted`, the CLI
 ignores user, project and local settings files, so no host hook sees the

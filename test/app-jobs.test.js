@@ -50,10 +50,19 @@ const STUB = `#!/usr/bin/env node
 const fs = require("fs"), path = require("path");
 const STATEMENT = ${JSON.stringify(STATEMENT)};
 const ruleSet = ${ruleSet.toString()};
+// The hub's startup probe. STUB_HELP_OMITS (comma-separated) plays an older CLI.
+const probe = process.argv.includes("--version") ? "version" : process.argv.includes("--help") ? "help" : null;
+if (probe === "version") process.stdout.write("9.9.9 (Claude Code stub)\\n");
+if (probe === "help") {
+  const omit = String(process.env.STUB_HELP_OMITS || "").split(",");
+  const flags = ["--restricted", "--tools <tools...>", "--json-schema <schema>", "--no-session-persistence", "--tools-extra"];
+  process.stdout.write("Usage: claude [options]\\n\\nOptions:\\n" +
+    flags.filter((f) => !omit.includes(f.split(" ")[0])).map((f) => "  " + f + "    some help\\n").join(""));
+}
 let stdin = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (c) => (stdin += c));
-process.stdin.on("end", () => {
+if (!probe) process.stdin.setEncoding("utf8");
+if (!probe) process.stdin.on("data", (c) => (stdin += c));
+if (!probe) process.stdin.on("end", () => {
   const argv = process.argv.slice(2);
   const cwd = process.cwd();
   const files = {};
@@ -110,10 +119,14 @@ const freePort = () => new Promise((resolve) => {
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 // One hub on a spare port with HOME in a scratch dir; resolves once it answers.
+// A hub with app jobs probes its CLI at startup, so every hub gets the stub
+// unless the test names its own: no test runs the host's real claude.
+let defaultStub = null;
 async function startHub(env, { expectExit = false } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-safari-appjobs-home-"));
   const port = await freePort();
-  const childEnv = { ...process.env, HOME: home, BRIDGE_PORT: String(port), BRIDGE_BIND: "127.0.0.1", ...env };
+  defaultStub = defaultStub || makeStub();
+  const childEnv = { ...process.env, HOME: home, BRIDGE_PORT: String(port), BRIDGE_BIND: "127.0.0.1", CLAUDE_BIN: defaultStub.bin, ...env };
   for (const k of Object.keys(childEnv)) if (childEnv[k] === undefined) delete childEnv[k];
   const proc = spawn(process.execPath, [BRIDGE, "--serve"], { env: childEnv, stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
@@ -205,6 +218,7 @@ before(async () => {
 });
 
 after(() => {
+  if (defaultStub) fs.rmSync(defaultStub.dir, { recursive: true, force: true });
   if (src) { src.server.closeAllConnections(); src.server.close(); }
   if (tls) fs.rmSync(tls.dir, { recursive: true, force: true });
 });
@@ -244,6 +258,8 @@ test("token separation both ways, and native clients only", async (t) => {
   assert.equal(h.defaultModel, "sonnet");
   assert.equal(h.limits.maxRunning, 2);
   assert.equal(h.limits.maxQueued, 20);
+  assert.equal(h.error, null);
+  assert.ok(["checking", "ok"].includes(h.cli.state), JSON.stringify(h.cli));
   // BRIDGE_TOKEN, no token, and a wrong token are all refused on /app/*.
   assert.equal((await fetch(hub.base + "/app/health", { headers: bridge })).status, 401);
   assert.equal((await fetch(hub.base + "/app/health")).status, 401);
@@ -924,7 +940,7 @@ test("a terms result links only to the card's requested sources", async (t) => {
 
 // ── Lifecycle, in process ────────────────────────────────────────────────────
 const inProcess = (stub, extra = {}) => appJobs.createAppJobs({
-  claudeBin: stub.bin, env: { PATH: process.env.PATH, HOME: os.homedir(), BRIDGE_TOKEN: "x", BRIDGE_APP_TOKEN: "y" },
+  claudeBin: stub.bin, env: { PATH: process.env.PATH, HOME: os.homedir(), BRIDGE_TOKEN: "x", BRIDGE_APP_TOKEN: "y" }, cliProbe: false,
   fetchDomains: "terms.example", log: () => {},
   fetchSource: async (url) => ({ url, ext: ".pdf", data: PDF, title: null }), ...extra });
 async function until(fn, ms = 5000) {
@@ -1122,6 +1138,60 @@ test("a statement job that outlives its timeout fails and its child is killed", 
   assert.ok(job, "failed");
   assert.equal(job.error, "timed out after 0.4 s");
   assert.ok(await until(() => !alive(stub.calls()[0].pid)));
+});
+
+test("the hub probes its claude CLI's flags at startup and reports the version", async (t) => {
+  const stub = makeStub();
+  t.after(() => fs.rmSync(stub.dir, { recursive: true, force: true }));
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin });
+  t.after(hub.stop);
+  const health = async (h) => (await fetch(h.base + "/app/health", { headers: appHeaders })).json();
+  let h = await health(hub);
+  for (let i = 0; i < 100 && h.cli.state === "checking"; i++) { await sleep(30); h = await health(hub); }
+  assert.deepEqual({ ok: h.ok, error: h.error, cli: h.cli },
+    { ok: true, error: null, cli: { state: "ok", version: "9.9.9 (Claude Code stub)", missing: [] } });
+  assert.match(hub.stderr(), /app-jobs: claude CLI 9\.9\.9 \(Claude Code stub\): every flag app jobs use is there/);
+  assert.equal(stub.calls().length, 0, "the probe is not a job");
+
+  // An older CLI without --json-schema and --restricted: jobs stay off, and say why.
+  const old = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin, STUB_HELP_OMITS: "--json-schema,--restricted" });
+  t.after(old.stop);
+  h = await health(old);
+  for (let i = 0; i < 100 && h.cli.state === "checking"; i++) { await sleep(30); h = await health(old); }
+  assert.equal(h.ok, false);
+  assert.deepEqual(h.cli, { state: "unusable", version: "9.9.9 (Claude Code stub)", missing: ["--restricted", "--json-schema"] });
+  assert.match(h.error, /has no --restricted, --json-schema, which app jobs rely on; app jobs are off/);
+  const r = await post(old.base, statementBody("x"));
+  assert.equal(r.status, 503);
+  assert.match((await r.json()).error, /has no --restricted, --json-schema/);
+  assert.equal(stub.calls().length, 0);
+});
+
+test("jobs queued while the probe runs start once it passes, or fail with its error", async (t) => {
+  const stub = makeStub();
+  t.after(() => fs.rmSync(stub.dir, { recursive: true, force: true }));
+  const make = (env) => appJobs.createAppJobs({ claudeBin: stub.bin, env: { PATH: process.env.PATH, HOME: os.homedir(), ...env }, log: () => {} });
+  const good = make({});
+  t.after(() => good.close());
+  const id = good.submit(statementBody("queued during the probe")).body.jobId;
+  assert.equal(good.get(id).status, "queued");
+  assert.ok(await until(() => good.get(id).status === "done"), "ran once the probe passed");
+  const bad = make({ STUB_HELP_OMITS: "--no-session-persistence" });
+  t.after(() => bad.close());
+  const id2 = bad.submit(statementBody("queued during the probe")).body.jobId;
+  const failed = await until(() => { const j = bad.get(id2); return j.status === "failed" ? j : null; });
+  assert.match(failed.error, /has no --no-session-persistence/);
+  assert.equal(bad.submit(statementBody("after")).status, 503);
+  // A flag that only prefixes another (--tools-extra) does not count as --tools.
+  const prefix = make({ STUB_HELP_OMITS: "--tools" });
+  t.after(() => prefix.close());
+  assert.ok(await until(() => prefix.health().cli.state === "unusable"));
+  assert.deepEqual(prefix.health().cli.missing, ["--tools"]);
+  const gone = appJobs.createAppJobs({ claudeBin: path.join(stub.dir, "no-such-claude"), log: () => {} });
+  t.after(() => gone.close());
+  assert.ok(await until(() => gone.health().cli.state === "unusable"));
+  assert.match(gone.health().error, /could not start the claude CLI \(ENOENT\)/);
+  assert.equal(stub.calls().filter((c) => c.stdin.includes("queued during the probe")).length, 1, "only the good hub's job ran");
 });
 
 test("today is computed in BRIDGE_APP_TIME_ZONE, not the host's zone", async () => {
