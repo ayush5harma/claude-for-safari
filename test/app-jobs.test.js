@@ -423,6 +423,7 @@ test("the statement prompt carries each extraction rule", () => {
   const prompt = statementArg("--system-prompt");
   const rules = {
     "dates are filled only when printed, never derived": [/only when the statement prints it/, /Never derive any of them from the transaction dates/],
+    "every printed row is returned, none skipped": [/EVERY transaction row the statement prints/, /never skip, merge, sample or summarise rows/],
     "balance totals are signed from the cardholder's side": [/signed from the cardholder's side/, /\(Cr, "credit balance", "NO PYMT REQD"\) is negative/],
     "rewardLines are only what this statement earned or credited": [/only rewards earned or credited in this statement/,
       /Opening, closing and available reward balances are not rewardLines.*only in rewardSummary/],

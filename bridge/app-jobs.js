@@ -244,6 +244,11 @@ const STATEMENT_SYSTEM = [
   "Card numbers and personal details are already masked. Keep them masked and never try to restore them.",
   "Dates are YYYY-MM-DD. A transaction's amount is a positive number in rupees; direction says debit (spent or charged) or credit (payment, refund, cashback, reversal).",
   "Payments made to the card are kind payment with direction credit.",
+  // Measured 2026-11-15: one run on a 125-row annual statement returned 107 rows (two
+  // blocks of 9 consecutive rows missing) while two re-runs returned all 125. Annual
+  // statements print no totals, so nothing downstream could catch the omission.
+  "transactions holds EVERY transaction row the statement prints, in the printed order, across every page: " +
+    "never skip, merge, sample or summarise rows, however many there are.",
   "periodStart, periodEnd, statementDate and dueDate: fill each one only when the statement prints it. " +
     "Never derive any of them from the transaction dates (not the first or last transaction, not the month); a date the statement does not print is null.",
   "The balance totals (openingBalance, totalDue, minimumDue) are signed from the cardholder's side: an amount the cardholder owes is positive, " +
