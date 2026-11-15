@@ -16,6 +16,7 @@ const https = require("node:https");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
+const zlib = require("node:zlib");
 
 const BRIDGE = path.join(__dirname, "..", "bridge", "claude-safari-bridge.js");
 const appJobs = require(path.join(__dirname, "..", "bridge", "app-jobs.js"));
@@ -137,6 +138,7 @@ const PAGE_TEXT = "Cashback terms for the Example Card. ".repeat(12);
 let tls = null;          // { dir, key, cert, certFile }
 let src = null;          // { server, port, host, url(p) }
 const PDF = Buffer.from("%PDF-1.4\n% synthetic terms document for tests\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n");
+const BOMB = zlib.gzipSync(Buffer.alloc(64 * 1024 * 1024));
 
 before(async () => {
   try {
@@ -174,6 +176,16 @@ before(async () => {
     }
     if (u === "/slow") { res.writeHead(200, { "content-type": "text/plain" }); res.write("partial"); return; }
     if (u === "/json") { res.writeHead(200, { "content-type": "application/json" }); return res.end("{}"); }
+    if (u === "/forbidden") { res.writeHead(403, { "content-type": "text/html" }); return res.end("<p>bot wall</p>"); }
+    if (u === "/reset") return req.socket.destroy();
+    if (u === "/redirect-http") { res.writeHead(302, { location: "http://" + req.headers.host + "/tc.pdf" }); return res.end(); }
+    if (u === "/redirect-creds") { res.writeHead(302, { location: "https://user:pw@" + req.headers.host + "/tc.pdf" }); return res.end(); }
+    const page = "<html><head><title>Packed</title></head><body><p>" + PAGE_TEXT + "</p></body></html>";
+    if (u === "/gz") { res.writeHead(200, { "content-type": "text/html", "content-encoding": "gzip" }); return res.end(zlib.gzipSync(page)); }
+    if (u === "/br") { res.writeHead(200, { "content-type": "text/html", "content-encoding": "br" }); return res.end(zlib.brotliCompressSync(page)); }
+    if (u === "/deflate") { res.writeHead(200, { "content-type": "text/html", "content-encoding": "deflate" }); return res.end(zlib.deflateSync(page)); }
+    // 64 MB of zeros, about 64 KB on the wire: the decoded cap must stop it.
+    if (u === "/bomb") { res.writeHead(200, { "content-type": "text/plain", "content-encoding": "gzip" }); return res.end(BOMB); }
     res.writeHead(503, { "content-type": "text/plain" });
     res.end("unavailable");
   });
@@ -651,9 +663,10 @@ test("a terms job fetches allowlisted sources into a per-card temp dir, runs Rea
   assert.equal(dead.status, "failed");
   assert.equal(dead.ruleSet, null);
   assert.deepEqual(dead.notes, ["none of the sources could be read"]);
-  assert.match(dead.sources[0].note, /HTTP 503/);
-  assert.match(dead.sources[1].note, /redirected to host not-allowed\.example is not on BRIDGE_APP_FETCH_DOMAINS/);
-  assert.match(dead.sources[1].note, /no Safari extension is polling/);
+  // A 503 is a failure a browser might get past, but the fallback is off by default.
+  assert.equal(dead.sources[0].note, "direct fetch failed (HTTP 503); the Safari fallback is off on this hub");
+  // A refused redirect is never handed to Safari, on or off.
+  assert.equal(dead.sources[1].note, "direct fetch failed (redirected to host not-allowed.example is not on BRIDGE_APP_FETCH_DOMAINS)");
 
   const calls = stub.calls();
   assert.equal(calls.length, 1, "a card with nothing read never reaches the CLI");
@@ -675,15 +688,13 @@ test("a terms job fetches allowlisted sources into a per-card temp dir, runs Rea
   assert.ok(!fs.existsSync(call.cwd), "the temp dir is gone");
 });
 
-test("a source the hub cannot fetch is read through a background Safari tab when an extension polls", async (t) => {
-  if (!tls) return t.skip("openssl is not available to mint a test certificate");
-  const stub = makeStub();
-  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin,
-    BRIDGE_APP_FETCH_DOMAINS: src.host, NODE_EXTRA_CA_CERTS: tls.certFile });
+// A fake extension instance: long-polls the hub with BRIDGE_TOKEN, records
+// every call it is handed, and answers navigate and read for tab 7, whose
+// page is whatever it was last navigated to. read(url) supplies the page.
+function fakeExtension(hub, read) {
   const ctl = new AbortController();
-  t.after(async () => { ctl.abort(); await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
-  const target = src.url("/spa.html");
   const served = [];
+  let current = null;
   const ext = { authorization: "Bearer " + BRIDGE_TOKEN, "x-claude-instance": "fake-ext", "x-claude-version": "0.44" };
   (async () => {
     while (!ctl.signal.aborted) {
@@ -691,31 +702,110 @@ test("a source the hub cannot fetch is read through a background Safari tab when
       try { r = await fetch(hub.base + "/pull", { method: "POST", headers: ext, signal: ctl.signal }); } catch { await sleep(20); continue; }
       if (r.status !== 200) continue;
       const call = await r.json();
-      served.push({ tool: call.tool, args: call.args });
-      const result = call.tool === "navigate" ? { tabId: 7, windowId: 1, url: call.args.url, opened: "new tab", active: false }
-        : call.tool === "read" ? { tabId: 7, url: target, title: "Rendered Terms", text: "Rendered by Safari. " + PAGE_TEXT }
+      served.push({ tool: call.tool, args: call.args, at: Date.now() });
+      if (call.tool === "navigate") current = call.args.url;
+      const result = call.tool === "navigate" ? { tabId: 7, windowId: 1, url: call.args.url, opened: call.args.newTab ? "new tab" : "current tab", active: false }
+        : call.tool === "read" ? { tabId: 7, ...read(current) }
           : call.tool === "probeActive" ? { tabId: 3, owned: true } : null;
       await fetch(hub.base + "/result", { method: "POST", headers: { ...ext, "content-type": "application/json" },
         body: JSON.stringify({ id: call.id, result }) }).catch(() => {});
     }
   })();
-  for (let i = 0; i < 100; i++) {
-    const st = await (await fetch(hub.base + "/status", { headers: { authorization: "Bearer " + BRIDGE_TOKEN } })).json();
-    if (st.instances && st.instances.length) break;
-    await sleep(30);
-  }
+  return {
+    served,
+    navigations: () => served.filter((c) => c.tool === "navigate").map((c) => c.args),
+    stop: () => ctl.abort(),
+    polling: async () => {
+      for (let i = 0; i < 100; i++) {
+        const st = await (await fetch(hub.base + "/status", { headers: { authorization: "Bearer " + BRIDGE_TOKEN } })).json();
+        if (st.instances && st.instances.length) return;
+        await sleep(30);
+      }
+      throw new Error("the fake extension never registered");
+    },
+  };
+}
+const renders = (url) => ({ url, title: "Rendered Terms", text: "Rendered by Safari. " + PAGE_TEXT });
+
+test("without BRIDGE_APP_SAFARI_FALLBACK=1 the app token never makes Safari navigate", async (t) => {
+  if (!tls) return t.skip("openssl is not available to mint a test certificate");
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin,
+    BRIDGE_APP_FETCH_DOMAINS: src.host, NODE_EXTRA_CA_CERTS: tls.certFile, BRIDGE_APP_SAFARI_FALLBACK: undefined });
+  const ext = fakeExtension(hub, renders);
+  t.after(async () => { ext.stop(); await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  await ext.polling();
+  const h = await (await fetch(hub.base + "/app/health", { headers: appHeaders })).json();
+  assert.equal(h.safariFallback, false);
   const r = await post(hub.base, { type: "terms-extract", input: { cards: [
-    { cardKey: "spa-card", issuer: "Example Bank", product: "Example Card", sources: [target] }] } });
+    { cardKey: "spa-card", issuer: "Example Bank", product: "Example Card", sources: [src.url("/spa.html"), src.url("/forbidden")] }] } });
+  const job = await waitJob(hub.base, (await r.json()).jobId);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.deepEqual(job.result.cards[0].sources.map((x) => x.note), [
+    "direct fetch failed (the page has almost no text without running its scripts); the Safari fallback is off on this hub",
+    "direct fetch failed (HTTP 403); the Safari fallback is off on this hub"]);
+  assert.deepEqual(ext.served, [], "the extension was handed nothing");
+});
+
+test("with the fallback on, a job reads its failed sources through ONE background tab and blanks it at the end", async (t) => {
+  if (!tls) return t.skip("openssl is not available to mint a test certificate");
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin,
+    BRIDGE_APP_FETCH_DOMAINS: src.host, NODE_EXTRA_CA_CERTS: tls.certFile, BRIDGE_APP_SAFARI_FALLBACK: "1" });
+  const ext = fakeExtension(hub, renders);
+  t.after(async () => { ext.stop(); await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  await ext.polling();
+  const h = await (await fetch(hub.base + "/app/health", { headers: appHeaders })).json();
+  assert.equal(h.safariFallback, true);
+  assert.equal(h.limits.safariPagesPerJob, 5);
+  assert.equal(h.limits.safariPagesPerHour, 20);
+  const spa = src.url("/spa.html"), forbidden = src.url("/forbidden"), out = src.url("/redirect-out");
+  const r = await post(hub.base, { type: "terms-extract", input: { cards: [
+    { cardKey: "spa-card", issuer: "Example Bank", product: "Example Card", sources: [spa, forbidden, out] }] } });
   const job = await waitJob(hub.base, (await r.json()).jobId, undefined, 600);
   assert.equal(job.status, "done", JSON.stringify(job));
   const [card] = job.result.cards;
   assert.equal(card.status, "verified");
-  assert.deepEqual(card.sources, [{ url: target, title: "Rendered Terms", fetchedVia: "safari", ok: true,
-    note: "direct fetch failed (the page has almost no text without running its scripts)" }]);
-  const nav = served.find((c) => c.tool === "navigate");
-  assert.deepEqual({ url: nav.args.url, newTab: nav.args.newTab, active: nav.args.active }, { url: target, newTab: true, active: false });
-  assert.ok(served.some((c) => c.tool === "read" && c.args.tabId === 7), "the read is pinned to the tab it opened");
+  assert.deepEqual(card.sources, [
+    { url: spa, title: "Rendered Terms", fetchedVia: "safari", ok: true,
+      note: "direct fetch failed (the page has almost no text without running its scripts)" },
+    { url: forbidden, title: "Rendered Terms", fetchedVia: "safari", ok: true, note: "direct fetch failed (HTTP 403)" },
+    { url: out, title: null, fetchedVia: "direct", ok: false,
+      note: "direct fetch failed (redirected to host not-allowed.example is not on BRIDGE_APP_FETCH_DOMAINS)" }]);
+  // One tab: opened in the background once, re-navigated, then blanked; the
+  // refused redirect never reached Safari.
+  await until(() => ext.navigations().length === 3);
+  const navs = ext.navigations().map(({ url, tabId, newTab, active }) => ({ url, tabId, newTab, active }));
+  assert.deepEqual(navs, [
+    { url: spa, tabId: undefined, newTab: true, active: false },
+    { url: forbidden, tabId: 7, newTab: false, active: false },
+    { url: "about:blank", tabId: 7, newTab: false, active: false }]);
+  assert.ok(ext.served.filter((c) => c.tool === "read").every((c) => c.args.tabId === 7), "every read is pinned to the job's tab");
   assert.match(stub.calls()[0].files["source-1.txt"], /^Rendered by Safari\./);
+});
+
+test("DELETE during the Safari phase frees the slot at once and blanks the tab", async (t) => {
+  if (!tls) return t.skip("openssl is not available to mint a test certificate");
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin,
+    BRIDGE_APP_FETCH_DOMAINS: src.host, NODE_EXTRA_CA_CERTS: tls.certFile, BRIDGE_APP_SAFARI_FALLBACK: "1" });
+  // A page that never gets enough text, so the read loop would go on for 20 s.
+  const ext = fakeExtension(hub, (url) => ({ url, title: null, text: "Loading..." }));
+  t.after(async () => { ext.stop(); await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  await ext.polling();
+  const r = await post(hub.base, { type: "terms-extract", input: { cards: [
+    { cardKey: "spa-card", issuer: "Example Bank", product: "Example Card", sources: [src.url("/spa.html")] }] } });
+  const { jobId } = await r.json();
+  await until(() => ext.served.some((c) => c.tool === "read"));
+  const t0 = Date.now();
+  assert.equal((await fetch(hub.base + "/app/jobs/" + jobId, { method: "DELETE", headers: appHeaders })).status, 200);
+  const health = async () => (await fetch(hub.base + "/app/health", { headers: appHeaders })).json();
+  let h = await health();
+  while (h.running && Date.now() - t0 < 3000) { await sleep(20); h = await health(); }
+  assert.equal(h.running, 0, "the slot is free");
+  assert.ok(Date.now() - t0 < 1000, "within a second, not after the 20 s read loop");
+  assert.ok(await until(() => ext.navigations().some((n) => n.url === "about:blank" && n.tabId === 7)), "the tab was blanked");
+  assert.equal(stub.calls().length, 0, "Claude never ran");
 });
 
 // ── The fetcher ──────────────────────────────────────────────────────────────
@@ -734,6 +824,30 @@ test("the fetcher re-checks every redirect and caps time, size and hops", async 
   await assert.rejects(get("/json"), /unsupported content type application\/json/);
   await assert.rejects(get("/spa.html"), /almost no text/);
   await assert.rejects(get("/slow", { totalMs: 300 }), /took longer than 0.3 s/);
+  // Compressed bodies are decoded, and the 8 MB cap counts DECODED bytes.
+  for (const p of ["/gz", "/br", "/deflate"]) {
+    const page = await get(p);
+    assert.equal(page.title, "Packed", p);
+    assert.match(page.data.toString(), /Cashback terms for the Example Card\./, p);
+  }
+  await assert.rejects(get("/bomb"), /larger than 8 MB/);
+  // Each failure carries a kind, and only a browser-fixable one may go to Safari.
+  const kindOf = async (p, extra) => { try { await get(p, extra); return "resolved"; } catch (e) { return [e.kind, e.status, appJobs.browserCanFix(e)]; } };
+  assert.deepEqual(await kindOf("/spa.html"), ["no-text", null, true]);
+  assert.deepEqual(await kindOf("/forbidden"), ["http", 403, true]);
+  assert.deepEqual(await kindOf("/missing"), ["http", 503, true]);
+  assert.deepEqual(await kindOf("/reset"), ["reset", null, true]);
+  assert.deepEqual(await kindOf("/redirect-out"), ["refused", null, false]);
+  assert.deepEqual(await kindOf("/redirect-http"), ["refused", null, false]);
+  assert.deepEqual(await kindOf("/redirect-creds"), ["refused", null, false]);
+  assert.deepEqual(await kindOf("/loop"), ["other", null, false]);
+  assert.deepEqual(await kindOf("/json"), ["other", null, false]);
+  assert.deepEqual(await kindOf("/chunked-big"), ["other", null, false]);
+  // A signal cancels a fetch in flight.
+  const ctl = new AbortController();
+  const pending = get("/slow", { signal: ctl.signal });
+  setTimeout(() => ctl.abort(), 100);
+  await assert.rejects(pending, (e) => e.kind === "cancelled");
   await assert.rejects(appJobs.fetchSource("http://" + src.host + "/tc.pdf", { allow, ca: tls.cert }), /not an https URL/);
   // A listener that never completes a TLS handshake trips the connect timeout.
   const silent = net.createServer(() => {}).listen(0, "127.0.0.1");
@@ -772,6 +886,103 @@ async function until(fn, ms = 5000) {
   while (Date.now() < end) { const v = fn(); if (v) return v; await sleep(20); }
   return fn();
 }
+
+// A fake Safari driver: each session records its reads and its release.
+function fakeSafari(read = async (url) => renders(url)) {
+  const sessions = [];
+  return {
+    sessions,
+    driver: { available: () => true, session: () => {
+      const s = { reads: [], released: 0 };
+      sessions.push(s);
+      return { read: (url, o) => { s.reads.push(url); return read(url, o); }, release: async () => { s.released += 1; } };
+    } },
+  };
+}
+const fails = (kind, status = null) => async (url) => { throw new appJobs.FetchError(kind + " " + url, kind, status); };
+const termsJob = (cards) => ({ type: "terms-extract", input: { cards: cards.map(([cardKey, sources]) => ({ cardKey,
+  issuer: "Example Bank", product: "Example Card", sources: sources.map((p) => "https://terms.example" + p) })) } });
+const doneJob = (jobs, id, ms) => until(() => { const j = jobs.get(id); return j && (j.status === "done" || j.status === "failed") ? j : null; }, ms);
+
+test("the fallback runs only for browser-fixable failures, through one session per job, within its page caps", async (t) => {
+  const stub = makeStub();
+  const safari = fakeSafari();
+  const kinds = { "/a": ["no-text"], "/b": ["http", 403], "/c": ["http", 429], "/d": ["reset"], "/e": ["refused"],
+    "/f": ["http", 404], "/g": ["other"], "/h": ["http", 503], "/i": ["no-text"] };
+  const jobs = inProcess(stub, { safari: safari.driver, safariPerJob: 5, safariPerHour: 7,
+    fetchSource: async (url) => { const [kind, status] = kinds[new URL(url).pathname]; throw new appJobs.FetchError(kind, kind, status || null); } });
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const id = jobs.submit(termsJob([["card-one", ["/a", "/b", "/e", "/f", "/g"]], ["card-two", ["/c", "/d", "/h", "/i"]]])).body.jobId;
+  const job = await doneJob(jobs, id);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  const notes = job.result.cards.flatMap((c) => c.sources.map((x) => [new URL(x.url).pathname, x.fetchedVia, x.note]));
+  assert.deepEqual(notes, [
+    ["/a", "safari", "direct fetch failed (no-text)"],
+    ["/b", "safari", "direct fetch failed (http)"],
+    ["/e", "direct", "direct fetch failed (refused)"],
+    ["/f", "direct", "direct fetch failed (http)"],
+    ["/g", "direct", "direct fetch failed (other)"],
+    ["/c", "safari", "direct fetch failed (http)"],
+    ["/d", "safari", "direct fetch failed (reset)"],
+    ["/h", "safari", "direct fetch failed (http)"],
+    ["/i", "direct", "direct fetch failed (no-text); the Safari fallback's 5 pages for this job are used up"]]);
+  assert.equal(safari.sessions.length, 1, "one tab for the whole job");
+  assert.equal(safari.sessions[0].reads.length, 5);
+  assert.ok(await until(() => safari.sessions[0].released === 1), "released once, at the end");
+  // The hour has 2 of its 7 pages left, across jobs.
+  const id2 = jobs.submit(termsJob([["card-three", ["/a", "/b", "/c"]]])).body.jobId;
+  const job2 = await doneJob(jobs, id2);
+  assert.deepEqual(job2.result.cards[0].sources.map((x) => x.fetchedVia), ["safari", "safari", "direct"]);
+  assert.match(job2.result.cards[0].sources[2].note, /the Safari fallback's 7 pages for this hour are used up$/);
+  assert.ok(await until(() => safari.sessions[1] && safari.sessions[1].released === 1));
+});
+
+test("a page Safari ends on outside the allowlist is discarded", async (t) => {
+  const stub = makeStub();
+  const safari = fakeSafari(async () => ({ url: "https://evil.example/landing", title: "Elsewhere", text: PAGE_TEXT }));
+  const jobs = inProcess(stub, { safari: safari.driver, fetchSource: fails("no-text") });
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const job = await doneJob(jobs, jobs.submit(termsJob([["card-one", ["/a"]]])).body.jobId);
+  const [card] = job.result.cards;
+  assert.equal(card.status, "failed");
+  assert.deepEqual(card.sources[0], { url: "https://terms.example/a", title: null, fetchedVia: "direct", ok: false,
+    note: "direct fetch failed (no-text https://terms.example/a); Safari: Safari ended on host evil.example is not on BRIDGE_APP_FETCH_DOMAINS" });
+  assert.equal(stub.calls().length, 0, "nothing reached Claude");
+});
+
+test("the per-card deadline holds in the fetch and Safari phases", async (t) => {
+  const stub = makeStub();
+  const never = () => new Promise(() => {});
+  const safari = fakeSafari(never);
+  const jobs = inProcess(stub, { safari: safari.driver, termsCardTimeoutMs: 400,
+    fetchSource: async (url) => (url.endsWith("/hang") ? never() : fails("no-text")(url)) });
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const t0 = Date.now();
+  const job = await doneJob(jobs, jobs.submit(termsJob([["card-one", ["/hang"]], ["card-two", ["/spa"]]])).body.jobId);
+  assert.ok(Date.now() - t0 < 2000, "two 0.4 s cards ended in " + (Date.now() - t0) + " ms");
+  assert.equal(job.status, "done");
+  assert.deepEqual(job.result.cards.map((c) => c.sources[0].note), [
+    "direct fetch failed (ran out of time)",
+    "direct fetch failed (no-text https://terms.example/spa); Safari: ran out of time"]);
+  assert.ok(await until(() => safari.sessions[0].released === 1));
+});
+
+test("DELETE during the fetch phase frees the slot at once and aborts the fetch", async (t) => {
+  const stub = makeStub();
+  let signal = null;
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-safari-appjobs-root-"));
+  const jobs = inProcess(stub, { tmpRoot, fetchSource: (url, o) => { signal = o.signal; return new Promise(() => {}); } });
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); fs.rmSync(tmpRoot, { recursive: true, force: true }); });
+  const id = jobs.submit(termsJob([["card-one", ["/a"]]])).body.jobId;
+  await until(() => signal);
+  assert.equal(fs.readdirSync(tmpRoot).length, 1, "the card's temp dir exists while it fetches");
+  const t0 = Date.now();
+  assert.equal(jobs.remove(id), true);
+  assert.equal(signal.aborted, true, "the fetch's signal fired");
+  assert.ok(await until(() => jobs.stats().running === 0, 1000), "the slot is free");
+  assert.ok(Date.now() - t0 < 1000);
+  assert.deepEqual(fs.readdirSync(tmpRoot), [], "and its temp dir is gone");
+});
 
 test("finished jobs are purged after purgeMs", async (t) => {
   const stub = makeStub();

@@ -36,7 +36,14 @@ const DEFAULTS = {
   termsCardTimeoutMs: 300000,
   purgeMs: 15 * 60 * 1000,
   defaultModel: "sonnet",
+  // The Safari fallback (off unless the hub passes a safari driver, which the
+  // bridge does only with BRIDGE_APP_SAFARI_FALLBACK=1): pages per job, and
+  // pages per rolling hour across every job, so a leaked app token can make
+  // the owner's Safari load at most this many allowlisted pages.
+  safariPerJob: 5,
+  safariPerHour: 20,
 };
+const HOUR_MS = 3600 * 1000;
 const LIMITS = { textChars: 200000, cards: 10, sources: 5, urlChars: 2048, nameChars: 200, currentChars: 200000 };
 const MAX_STDOUT = 16 * 1024 * 1024;
 const KILL_GRACE_MS = 2000;
@@ -423,7 +430,17 @@ const retrySuffix = (errors) => "\n\nYour previous answer did not match the sche
 const FETCH = { connectMs: 10000, totalMs: 30000, maxBytes: 8 * 1024 * 1024, maxRedirects: 5, minText: 200 };
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 
-class FetchError extends Error {}
+// kind says what failed, so the caller can tell a failure a browser could
+// get past from one it must not retry anywhere:
+//   refused   the URL or a redirect broke the rules (host, https, credentials)
+//   http      a status other than 200 (status holds it)
+//   no-text   an HTML page with almost no text until its scripts run
+//   reset     the server dropped the connection (what bot walls do)
+//   cancelled the job was deleted
+//   other     time, size, encoding, content type
+class FetchError extends Error {
+  constructor(message, kind = "other", status = null) { super(message); this.kind = kind; this.status = status; }
+}
 
 function parseDomains(raw) {
   return new Set(String(raw || "").split(/[\s,]+/).map((d) => d.trim().toLowerCase()).filter((d) => d && !d.includes("/")));
@@ -452,7 +469,7 @@ function getOnce(u, deadline, opts) {
       if (err) reject(err); else resolve(val);
     };
     const req = https.request(u, {
-      method: "GET", agent: false, ca: opts.ca,
+      method: "GET", agent: false, ca: opts.ca, signal: opts.signal,
       headers: { "user-agent": "Mozilla/5.0 (compatible; claude-safari-bridge app-jobs)",
         accept: "application/pdf,text/html;q=0.9,text/plain;q=0.8,*/*;q=0.1", "accept-encoding": "gzip, deflate, br" },
     });
@@ -460,11 +477,12 @@ function getOnce(u, deadline, opts) {
     connectTimer = setTimeout(() => fail("no connection within " + opts.connectMs / 1000 + " s"), Math.min(opts.connectMs, left));
     totalTimer = setTimeout(() => fail("took longer than " + opts.totalMs / 1000 + " s"), left);
     req.on("socket", (s) => s.once("secureConnect", () => clearTimeout(connectTimer)));
-    req.on("error", (e) => done(new FetchError(e.code || "request failed")));
+    req.on("error", (e) => done(e.name === "AbortError" ? new FetchError("cancelled", "cancelled")
+      : new FetchError(e.code || "request failed", e.code === "ECONNRESET" ? "reset" : "other")));
     req.on("response", (res) => {
       clearTimeout(connectTimer);
       // A response destroyed mid-body emits "error"; unheard, it would throw.
-      res.on("error", () => done(new FetchError("connection closed early")));
+      res.on("error", () => done(new FetchError("connection closed early", "reset")));
       if (res.statusCode !== 200) {
         res.resume();
         req.destroy();
@@ -485,7 +503,7 @@ function getOnce(u, deadline, opts) {
       });
       stream.on("end", () => done(null, { status: 200, headers: res.headers, body: Buffer.concat(chunks) }));
       stream.on("error", () => done(new FetchError("could not decode the response")));
-      res.on("close", () => { if (!res.complete) done(new FetchError("connection closed early")); });
+      res.on("close", () => { if (!res.complete) done(new FetchError("connection closed early", "reset")); });
     });
     req.end();
   });
@@ -592,9 +610,9 @@ function decodeBody(body, contentType) {
 
 // { ext, data, title } for one source, or a FetchError. A PDF is saved as it
 // came (Claude's Read takes PDFs); HTML is reduced to text, and a page that is
-// nearly empty without its scripts counts as a failed fetch, which is what
-// sends it to the Safari fallback. connectMs/totalMs/maxBytes/ca exist for
-// the tests; the hub always runs on FETCH.
+// nearly empty without its scripts counts as a failed fetch, one the Safari
+// fallback may retry. signal aborts it (a DELETE). connectMs/totalMs/
+// maxBytes/ca exist for the tests; the hub always runs on FETCH.
 async function fetchSource(raw, opts = {}) {
   const allow = opts.allow || new Set();
   const maxBytes = opts.maxBytes || FETCH.maxBytes;
@@ -604,15 +622,15 @@ async function fetchSource(raw, opts = {}) {
   let current = raw;
   for (let hop = 0; ; hop++) {
     const c = checkSourceUrl(current, allow);
-    if (c.error) throw new FetchError(hop ? "redirected to " + c.error : c.error);
-    const r = await getOnce(c.url, deadline, { ca: opts.ca, maxBytes, connectMs, totalMs });
+    if (c.error) throw new FetchError(hop ? "redirected to " + c.error : c.error, "refused");
+    const r = await getOnce(c.url, deadline, { ca: opts.ca, signal: opts.signal, maxBytes, connectMs, totalMs });
     if (REDIRECTS.has(r.status)) {
       if (!r.headers.location) throw new FetchError("HTTP " + r.status + " without a Location");
       if (hop >= FETCH.maxRedirects) throw new FetchError("more than " + FETCH.maxRedirects + " redirects");
-      try { current = new URL(r.headers.location, c.url).href; } catch { throw new FetchError("redirected to " + "not a URL"); }
+      try { current = new URL(r.headers.location, c.url).href; } catch { throw new FetchError("redirected to not a URL", "refused"); }
       continue;
     }
-    if (r.status !== 200) throw new FetchError("HTTP " + r.status);
+    if (r.status !== 200) throw new FetchError("HTTP " + r.status, "http", r.status);
     const type = String(r.headers["content-type"] || "");
     const mime = type.split(";")[0].trim().toLowerCase();
     const head = r.body.subarray(0, 1024).toString("latin1");
@@ -623,12 +641,41 @@ async function fetchSource(raw, opts = {}) {
     }
     if (mime === "text/html" || mime === "application/xhtml+xml" || /^\s*(<!doctype html|<html)/i.test(head)) {
       const page = htmlToText(decodeBody(r.body, type));
-      if (page.text.length < FETCH.minText) throw new FetchError("the page has almost no text without running its scripts");
+      if (page.text.length < FETCH.minText) throw new FetchError("the page has almost no text without running its scripts", "no-text");
       return { url: c.url.href, ext: ".txt", data: Buffer.from(page.text), title: page.title };
     }
     if (mime.startsWith("text/")) return { url: c.url.href, ext: ".txt", data: Buffer.from(decodeBody(r.body, type)), title: null };
     throw new FetchError("unsupported content type " + (mime || "(none)"));
   }
+}
+
+// The failures a browser can get past, and the only ones the Safari fallback
+// retries: a page that needs its scripts, a bot wall's 403/429/503, a dropped
+// connection. Never a refusal: Safari would follow the redirect or the
+// http:// URL the fetcher refused, in the owner's logged-in profile.
+const SAFARI_STATUSES = new Set([403, 429, 503]);
+const browserCanFix = (e) => !!e && (e.kind === "no-text" || e.kind === "reset" ||
+  (e.kind === "http" && SAFARI_STATUSES.has(e.status)));
+
+// A promise raced against a deadline and a cancellation check, so no await in
+// a job outlives either. What it waited for is abandoned, not stopped: its
+// owner cleans up after it (the fetch has its signal, a Safari session chains
+// its release after its last call). isCancelled is polled because a job's
+// cancellation is a flag that DELETE sets.
+const CANCEL_POLL_MS = 100;
+function within(promise, deadline, isCancelled = () => false) {
+  return new Promise((resolve, reject) => {
+    let timer = null, poll = null;
+    const end = (settle, v) => { clearTimeout(timer); clearInterval(poll); settle(v); };
+    const left = deadline - Date.now();
+    if (isCancelled()) return end(reject, new JobError("cancelled", "deleted"));
+    if (left <= 0) return end(reject, new JobError("timeout", "ran out of time"));
+    timer = setTimeout(() => end(reject, new JobError("timeout", "ran out of time")), left);
+    poll = setInterval(() => { if (isCancelled()) end(reject, new JobError("cancelled", "deleted")); }, CANCEL_POLL_MS);
+    timer.unref();
+    poll.unref();
+    Promise.resolve(promise).then((v) => end(resolve, v), (e) => end(reject, e));
+  });
 }
 
 // ── Request validation ───────────────────────────────────────────────────────
@@ -709,8 +756,12 @@ const localDate = (d = new Date()) =>
 const secs = (ms) => (ms / 1000).toFixed(1) + "s";
 
 // opts: claudeBin (path or function), env (the child's base environment),
-// fetchDomains (string or Set), safari ({ available(), read(url, deadline) }),
-// log (one line), fetchSource (tests), tmpRoot, and any DEFAULTS key.
+// fetchDomains (string or Set), log (one line), fetchSource (tests), tmpRoot,
+// any DEFAULTS key, and safari, the fallback's driver or null (off):
+//   available()  is an extension instance polling the hub
+//   session()    one background tab for one job, opened on its first read:
+//     read(url, { deadline, isCancelled }) -> { url, title, text }
+//     release()    load about:blank in the tab once the job is over
 function createAppJobs(opts = {}) {
   const cfg = { ...DEFAULTS, ...Object.fromEntries(Object.entries(opts).filter(([k]) => k in DEFAULTS && opts[k] !== undefined)) };
   const allow = opts.fetchDomains instanceof Set ? opts.fetchDomains : parseDomains(opts.fetchDomains);
@@ -720,6 +771,7 @@ function createAppJobs(opts = {}) {
   const fetcher = opts.fetchSource || fetchSource;
   const tmpRoot = opts.tmpRoot || os.tmpdir();
   const safari = opts.safari || null;
+  const safariUses = [];   // when each fallback page was loaded, for the hourly cap
   const jobs = new Map();
   const queue = [];
   let running = 0;
@@ -753,29 +805,50 @@ function createAppJobs(opts = {}) {
     return { ...value, schemaVersion: 1 };
   }
 
+  // A fallback page, if this job and the hour have one left; else why not.
+  function takeSafariPage(job) {
+    const now = Date.now();
+    while (safariUses.length && safariUses[0] <= now - HOUR_MS) safariUses.shift();
+    if (job.safariPages >= cfg.safariPerJob) return "the Safari fallback's " + cfg.safariPerJob + " pages for this job are used up";
+    if (safariUses.length >= cfg.safariPerHour) return "the Safari fallback's " + cfg.safariPerHour + " pages for this hour are used up";
+    job.safariPages += 1;
+    safariUses.push(now);
+    return null;
+  }
+
   async function readSource(job, url, n, dir, deadline) {
     const entry = { url, title: null, fetchedVia: "direct", ok: false, note: null };
+    const isCancelled = () => job.cancelled;
     let direct;
     try {
-      const got = await fetcher(url, { allow, deadline: Math.min(deadline, Date.now() + FETCH.totalMs) });
+      const got = await within(fetcher(url, { allow, deadline: Math.min(deadline, Date.now() + FETCH.totalMs),
+        signal: job.abort.signal }), deadline, isCancelled);
       fs.writeFileSync(path.join(dir, "source-" + n + got.ext), got.data);
       return { ...entry, title: got.title || null, ok: true, file: "source-" + n + got.ext };
     } catch (e) {
-      direct = String((e && e.message) || e);
+      direct = e;
     }
     if (job.cancelled) throw new JobError("cancelled", "deleted");
-    if (!safari || !safari.available()) return { ...entry, note: "direct fetch failed (" + direct + "); no Safari extension is polling" };
+    const failed = "direct fetch failed (" + String((direct && direct.message) || direct) + ")";
+    const skip = (why) => ({ ...entry, note: failed + (why ? "; " + why : "") });
+    if (!browserCanFix(direct)) return skip(null);
+    if (!safari) return skip("the Safari fallback is off on this hub");
+    if (Date.now() >= deadline) return skip("no time was left to try Safari");
+    if (!safari.available()) return skip("no Safari extension is polling");
+    const spent = takeSafariPage(job);
+    if (spent) return skip(spent);
     try {
-      const page = await safari.read(url, deadline);
+      job.safari = job.safari || safari.session();
+      const page = await within(job.safari.read(url, { deadline, isCancelled }), deadline, isCancelled);
       const c = checkSourceUrl(page && page.url, allow);
       if (c.error) throw new Error("Safari ended on " + c.error);
       const text = String(page.text || "");
       if (text.trim().length < FETCH.minText) throw new Error("Safari's copy has almost no text");
       fs.writeFileSync(path.join(dir, "source-" + n + ".txt"), text.slice(0, FETCH.maxBytes));
-      return { ...entry, title: page.title || null, fetchedVia: "safari", ok: true, file: "source-" + n + ".txt",
-        note: "direct fetch failed (" + direct + ")" };
+      return { ...entry, title: page.title || null, fetchedVia: "safari", ok: true, file: "source-" + n + ".txt", note: failed };
     } catch (e) {
-      return { ...entry, note: "direct fetch failed (" + direct + "); Safari: " + String((e && e.message) || e) };
+      if (job.cancelled) throw new JobError("cancelled", "deleted");
+      return skip("Safari: " + String((e && e.message) || e));
     }
   }
 
@@ -850,6 +923,13 @@ function createAppJobs(opts = {}) {
       job.child = null;
       job.input = null;
       job.finishedAt = Date.now();
+      // Success, failure, timeout or DELETE: the job's tab goes blank. Not
+      // awaited, so a slow extension never holds the slot.
+      if (job.safari) {
+        const session = job.safari;
+        job.safari = null;
+        Promise.resolve().then(() => session.release()).catch(() => {});
+      }
       if (!job.cancelled) {
         const outBytes = job.result ? Buffer.byteLength(JSON.stringify(job.result)) : 0;
         say(job, job.status, secs(job.finishedAt - job.startedAt) + " attempts=" + job.attempts +
@@ -878,7 +958,8 @@ function createAppJobs(opts = {}) {
     const job = { id: crypto.randomUUID(), type: body.type, status: "queued", input: parsed.input,
       progress: { done: 0, total: body.type === "terms-extract" ? parsed.input.cards.length : 1 },
       result: null, error: null, createdAt: Date.now(), startedAt: null, finishedAt: null,
-      attempts: 0, child: null, dir: null, cancelled: false, purgeTimer: null };
+      attempts: 0, child: null, dir: null, cancelled: false, purgeTimer: null,
+      abort: new AbortController(), safari: null, safariPages: 0 };
     jobs.set(job.id, job);
     queue.push(job);
     say(job, "queued", job.type === "statement-extract" ? "in=" + parsed.input.text.length
@@ -906,6 +987,7 @@ function createAppJobs(opts = {}) {
     if (q >= 0) queue.splice(q, 1);
     if (job.status === "running") {
       job.cancelled = true;
+      job.abort.abort();
       killChild(job.child);
     }
     job.input = null;
@@ -915,10 +997,12 @@ function createAppJobs(opts = {}) {
   }
 
   function health() {
-    return { ok: true, types: TYPES, defaultModel: cfg.defaultModel, fetchDomains: [...allow], running, queued: queue.length,
+    return { ok: true, types: TYPES, defaultModel: cfg.defaultModel, fetchDomains: [...allow], safariFallback: !!safari,
+      running, queued: queue.length,
       limits: { maxRunning: cfg.maxRunning, maxQueued: cfg.maxQueued, statementTimeoutS: cfg.statementTimeoutMs / 1000,
         termsCardTimeoutS: cfg.termsCardTimeoutMs / 1000, purgeAfterS: cfg.purgeMs / 1000, textChars: LIMITS.textChars,
-        cards: LIMITS.cards, sourcesPerCard: LIMITS.sources } };
+        cards: LIMITS.cards, sourcesPerCard: LIMITS.sources, safariPagesPerJob: cfg.safariPerJob,
+        safariPagesPerHour: cfg.safariPerHour } };
   }
 
   // For a hub that is stopping: the jobs' own finally blocks will not run once
@@ -933,6 +1017,7 @@ function createAppJobs(opts = {}) {
 }
 
 module.exports = {
-  createAppJobs, fetchSource, checkSourceUrl, parseDomains, htmlToText, check, toJsonSchema, nullable, childEnv,
+  createAppJobs, fetchSource, checkSourceUrl, parseDomains, htmlToText, check, toJsonSchema, nullable, childEnv, within,
+  FetchError, browserCanFix,
   statementArgs, termsArgs, STATEMENT_SHAPE, TERMS_ANSWER_SHAPE, TERMS_RESULT_SHAPE, RULE_SET_SHAPE, LIMITS, DEFAULTS, FETCH,
 };

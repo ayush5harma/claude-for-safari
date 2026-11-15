@@ -17,12 +17,13 @@ takes longer than that.
 | --- | --- | --- |
 | `BRIDGE_APP_TOKEN` | unset | Turns `/app/*` on. Without it every `/app/*` route answers 404. At least 16 characters and different from `BRIDGE_TOKEN`, or the hub refuses to start. |
 | `BRIDGE_APP_FETCH_DOMAINS` | empty | Hosts a terms job may fetch from, comma- or space-separated, matched exactly against the URL's host (`www.bank.example` does not admit `bank.example`, and a non-default port is part of the host). Empty means terms jobs are refused. |
+| `BRIDGE_APP_SAFARI_FALLBACK` | unset (off) | `1` lets a terms job read a source through a background tab of the owner's Safari when the hub's own fetch fails in a way a browser can get past. This gives the app token a bounded reach into the browser; see [Safari fallback](#safari-fallback-off-by-default). Any other value leaves it off. |
 
 Mint the token the same way as `BRIDGE_TOKEN` (`openssl rand -hex 24`). On
 Heroku, set both as config vars ([HOSTING.md](../HOSTING.md)); the deploy
-script ships `app-jobs.js` beside the bridge. `install.sh` does not copy these
-two variables into the launchd plist, so a local hub that should serve the
-app needs them in its own environment.
+script ships `app-jobs.js` beside the bridge. `install.sh` does not copy any
+of these variables into the launchd plist, so a local hub that should serve
+the app needs them in its own environment.
 
 ## Authentication
 
@@ -30,7 +31,10 @@ app needs them in its own environment.
   `BRIDGE_TOKEN` gets 401 there.
 - `BRIDGE_APP_TOKEN` gets 401 on every other route, including on a loopback
   hub that has no `BRIDGE_TOKEN`. A leaked app token cannot reach the browser
-  tools, the chat panel or the MCP routes.
+  tools, the chat panel or the MCP routes. With the Safari fallback off (the
+  default) it cannot make the browser do anything. With it on, it can make
+  Safari load and read a bounded set of pages; the
+  [Safari fallback](#safari-fallback-off-by-default) section lists exactly what.
 - A request that carries `Origin` or `Sec-Fetch-Site` gets 403. Browsers send
   one of the two on every request and a native client sends neither, so a web
   page that learns the token still cannot use it.
@@ -41,7 +45,8 @@ app needs them in its own environment.
 ## Routes
 
 `GET /app/health` is the app's "test connection". It returns
-`{ ok, types, defaultModel, fetchDomains, running, queued, limits }`.
+`{ ok, types, defaultModel, fetchDomains, safariFallback, running, queued, limits }`.
+`safariFallback` is true when `BRIDGE_APP_SAFARI_FALLBACK=1`.
 
 `POST /app/jobs` returns `202 {"jobId": "<uuid>", "status": "queued"|"running"}`.
 Validation failures return 400 with an `error` string. An oversized body or
@@ -208,16 +213,58 @@ The bridge fetches each source itself with `node:https`, without keep-alive:
   to text. A page with almost no text without its scripts counts as a failed
   fetch.
 
-**Safari fallback.** When a direct fetch fails and a Safari extension
-instance is polling the hub, the bridge opens the URL in a **background**
-tab. It goes through the same routing as `claude_safari_navigate` with
-`newTab: true, active: false`, so it opens in the current window without
-changing what that window shows. The bridge then reads that tab until it has
-text, and it keeps the text only if the tab's final URL is still on the
-allowlist. This helps for bot walls and pages that render only with
-JavaScript. It does not help for a PDF, because Safari's PDF viewer has no
-page text to read. **The bridge cannot close that tab** (the extension has
-no close operation), so it stays open in Safari until someone closes it.
+### Safari fallback (off by default)
+
+Set `BRIDGE_APP_SAFARI_FALLBACK=1` to turn it on. When it is on, a source whose
+direct fetch failed can be read through the owner's Safari, but only if all
+of these hold:
+
+- The failure is one a browser can get past: an HTML page with almost no text
+  until its scripts run, HTTP 403, 429 or 503, or a dropped connection. A
+  refusal never goes to Safari: a redirect to a host off the allowlist, a
+  non-https URL or redirect, or a URL carrying credentials. Neither does a
+  timeout, an oversized body, a 404 or an unsupported content type.
+- A Safari extension instance is polling the hub.
+- The job has used fewer than 5 fallback pages, and the hub fewer than 20 in
+  the last hour across all jobs.
+- The card's 300 s are not used up. Every call to the extension is raced
+  against the card's deadline, and DELETE stops the fallback at once.
+
+Each job uses one tab. The first source that needs Safari opens it with
+`newTab: true, active: false`, through the same routing as
+`claude_safari_navigate`, so it opens in the owner's current window without
+changing what that window shows. Later sources in the same job navigate that
+same tab. The bridge reads the tab until it has text, and keeps the text
+only if the tab's final URL is still https and on the allowlist. When the job
+ends (done, failed, timed out or deleted), the bridge navigates the tab to
+`about:blank`. **The bridge cannot close the tab**, because the extension has
+no close operation, so a blank tab stays open in Safari until someone closes
+it. Adding a close operation to the extension is a follow-up.
+
+The fallback helps for bot walls and pages that render only with JavaScript.
+It does not help for a PDF, because Safari's PDF viewer has no page text to
+read.
+
+**What the app token can make Safari do when the fallback is on.** A holder
+of the app token can submit terms jobs that make the owner's Safari:
+
+- open one background tab per job, in the owner's current window and
+  profile, without switching to it;
+- load in that tab the job's own source URLs (https, host on
+  `BRIDGE_APP_FETCH_DOMAINS`), and only after the hub's own fetch of that URL
+  failed as above: at most 5 pages per job and 20 per hour;
+- read that tab's text, which is written to the card's temp directory and
+  read by Claude;
+- load `about:blank` in that tab when the job ends.
+
+It cannot pick another tab, click, type, run scripts, take screenshots or
+read any other tab. Two things still reach beyond the allowlist and the
+public web. The page loads in the owner's logged-in profile with its cookies,
+and the extension's read of a background tab may refetch the URL with
+`credentials: include`. And a listed page can redirect the tab to any site
+before the bridge sees the final URL: Safari will have loaded that site even
+though the bridge throws its text away. Turn the fallback on only with an
+allowlist of hosts that serve public terms pages.
 
 ## Limits
 
@@ -226,7 +273,8 @@ no close operation), so it stays open in Safari until someone closes it.
 | Running at once | 2 |
 | Queued | 20 (429 beyond) |
 | Statement job | 240 s, retry included |
-| Terms job | 300 s per card, fetching included |
+| Terms job | 300 s per card: fetching, the Safari fallback and Claude included |
+| Safari fallback | off by default; 5 pages per job, 20 per hour across jobs |
 | Purge | 15 min after a job finishes |
 | Request body | 2 MB |
 | Statement text | 200,000 characters |
@@ -249,5 +297,13 @@ attempt.
   discarded unread, because it can echo its input.
 - The app masks card numbers and personal details before upload. The
   statement prompt tells Claude to keep them masked.
-- A terms job sends nothing private: only public URLs, the card's names and
-  the current rule set.
+- A terms job's request holds no statement data: only source URLs, the
+  card's names and the current rule set. The hub fetches sources itself,
+  with no cookies or credentials, so with the Safari fallback off (the
+  default) only public pages reach Claude.
+- With the Safari fallback on, a fallback page loads in the owner's
+  logged-in Safari profile with its cookies, and the extension's read may
+  refetch it with `credentials: include`. Whatever that page shows a signed-in
+  owner (a name, an account banner, an offer tied to their account) goes into
+  the card's source text and to Claude. Keep the allowlist to hosts whose
+  terms pages are public, or leave the fallback off.

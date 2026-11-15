@@ -33,7 +33,9 @@
 //   - /app/* (bridge/app-jobs.js, docs/APP-JOBS.md) exists only when
 //     BRIDGE_APP_TOKEN is set, takes that token and no other, serves native
 //     clients only (no Origin, no Sec-Fetch-Site), and the app token opens
-//     nothing outside /app/*.
+//     nothing outside /app/*. Its one reach into the browser is the terms
+//     jobs' Safari fallback, off unless BRIDGE_APP_SAFARI_FALLBACK=1 and then
+//     fenced (see THE SAFARI FALLBACK below).
 
 "use strict";
 const http = require("node:http");
@@ -974,44 +976,76 @@ function runHub() {
     };
     if (APP_TOKEN.length < APP_TOKEN_MIN) refuse("BRIDGE_APP_TOKEN is shorter than " + APP_TOKEN_MIN + " characters");
     // One token for both would undo the separation: the phone's token must
-    // not be able to drive the browser.
+    // not be able to drive the browser (beyond the opt-in, capped fallback).
     if (APP_TOKEN === TOKEN) refuse("BRIDGE_APP_TOKEN equals BRIDGE_TOKEN; give the app its own token");
     try {
       appMod = require(path.join(__dirname, "app-jobs.js"));
     } catch (e) {
       refuse("BRIDGE_APP_TOKEN is set but app-jobs.js did not load from beside the bridge (" + e.message + ")");
     }
-    // THE SAFARI FALLBACK, for a source the hub could not fetch itself (a
-    // bot wall, a page that renders only with its scripts): a BACKGROUND tab
-    // through the same routing a /call uses, so it opens in the owner's
-    // current window without changing what it shows, then reads of that tab
-    // until it has text. The extension has no close op, so the tab stays
-    // open; docs/APP-JOBS.md says so. navigate answers before the page has
-    // loaded, hence the settle wait before each read.
+    // THE SAFARI FALLBACK, OFF UNLESS BRIDGE_APP_SAFARI_FALLBACK=1. With it
+    // on, the app token can make the owner's Safari load pages, which is
+    // exactly what this token is otherwise kept from, so the reach is fenced:
+    // only for a source whose direct fetch failed in a way a browser can get
+    // past (app-jobs.js, browserCanFix), only allowlisted URLs, at most
+    // safariPerJob pages per job and safariPerHour per hour, and ONE
+    // background tab per job: opened with newTab true, active false (the same
+    // routing a /call uses, so it lands in the owner's current window without
+    // changing what it shows), re-navigated for the job's later sources, and
+    // sent to about:blank when the job ends. The extension has no close op,
+    // so the blank tab stays; adding one is a follow-up (docs/APP-JOBS.md).
+    // navigate answers before the page has loaded, hence the settle wait
+    // before each read.
     const SAFARI_SETTLE_MS = 2500;
     const SAFARI_READS = 8;
-    const safariRead = async (url, deadline) => {
-      const nav = await routeCall("navigate", { url, newTab: true, active: false });
-      if (nav.error) throw new Error(nav.error);
-      const tabId = nav.result && nav.result.tabId;
-      if (typeof tabId !== "number") throw new Error("the extension opened no tab");
-      let page = null;
-      let last = "no read answered";
-      for (let i = 0; i < SAFARI_READS && Date.now() + SAFARI_SETTLE_MS < deadline; i++) {
-        await new Promise((r) => setTimeout(r, SAFARI_SETTLE_MS));
-        const r = await routeCall("read", { tabId, maxChars: appMod.FETCH.maxBytes });
-        if (r.error) { last = r.error; continue; }
-        page = r.result || null;
-        if (page && /^https:/.test(String(page.url || "")) && String(page.text || "").trim().length >= appMod.FETCH.minText) break;
-      }
-      if (!page) throw new Error(last);
-      return { url: page.url, title: page.title, text: page.text };
+    const safariSession = () => {
+      let tabId = null;
+      let chain = Promise.resolve();
+      // Every call on the job's tab runs after the one before, including one
+      // the job stopped waiting for at its deadline or a DELETE, so the blank
+      // page release() loads is always the tab's last navigation, and a first
+      // navigate that answers late still records the tab it opened. argsOf
+      // runs when the call's turn comes; null skips the call.
+      const call = (tool, argsOf, after = (r) => r) => {
+        const p = chain.then(() => { const args = argsOf(); return args ? routeCall(tool, args) : null; }).then(after);
+        chain = p.catch(() => {});
+        return p;
+      };
+      const read = async (url, { deadline, isCancelled }) => {
+        const step = (p) => appMod.within(p, deadline, isCancelled);
+        const nav = await step(call("navigate",
+          () => (tabId === null ? { url, newTab: true, active: false } : { url, tabId, newTab: false, active: false }),
+          (r) => {
+            if (tabId === null && r && r.result && typeof r.result.tabId === "number") tabId = r.result.tabId;
+            return r;
+          }));
+        if (nav.error) throw new Error(nav.error);
+        if (tabId === null) throw new Error("the extension opened no tab");
+        let page = null;
+        let last = "no read answered";
+        for (let i = 0; i < SAFARI_READS; i++) {
+          await step(new Promise((r) => setTimeout(r, SAFARI_SETTLE_MS)));
+          const r = await step(call("read", () => ({ tabId, maxChars: appMod.FETCH.maxBytes })));
+          if (r.error) { last = r.error; continue; }
+          page = r.result || null;
+          if (page && /^https:/.test(String(page.url || "")) && String(page.text || "").trim().length >= appMod.FETCH.minText) break;
+        }
+        if (!page) throw new Error(last);
+        return { url: page.url, title: page.title, text: page.text };
+      };
+      const release = () => call("navigate", () => (tabId === null ? null : { url: "about:blank", tabId, newTab: false, active: false }));
+      return { read, release };
     };
-    appJobs = appMod.createAppJobs({
-      claudeBin,
-      fetchDomains: process.env.BRIDGE_APP_FETCH_DOMAINS,
-      safari: { available: () => currentInstances(liveInstances()).length > 0, read: safariRead },
-    });
+    try {
+      appJobs = appMod.createAppJobs({
+        claudeBin,
+        fetchDomains: process.env.BRIDGE_APP_FETCH_DOMAINS,
+        safari: process.env.BRIDGE_APP_SAFARI_FALLBACK === "1"
+          ? { available: () => currentInstances(liveInstances()).length > 0, session: safariSession } : null,
+      });
+    } catch (e) {
+      refuse(e.message);
+    }
     // Kill the children and remove their temp dirs on the way down, then die
     // by the same signal so a supervisor sees what it sent.
     for (const sig of ["SIGTERM", "SIGINT"]) {
