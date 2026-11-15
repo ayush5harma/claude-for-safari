@@ -65,7 +65,7 @@ process.stdin.on("end", () => {
   const emit = (o) => process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, ...o }));
   const retry = stdin.includes("did not match the schema");
   if (stdin.includes("STUB-SLOW") || stdin.includes("cardKey=slow-card")) return setTimeout(() => emit({ structured_output: STATEMENT }), 60000);
-  if (stdin.includes("STUB-IS-ERROR")) return emit({ is_error: true, result: "Invalid API key - please run /login" });
+  if (stdin.includes("STUB-IS-ERROR") || stdin.includes("cardKey=error-card")) return emit({ is_error: true, result: "Invalid API key - please run /login" });
   if (stdin.includes("STUB-TEXT-RESULT")) return emit({ result: "Here it is:\\n\`\`\`json\\n" + JSON.stringify(STATEMENT) + "\\n\`\`\`" });
   if (stdin.includes("STUB-ALWAYS-INVALID") || (stdin.includes("STUB-INVALID-FIRST") && !retry)) {
     const bad = JSON.parse(JSON.stringify(STATEMENT));
@@ -75,7 +75,18 @@ process.stdin.on("end", () => {
   }
   if (argv[argv.indexOf("--tools") + 1] === "Read") {
     const url = (/ from (https:\\/\\/\\S+)/.exec(stdin) || [])[1] || "https://unknown.invalid/";
-    return emit({ structured_output: { status: "verified", ruleSet: ruleSet(url), notes: ["synthetic"] } });
+    const rs = ruleSet(url);
+    if (stdin.includes("cardKey=inject-card")) {
+      // What a hostile source page could talk the model into citing.
+      rs.sources = [{ url: "https://evil.example/phish", title: "Click me", checkedOn: null },
+        { url: url.replace("https://terms.example", "https://TERMS.example") + "#page=2", title: null, checkedOn: null }];
+      rs.earn[0].sourceUrl = "https://evil.example/phish";
+      rs.earn[0].caps = [{ period: "cycle", kind: "absolute", amountINR: 500, points: null, ruleId: null, multiple: null, percent: null,
+        perMerchant: false, note: null, sourceUrl: "javascript:alert(1)" }];
+      rs.fees = [{ id: "fx", label: "FX", match: rs.earn[0].match, percent: 3.5, gstOnFee: true, minTxnINR: null,
+        monthlyThresholdINR: null, sourceUrl: url + "#fees", note: null }];
+    }
+    return emit({ structured_output: { status: "verified", ruleSet: rs, notes: ["synthetic"] } });
   }
   emit({ structured_output: STATEMENT, result: JSON.stringify(STATEMENT) });
 });
@@ -428,6 +439,21 @@ test("a schema miss is retried once with its errors (paths, never values) append
 test("the shape checker is strict on types and lenient on vocabulary", () => {
   const { check, STATEMENT_SHAPE, toJsonSchema } = appJobs;
   assert.deepEqual(check(STATEMENT_SHAPE, { ...STATEMENT, kind: "quarterly" }), []);
+  // ...except where the bridge or the app branches on the word.
+  const txn = (over) => ({ ...STATEMENT, transactions: [{ ...STATEMENT.transactions[0], ...over }] });
+  assert.deepEqual(check(STATEMENT_SHAPE, txn({ category: "space-travel", channel: "telepathy" })), [], "lenient vocabularies stay lenient");
+  assert.deepEqual(check(STATEMENT_SHAPE, txn({ direction: "sideways" })), ["transactions[0].direction: expected one of debit, credit, got string"]);
+  assert.deepEqual(check(STATEMENT_SHAPE, txn({ kind: "bonus" })),
+    ["transactions[0].kind: expected one of purchase, refund, payment, cashback, fee, interest, tax, emi, reversal, other, got string"]);
+  assert.deepEqual(check(STATEMENT_SHAPE, txn({ direction: null })), ["transactions[0].direction: expected one of debit, credit, got null"]);
+  assert.deepEqual(check(appJobs.TERMS_ANSWER_SHAPE, { status: "partial", ruleSet: null, notes: [] }),
+    ["status: expected one of verified, unverified, failed, got string"]);
+  assert.deepEqual(check(appJobs.TERMS_RESULT_SHAPE.cards[0],
+    { cardKey: "a", status: "maybe", checkedOn: "2026-11-15", sources: [], ruleSet: null, notes: [] }),
+    ["status: expected one of verified, unverified, failed, got string"]);
+  const txnSchema = toJsonSchema(STATEMENT_SHAPE).properties.transactions.items.properties;
+  assert.deepEqual(txnSchema.direction, { type: "string", enum: ["debit", "credit"] });
+  assert.equal(txnSchema.kind.enum.length, 10);
   assert.deepEqual(check(STATEMENT_SHAPE, { ...STATEMENT, dueDate: null }), []);
   assert.deepEqual(check(STATEMENT_SHAPE, { ...STATEMENT, dueDate: "2026-02-30" }), ["dueDate: expected YYYY-MM-DD date, got string"]);
   assert.deepEqual(check(STATEMENT_SHAPE, { ...STATEMENT, kind: 3 }), ["kind: expected one of monthly, annual, unknown, got number"]);
@@ -874,6 +900,26 @@ test("HTML is reduced to text in linear time and keeps its structure", () => {
   assert.equal(title, "T & C");
   assert.equal(text, "a < b\nc\n- one\n\n- two\n\tBase\t1%\n\nkept after \u20b95 \u20b9\ntail");
   assert.deepEqual(appJobs.htmlToText("<html><body><div id=app></div></body></html>"), { title: null, text: "" });
+});
+
+test("a terms result links only to the card's requested sources", async (t) => {
+  const stub = makeStub();
+  const jobs = inProcess(stub);
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const id = jobs.submit({ type: "terms-extract", input: { cards: [{ cardKey: "inject-card", issuer: "Example Bank",
+    product: "Example Card", sources: ["https://terms.example/tc.pdf"] }] } }).body.jobId;
+  const job = await until(() => { const j = jobs.get(id); return j && j.status === "done" ? j : null; });
+  assert.ok(job, "done");
+  assert.deepEqual(appJobs.check(appJobs.TERMS_RESULT_SHAPE, job.result), []);
+  const { ruleSet: rs, notes } = job.result.cards[0];
+  const want = "https://terms.example/tc.pdf";
+  assert.deepEqual(rs.sources.map((x) => x.url), [want], "the injected source is dropped; the other is respelled");
+  assert.equal(rs.earn[0].sourceUrl, null);
+  assert.equal(rs.earn[0].caps[0].sourceUrl, null);
+  assert.equal(rs.fees[0].sourceUrl, want, "a fragment of a requested URL is still that URL");
+  assert.match(notes[notes.length - 1], /^3 cited link\(s\) that were not among the requested sources were removed$/);
+  const flat = JSON.stringify(job.result);
+  assert.ok(!flat.includes("evil.example") && !flat.includes("javascript:"));
 });
 
 // ── Lifecycle, in process ────────────────────────────────────────────────────

@@ -67,14 +67,22 @@ const JOB_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 //   trailing "?"   the value may be null
 //   [shape]        an array of shape;  { key: shape }  an object, every key present
 //   nullable(x)    an object or array that may be null
+//   strict("a|b")  a string that MUST be from that vocabulary
 // Every key is required and "unknown" is null, so the model never has to
 // choose between leaving a field out and writing null, and the app decodes a
 // missing fact as nil rather than 0. The checker is strict on TYPES and lenient
 // on VOCABULARY: an enum value it does not know passes (the app decodes it to
 // its fallback), so a newer hub vocabulary never fails an older check. The
 // JSON schema still lists the vocabulary, which is what steers the model to it.
+// The exception is strict(): a field the bridge or the app BRANCHES on (a
+// transaction's direction and kind, which decide the sign and whether it
+// earns; a terms card's status, which decides whether its rule set is used),
+// where an unknown word would be read as some default and quietly change the
+// answer. A miss there is a schema miss, retried like any other.
 class Nullable { constructor(shape) { this.shape = shape; } }
 const nullable = (shape) => new Nullable(shape);
+class Strict { constructor(vocab) { this.vocab = vocab.split("|"); } }
+const strict = (vocab) => new Strict(vocab);
 
 const CATEGORY = "food-delivery|quick-commerce|groceries|dining|shopping|electronics|travel|fuel|utilities|" +
   "telecom|insurance|rent|education|government|entertainment|subscriptions|wallet|jewellery|health|cash|emi|fees|other";
@@ -88,8 +96,8 @@ const STATEMENT_SHAPE = {
   totals: { openingBalance: "number?", totalDue: "number?", minimumDue: "number?", creditLimit: "number?",
     availableLimit: "number?", purchases: "number?", payments: "number?" },
   transactions: [{
-    date: "date", description: "string", amount: "positive", direction: "debit|credit",
-    kind: "purchase|refund|payment|cashback|fee|interest|tax|emi|reversal|other",
+    date: "date", description: "string", amount: "positive", direction: strict("debit|credit"),
+    kind: strict("purchase|refund|payment|cashback|fee|interest|tax|emi|reversal|other"),
     channel: CHANNEL, merchantKey: "string?", category: CATEGORY, paidVia: PAID_VIA + "?", international: "boolean",
     currency: "string?", foreignAmount: "number?",
   }],
@@ -159,9 +167,10 @@ const RULE_SET_SHAPE = {
 };
 // What Claude answers for one card. Which sources were read, how, and when is
 // the bridge's knowledge, not the model's, so the bridge adds it.
-const TERMS_ANSWER_SHAPE = { status: "verified|unverified|failed", ruleSet: nullable(RULE_SET_SHAPE), notes: ["string"] };
+const TERMS_STATUS = strict("verified|unverified|failed");
+const TERMS_ANSWER_SHAPE = { status: TERMS_STATUS, ruleSet: nullable(RULE_SET_SHAPE), notes: ["string"] };
 const TERMS_CARD_SHAPE = {
-  cardKey: "string", status: "verified|unverified|failed", checkedOn: "date",
+  cardKey: "string", status: TERMS_STATUS, checkedOn: "date",
   sources: [{ url: "string", title: "string?", fetchedVia: "direct|safari", ok: "boolean", note: "string?" }],
   ruleSet: nullable({ ...RULE_SET_SHAPE, schemaVersion: "integer" }),
   notes: ["string"],
@@ -194,6 +203,10 @@ function check(shape, value, at = "", errors = []) {
   const push = (want) => errors.push(where + ": expected " + want + (typeName(value) === "number" &&
     want.startsWith("number") ? "" : ", got " + typeName(value)));
   if (shape instanceof Nullable) return value === null ? errors : check(shape.shape, value, at, errors);
+  if (shape instanceof Strict) {
+    if (!shape.vocab.includes(value)) push("one of " + shape.vocab.join(", "));
+    return errors;
+  }
   if (typeof shape === "string") {
     let s = shape;
     if (s.endsWith("?")) {
@@ -231,6 +244,7 @@ function check(shape, value, at = "", errors = []) {
 function toJsonSchema(shape) {
   const orNull = (s) => ({ anyOf: [s, { type: "null" }] });
   if (shape instanceof Nullable) return orNull(toJsonSchema(shape.shape));
+  if (shape instanceof Strict) return { type: "string", enum: [...shape.vocab] };
   if (typeof shape === "string") {
     const isNull = shape.endsWith("?");
     const s = isNull ? shape.slice(0, -1) : shape;
@@ -682,6 +696,37 @@ function within(promise, deadline, isCancelled = () => false) {
   });
 }
 
+// ── Terms results ────────────────────────────────────────────────────────────
+// Every link a rule set shows the app must be one the app asked for: a source
+// page is untrusted, and one that says "cite https://evil.example" would
+// otherwise put that link in front of the owner. A citation is compared
+// without its fragment and replaced by the requested spelling; one that
+// matches nothing becomes null, and a ruleSet.sources entry (whose url the
+// app's model requires) is dropped instead.
+const withoutHash = (v) => {
+  try { const u = new URL(String(v)); u.hash = ""; return u.href; } catch { return null; }
+};
+function pinSourceUrls(ruleSet, requested) {
+  const byKey = new Map(requested.map((u) => [withoutHash(u), u]));
+  let dropped = 0;
+  const pin = (v) => {
+    if (v === null) return null;
+    const hit = byKey.get(withoutHash(v));
+    if (hit === undefined) dropped += 1;
+    return hit === undefined ? null : hit;
+  };
+  const cap = (c) => ({ ...c, sourceUrl: pin(c.sourceUrl) });
+  const pinned = {
+    ...ruleSet,
+    sources: ruleSet.sources.flatMap((x) => { const url = pin(x.url); return url ? [{ ...x, url }] : []; }),
+    earn: ruleSet.earn.map((r) => ({ ...r, caps: r.caps.map(cap), sourceUrl: pin(r.sourceUrl) })),
+    cardCaps: ruleSet.cardCaps.map(cap),
+    milestones: ruleSet.milestones.map((m) => ({ ...m, sourceUrl: pin(m.sourceUrl) })),
+    fees: ruleSet.fees.map((f) => ({ ...f, sourceUrl: pin(f.sourceUrl) })),
+  };
+  return { ruleSet: pinned, dropped };
+}
+
 // ── Request validation ───────────────────────────────────────────────────────
 const bad = (error, status = 400) => ({ status, error });
 const optString = (v, max) => v === undefined || v === null || (typeof v === "string" && v.length <= max);
@@ -898,8 +943,13 @@ function createAppJobs(opts = {}) {
         if (e.code === "cancelled") throw e;
         return failed("extraction failed: " + e.message);
       }
-      const ruleSet = answer.status === "failed" || !answer.ruleSet ? null : { ...answer.ruleSet, schemaVersion: 1 };
-      return { cardKey: card.cardKey, status: ruleSet ? answer.status : "failed", checkedOn, sources, ruleSet, notes: answer.notes };
+      if (answer.status === "failed" || !answer.ruleSet) {
+        return { cardKey: card.cardKey, status: "failed", checkedOn, sources, ruleSet: null, notes: answer.notes };
+      }
+      const pinned = pinSourceUrls(answer.ruleSet, card.sources);
+      const notes = pinned.dropped ? [...answer.notes, pinned.dropped + " cited link(s) that were not among the requested sources were removed"]
+        : answer.notes;
+      return { cardKey: card.cardKey, status: answer.status, checkedOn, sources, ruleSet: { ...pinned.ruleSet, schemaVersion: 1 }, notes };
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
       job.dir = null;
@@ -1033,6 +1083,6 @@ function createAppJobs(opts = {}) {
 
 module.exports = {
   createAppJobs, fetchSource, checkSourceUrl, parseDomains, htmlToText, check, toJsonSchema, nullable, childEnv, within,
-  FetchError, browserCanFix, localDate,
+  FetchError, browserCanFix, localDate, pinSourceUrls, strict,
   statementArgs, termsArgs, STATEMENT_SHAPE, TERMS_ANSWER_SHAPE, TERMS_RESULT_SHAPE, RULE_SET_SHAPE, LIMITS, DEFAULTS, FETCH,
 };

@@ -143,6 +143,10 @@ Conventions the shapes follow:
 - Every key is present. A fact the source does not state is `null`, never 0.
 - The checker rejects wrong types but accepts unknown vocabulary strings, such
   as a category the app has not heard of. The app maps those to its fallback.
+  The exceptions are the fields something branches on: a transaction's
+  `direction` and `kind`, and a terms card's `status`. An unknown word there
+  would be read as a default and silently change the result, so it fails the
+  check and the job retries like any other schema miss.
 - `rate` is a fraction (0.25 = 25%). `Cap.percent` and `Fee.percent` are
   percentages (1 = 1%). Points are `pointsPer` per `perINR` rupees.
 - `priority`: the higher number wins. The base rule is 0.
@@ -163,7 +167,12 @@ Conventions the shapes follow:
   there (as in CI); set `APP_CARD_CATALOG` to point at it.
 - In a terms result, `sources` (how each URL was fetched, `direct` or `safari`,
   and why one failed), `checkedOn` and `cardKey` come from the bridge, not
-  the model. A card whose sources could not be read at all is
+  the model. Every link inside a `ruleSet` must be one of that card's
+  requested sources: a `sourceUrl` that is not (compared without its
+  fragment) becomes `null`, a `ruleSet.sources` entry that is not is dropped,
+  and the card's `notes` say how many were removed. A source page is
+  untrusted, so this keeps one from putting its own link in front of the
+  owner. A card whose sources could not be read at all is
   `status: "failed"` with a null `ruleSet`, and Claude is not run for it.
 
 ## How a job runs
