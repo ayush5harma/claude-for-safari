@@ -11,6 +11,7 @@ const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
 const { spawn, execFileSync } = require("node:child_process");
 const fs = require("node:fs");
+const http = require("node:http");
 const https = require("node:https");
 const net = require("node:net");
 const os = require("node:os");
@@ -287,6 +288,41 @@ test("input limits and the fetch allowlist are enforced before anything runs", a
   const r = await post(bare.base, terms([card()]));
   assert.equal(r.status, 400);
   assert.match((await r.json()).error, /BRIDGE_APP_FETCH_DOMAINS is empty/);
+});
+
+// A POST written in the given pieces, each its own chunk on the wire, with no
+// content-length, so the hub's own body reader sees where they split.
+const postInPieces = (base, pieces) => new Promise((resolve) => {
+  const req = http.request(base + "/app/jobs", { method: "POST", headers: appHeaders }, (res) => {
+    let body = "";
+    res.setEncoding("utf8");
+    res.on("data", (c) => { body += c; });
+    res.on("end", () => resolve({ status: res.statusCode, body }));
+  });
+  req.on("error", (e) => resolve({ error: e.code || e.message }));
+  (async () => {
+    for (const p of pieces) { req.write(p); await sleep(40); }
+    req.end();
+  })();
+});
+
+test("a request body is read as bytes: a character split across chunks arrives whole, and the cap counts bytes", async (t) => {
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin });
+  t.after(async () => { await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const body = Buffer.from(JSON.stringify(statementBody("Annual fee \u20b91,500 " + SECRET)));
+  const cut = body.indexOf(Buffer.from("\u20b9")) + 1;   // inside the rupee sign's three bytes
+  const r = await postInPieces(hub.base, [body.subarray(0, cut), body.subarray(cut)]);
+  assert.equal(r.status, 202, JSON.stringify(r));
+  const job = await waitJob(hub.base, JSON.parse(r.body).jobId);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.ok(stub.calls()[0].stdin.includes("Annual fee \u20b91,500"), "the rupee sign reached the CLI intact");
+  // 800,000 three-byte characters: 2.4 MB on the wire but fewer than 2 MB characters.
+  const big = Buffer.from(JSON.stringify({ type: "statement-extract", input: { text: "x", pad: "\u20b9".repeat(800000) } }));
+  const r2 = await postInPieces(hub.base, [big.subarray(0, 1000000), big.subarray(1000000)]);
+  assert.ok(r2.error || r2.status === 413, "refused: " + JSON.stringify(r2).slice(0, 200));
+  await sleep(200);
+  assert.equal(stub.calls().length, 1, "the oversized body never became a job");
 });
 
 // ── Statement jobs ───────────────────────────────────────────────────────────

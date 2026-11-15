@@ -934,18 +934,30 @@ function runHub() {
     return withSlot(await dispatch(inst, tool, route.args));
   };
 
+  // Buffers, decoded once at the end, and a cap in BYTES. Appending each chunk
+  // to a string decoded it on its own, so a multi-byte character split across
+  // two chunks arrived as two U+FFFD (a rupee sign in a statement, measured by
+  // the test that pins this), and the cap counted characters, letting up to
+  // three times max bytes of non-ASCII text through.
   const readBody = (req, max = MAX_BODY) => new Promise((resolve, reject) => {
-    let data = "";
+    const chunks = [];
+    let size = 0;
     let done = false;
     const fail = (e) => { if (done) return; done = true; reject(e); };
     req.on("data", (c) => {
-      data += c;
+      if (done) return;
+      size += c.length;
       // destroy() emits "aborted"/"close", not necessarily "error", so the
       // promise has to be settled HERE: without this the request handler
       // awaited a promise that never resolved and the connection leaked.
-      if (data.length > max) { req.destroy(); fail(new Error("request body too large")); }
+      if (size > max) { req.destroy(); fail(new Error("request body too large")); return; }
+      chunks.push(c);
     });
-    req.on("end", () => { if (done) return; done = true; try { resolve(JSON.parse(data || "{}")); } catch (e) { reject(e); } });
+    req.on("end", () => {
+      if (done) return;
+      done = true;
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")); } catch (e) { reject(e); }
+    });
     req.on("error", fail);
     req.on("aborted", () => fail(new Error("request aborted")));
   });
