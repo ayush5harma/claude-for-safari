@@ -33,6 +33,7 @@ their own approval model.
 | `extension/content.js` | panel, tab mentions, attachments, and page-side tools |
 | `extension/background.js` | Safari APIs, routing, and bridge requests |
 | `bridge/claude-safari-bridge.js` | loopback hub, CLI process control, and MCP server |
+| `bridge/app-jobs.js` | optional `/app/*` extraction jobs for a native companion app ([APP-JOBS.md](APP-JOBS.md)) |
 | `extension/options.*` | per-profile settings and Chrome-UA site list |
 | `build-app.sh`, `build-ios.sh` | signed-wrapper and iOS builds |
 | `HOSTING.md` | authenticated remote-hub deployment |

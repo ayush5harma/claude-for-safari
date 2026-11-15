@@ -30,6 +30,12 @@
 //     Sec-Fetch-Site, which every browser sends and curl/node never do.
 //   - BRIDGE_PANEL_TOOLS caps what a chat turn may do in the browser, because
 //     a panel turn's prompt contains page text nobody vetted. Default "read".
+//   - /app/* (bridge/app-jobs.js, docs/APP-JOBS.md) exists only when
+//     BRIDGE_APP_TOKEN is set, takes that token and no other, serves native
+//     clients only (no Origin, no Sec-Fetch-Site), and the app token opens
+//     nothing outside /app/*. Its one reach into the browser is the terms
+//     jobs' Safari fallback, off unless BRIDGE_APP_SAFARI_FALLBACK=1 and then
+//     fenced (see THE SAFARI FALLBACK below).
 
 "use strict";
 const http = require("node:http");
@@ -57,6 +63,15 @@ const CODEX_PANEL = process.env.BRIDGE_CODEX_PANEL === "1";
 const CODEX_API_KEY = process.env.CODEX_API_KEY || "";
 delete process.env.CODEX_API_KEY;
 const CODEX_REQUIRE_API_KEY = process.env.BRIDGE_CODEX_REQUIRE_API_KEY === "1";
+// The companion app's token, captured and removed from the ambient environment
+// like CODEX_API_KEY: every panel turn's claude and its MCP child inherit the
+// hub's environment, and none of them has a use for it.
+const APP_TOKEN = process.env.BRIDGE_APP_TOKEN || "";
+delete process.env.BRIDGE_APP_TOKEN;
+const APP_TOKEN_MIN = 16;
+// A statement is at most 200,000 characters; JSON escaping can grow that
+// several-fold for non-ASCII text, and nothing else in an app request is large.
+const APP_BODY_MAX = 2 * 1024 * 1024;
 
 // ── Several extension instances, one hub ──────────────────────────────────────
 // Safari runs one copy of the extension PER PROFILE, and every copy long-polls
@@ -772,13 +787,12 @@ function runHub() {
   const cliOriginOk = (req) => !req.headers.origin && !req.headers["sec-fetch-site"];
   // Bearer gate, on EVERY endpoint when a token is configured. Constant-time
   // compare: an equality that short-circuits leaks the prefix by timing.
-  const tokenOk = (req) => {
-    if (!TOKEN) return true;
-    const h = String(req.headers.authorization || "");
-    const want = Buffer.from("Bearer " + TOKEN);
-    const got = Buffer.from(h);
+  const bearerIs = (req, secret) => {
+    const want = Buffer.from("Bearer " + secret);
+    const got = Buffer.from(String(req.headers.authorization || ""));
     return got.length === want.length && crypto.timingSafeEqual(got, want);
   };
+  const tokenOk = (req) => !TOKEN || bearerIs(req, TOKEN);
 
   // Answer a waiter once and clean up everything attached to its id. The
   // answer carries the instance that took the call, so the router can stamp
@@ -922,24 +936,202 @@ function runHub() {
     return withSlot(await dispatch(inst, tool, route.args));
   };
 
-  const readBody = (req) => new Promise((resolve, reject) => {
-    let data = "";
+  // Buffers, decoded once at the end, and a cap in BYTES. Appending each chunk
+  // to a string decoded it on its own, so a multi-byte character split across
+  // two chunks arrived as two U+FFFD (a rupee sign in a statement, measured by
+  // the test that pins this), and the cap counted characters, letting up to
+  // three times max bytes of non-ASCII text through.
+  const readBody = (req, max = MAX_BODY) => new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
     let done = false;
     const fail = (e) => { if (done) return; done = true; reject(e); };
     req.on("data", (c) => {
-      data += c;
+      if (done) return;
+      size += c.length;
       // destroy() emits "aborted"/"close", not necessarily "error", so the
       // promise has to be settled HERE: without this the request handler
       // awaited a promise that never resolved and the connection leaked.
-      if (data.length > MAX_BODY) { req.destroy(); fail(new Error("request body too large")); }
+      if (size > max) { req.destroy(); fail(new Error("request body too large")); return; }
+      chunks.push(c);
     });
-    req.on("end", () => { if (done) return; done = true; try { resolve(JSON.parse(data || "{}")); } catch (e) { reject(e); } });
+    req.on("end", () => {
+      if (done) return;
+      done = true;
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")); } catch (e) { reject(e); }
+    });
     req.on("error", fail);
     req.on("aborted", () => fail(new Error("request aborted")));
   });
 
+  // ── App jobs (/app/*; bridge/app-jobs.js, docs/APP-JOBS.md) ─────────────────
+  // Required only when switched on, so a deployment that ships this file
+  // alone keeps working until it sets BRIDGE_APP_TOKEN.
+  let appJobs = null;
+  let appMod = null;
+  if (APP_TOKEN) {
+    const refuse = (why) => {
+      process.stderr.write("claude-safari-bridge: refusing to start: " + why + "\n");
+      process.exit(1);
+    };
+    if (APP_TOKEN.length < APP_TOKEN_MIN) refuse("BRIDGE_APP_TOKEN is shorter than " + APP_TOKEN_MIN + " characters");
+    // One token for both would undo the separation: the phone's token must
+    // not be able to drive the browser (beyond the opt-in, capped fallback).
+    if (APP_TOKEN === TOKEN) refuse("BRIDGE_APP_TOKEN equals BRIDGE_TOKEN; give the app its own token");
+    try {
+      appMod = require(path.join(__dirname, "app-jobs.js"));
+    } catch (e) {
+      refuse("BRIDGE_APP_TOKEN is set but app-jobs.js did not load from beside the bridge (" + e.message + ")");
+    }
+    // THE SAFARI FALLBACK, OFF UNLESS BRIDGE_APP_SAFARI_FALLBACK=1. With it
+    // on, the app token can make the owner's Safari load pages, which is
+    // exactly what this token is otherwise kept from, so the reach is fenced:
+    // only for a source whose direct fetch failed in a way a browser can get
+    // past (app-jobs.js, browserCanFix), only allowlisted URLs, at most
+    // safariPerJob pages per job and safariPerHour per hour, and ONE
+    // background tab per job: opened with newTab true, active false (the same
+    // routing a /call uses, so it lands in the owner's current window without
+    // changing what it shows), re-navigated for the job's later sources, and
+    // sent to about:blank when the job ends. The extension has no close op,
+    // so the blank tab stays; adding one is a follow-up (docs/APP-JOBS.md).
+    // Before it re-navigates or blanks the tab the bridge lists the tabs, and
+    // a tab the owner has since switched to (it is the one its window shows)
+    // or closed is left alone: the next source opens a fresh background tab
+    // and the blanking is skipped, so the page the owner is reading never
+    // changes under them. The list and the navigate are two calls, so a
+    // switch in between still lands; that window is a few milliseconds.
+    // navigate answers before the page has loaded, hence the settle wait
+    // before each read.
+    const SAFARI_SETTLE_MS = 2500;
+    const SAFARI_READS = 8;
+    const safariSession = () => {
+      let tabId = null;
+      let chain = Promise.resolve();
+      // Every call on the job's tab runs after the one before, including one
+      // the job stopped waiting for at its deadline or a DELETE, so the blank
+      // page release() loads is always the tab's last navigation, and a first
+      // navigate that answers late still records the tab it opened. argsOf
+      // runs (and may await) when the call's turn comes; null skips the call.
+      const call = (tool, argsOf, after = (r) => r) => {
+        const p = chain.then(async () => { const args = await argsOf(); return args ? routeCall(tool, args) : null; }).then(after);
+        chain = p.catch(() => {});
+        return p;
+      };
+      // Whether the job's tab can be driven: "ok" (still open, in the
+      // background), "shown" (the owner switched to it) or "gone". A listing
+      // that fails or lacks the tab counts as "gone", never as ok: the tab
+      // would be left alone and the job would open another. In a hub with
+      // several Safari profiles the listing can number a tab no profile has
+      // reached yet under another profile's id; that too only costs an extra
+      // tab, never a touch of one the owner has.
+      const tabState = async () => {
+        const r = await routeCall("tabs", {});
+        const tab = r && Array.isArray(r.result) ? r.result.find((x) => x && x.tabId === tabId) : null;
+        return !tab ? "gone" : tab.active ? "shown" : "ok";
+      };
+      const read = async (url, { deadline, isCancelled }) => {
+        const step = (p) => appMod.within(p, deadline, isCancelled);
+        const nav = await step(call("navigate",
+          async () => {
+            // The owner took the tab or closed it: leave it, open another.
+            if (tabId !== null && (await tabState()) !== "ok") tabId = null;
+            return tabId === null ? { url, newTab: true, active: false } : { url, tabId, newTab: false, active: false };
+          },
+          (r) => {
+            if (tabId === null && r && r.result && typeof r.result.tabId === "number") tabId = r.result.tabId;
+            return r;
+          }));
+        if (nav.error) throw new Error(nav.error);
+        if (tabId === null) throw new Error("the extension opened no tab");
+        let page = null;
+        let last = "no read answered";
+        for (let i = 0; i < SAFARI_READS; i++) {
+          await step(new Promise((r) => setTimeout(r, SAFARI_SETTLE_MS)));
+          const r = await step(call("read", () => ({ tabId, maxChars: appMod.FETCH.maxBytes })));
+          if (r.error) { last = r.error; continue; }
+          page = r.result || null;
+          if (page && /^https:/.test(String(page.url || "")) && String(page.text || "").trim().length >= appMod.FETCH.minText) break;
+        }
+        if (!page) throw new Error(last);
+        return { url: page.url, title: page.title, text: page.text };
+      };
+      const release = () => call("navigate", async () =>
+        (tabId !== null && (await tabState()) === "ok" ? { url: "about:blank", tabId, newTab: false, active: false } : null));
+      return { read, release };
+    };
+    try {
+      appJobs = appMod.createAppJobs({
+        claudeBin,
+        fetchDomains: process.env.BRIDGE_APP_FETCH_DOMAINS,
+        timeZone: process.env.BRIDGE_APP_TIME_ZONE || undefined,
+        safari: process.env.BRIDGE_APP_SAFARI_FALLBACK === "1"
+          ? { available: () => currentInstances(liveInstances()).length > 0, session: safariSession } : null,
+      });
+    } catch (e) {
+      refuse(e.message);
+    }
+    // Kill the children, remove their temp dirs and blank the jobs' Safari
+    // tabs on the way down, then die by the same signal so a supervisor sees
+    // what it sent. The tabs need the extension's answer, so the exit waits
+    // for it, at most APP_CLOSE_WAIT_MS; once() hands a second signal back to
+    // the default action, which ends the wait at once.
+    const APP_CLOSE_WAIT_MS = 2000;
+    for (const sig of ["SIGTERM", "SIGINT"]) {
+      process.once(sig, () => {
+        const bound = new Promise((r) => setTimeout(r, APP_CLOSE_WAIT_MS).unref());
+        Promise.race([appJobs.close(), bound]).finally(() => process.kill(process.pid, sig));
+      });
+    }
+  }
+  // App responses carry statement-derived data: no cache may keep them.
+  const appJson = (res, code, obj) => {
+    res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(JSON.stringify(obj));
+  };
+  const handleApp = async (req, res, pathname) => {
+    if (!appJobs) return json(res, 404, { error: "not found" });
+    if (!bearerIs(req, APP_TOKEN)) return appJson(res, 401, { error: "unauthorized" });
+    // Native clients only. A browser sends one of these on every request (the
+    // caller table above), and the companion app never does; refusing them
+    // keeps a page that somehow learned the token from using it.
+    if (req.headers.origin !== undefined || req.headers["sec-fetch-site"] !== undefined) {
+      return appJson(res, 403, { error: "forbidden: /app/* serves native clients only" });
+    }
+    if (pathname === "/app/health") {
+      return req.method === "GET" ? appJson(res, 200, appJobs.health()) : appJson(res, 405, { error: "method not allowed" });
+    }
+    if (pathname === "/app/jobs") {
+      if (req.method !== "POST") return appJson(res, 405, { error: "method not allowed" });
+      const tooBig = "the request body is larger than " + APP_BODY_MAX / 1048576 + " MB";
+      if (Number(req.headers["content-length"]) > APP_BODY_MAX) return appJson(res, 413, { error: tooBig });
+      let body;
+      try {
+        body = await readBody(req, APP_BODY_MAX);
+      } catch (e) {
+        const big = /too large/.test(String(e && e.message));
+        return appJson(res, big ? 413 : 400, { error: big ? tooBig : "the body is not JSON" });
+      }
+      const out = appJobs.submit(body);
+      return appJson(res, out.status, out.body);
+    }
+    const m = /^\/app\/jobs\/([^/]+)$/.exec(pathname);
+    if (m && req.method === "GET") {
+      const view = appJobs.get(m[1]);
+      return view ? appJson(res, 200, view) : appJson(res, 404, { error: "no such job (a finished job is purged 15 minutes after it ends)" });
+    }
+    if (m && req.method === "DELETE") {
+      return appJobs.remove(m[1]) ? appJson(res, 200, { jobId: m[1].toLowerCase(), deleted: true }) : appJson(res, 404, { error: "no such job" });
+    }
+    return appJson(res, 404, { error: "not found" });
+  };
+
   const server = http.createServer(async (req, res) => {
     try {
+      const pathname = String(req.url || "").split("?")[0];
+      if (pathname === "/app" || pathname.startsWith("/app/")) return await handleApp(req, res, pathname);
+      // The app token opens /app/* and nothing else -- also on a loopback hub
+      // with no BRIDGE_TOKEN, where tokenOk alone would let it through.
+      if (APP_TOKEN && bearerIs(req, APP_TOKEN)) return json(res, 401, { error: "unauthorized" });
       if (!tokenOk(req)) return json(res, 401, { error: "unauthorized" });
       // Cheap reachability probe for the panel's hub-settings status line;
       // token-gated like everything, allowed from any origin (it leaks

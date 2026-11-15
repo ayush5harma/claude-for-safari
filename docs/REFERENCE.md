@@ -566,6 +566,10 @@ are optional and every default is the standalone behaviour.
 | `BRIDGE_PANEL_TOOLS` | `read` | What a **panel** turn may do in the browser: `read` (tabs/read/screenshot) or `all`. Reported as `panelTools` by `/health` and `/status`. Does not affect the stdio MCP mode. See [Security](#security). |
 | `BRIDGE_CODEX_PANEL` | unset | Set to `1` to offer Codex in the panel. Hosted deployments also need a scoped `CODEX_API_KEY` in their secret store. |
 | `BRIDGE_CODEX_REQUIRE_API_KEY` | unset | Set to `1` on hosted deployments so Codex is advertised only when `CODEX_API_KEY` is present. Local and mesh-bound Macs leave it unset and use the CLI's normal login. |
+| `BRIDGE_APP_TOKEN` | unset | Turns on `/app/*`, the companion-app jobs, and is the only token those routes accept. It must be at least 16 characters and differ from `BRIDGE_TOKEN`. See [APP-JOBS.md](APP-JOBS.md). |
+| `BRIDGE_APP_FETCH_DOMAINS` | empty | The exact hosts a terms job may fetch from, comma-separated. Empty means terms jobs are refused. See [APP-JOBS.md](APP-JOBS.md). |
+| `BRIDGE_APP_SAFARI_FALLBACK` | unset (off) | `1` lets a terms job read a source the hub could not fetch through one background Safari tab per job, capped at 5 pages per job and 20 per hour. See [APP-JOBS.md](APP-JOBS.md). |
+| `BRIDGE_APP_TIME_ZONE` | `Asia/Kolkata` | The IANA time zone a job's "today" (`checkedOn`, the date in the terms prompt) is computed in. The hub refuses to start on an unknown zone. |
 | `CLAUDE_BIN` | `~/.local/bin/claude`, else `claude` | The CLI the hub spawns for panel turns. |
 | `CODEX_BIN` | `codex` | The Codex CLI the hub spawns for Codex panel turns. |
 

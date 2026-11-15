@@ -27,7 +27,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE_SRC="$HERE/../bridge/claude-safari-bridge.js"
-[ -f "$BRIDGE_SRC" ] || { echo "bridge source not found beside this script" >&2; exit 1; }
+APP_JOBS_SRC="$HERE/../bridge/app-jobs.js"   # /app/* jobs, loaded when BRIDGE_APP_TOKEN is set
+[ -f "$BRIDGE_SRC" ] && [ -f "$APP_JOBS_SRC" ] || { echo "bridge source not found beside this script" >&2; exit 1; }
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -53,6 +54,7 @@ fi
 # home is the persistent disk that keeps --resume continuity across reboots.
 id -u bridge >/dev/null 2>&1 || useradd -m -s /bin/bash bridge
 install -o bridge -g bridge -m 0755 "$BRIDGE_SRC" /home/bridge/claude-safari-bridge.js
+install -o bridge -g bridge -m 0644 "$APP_JOBS_SRC" /home/bridge/app-jobs.js
 sudo -u bridge npm install -g --prefix /home/bridge/.npm-global @anthropic-ai/claude-code >/dev/null
 
 # Secrets live in an EnvironmentFile the unit reads, 0600 root-owned.
