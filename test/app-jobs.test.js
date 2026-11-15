@@ -743,6 +743,25 @@ test("the fetcher re-checks every redirect and caps time, size and hops", async 
   await assert.rejects(appJobs.fetchSource("https://" + host + "/", { allow: new Set([host]), connectMs: 200 }), /no connection within 0.2 s/);
 });
 
+test("HTML is reduced to text in linear time and keeps its structure", () => {
+  // Every unit here made the old regex stripper quadratic: 160 KB of "<script "
+  // took 2.0 s and 40 KB of "<" 0.8 s (measured 2026-11-15), so a hostile 8 MB
+  // page, the fetch cap, would have held the hub's event loop for over an hour.
+  for (const unit of ["<script ", "<!--", "<", "<title>", "<p ", "<head>", "&abcdefgh", "</div ", "\t \t\n"]) {
+    const html = unit.repeat(Math.ceil((8 * 1024 * 1024) / unit.length));
+    const t0 = Date.now();
+    appJobs.htmlToText(html);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 3000, JSON.stringify(unit) + " x 8 MB took " + ms + " ms");
+  }
+  const { title, text } = appJobs.htmlToText("<!DOCTYPE html><HTML><Head><TITLE>T &amp; C</TITLE><Style>.x{}</Style></Head>" +
+    "<BODY>a < b<br>c<!-- gone --><UL><LI>one</LI><li>two</ul><Table><TR><TD>Base</TD><td>1%</td></TR></Table>" +
+    "<header-line>kept</header-line><SCRIPT type=x>bad()</script ><p>after &#8377;5 &rupee;</p><noscript>no</noscript>tail<p");
+  assert.equal(title, "T & C");
+  assert.equal(text, "a < b\nc\n- one\n\n- two\n\tBase\t1%\n\nkept after \u20b95 \u20b9\ntail");
+  assert.deepEqual(appJobs.htmlToText("<html><body><div id=app></div></body></html>"), { title: null, text: "" });
+});
+
 // ── Lifecycle, in process ────────────────────────────────────────────────────
 const inProcess = (stub, extra = {}) => appJobs.createAppJobs({
   claudeBin: stub.bin, env: { PATH: process.env.PATH, HOME: os.homedir(), BRIDGE_TOKEN: "x", BRIDGE_APP_TOKEN: "y" },

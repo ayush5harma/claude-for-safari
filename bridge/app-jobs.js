@@ -506,21 +506,83 @@ function decodeEntities(s) {
 
 // Enough structure for a model to read a T&C page: block ends become line
 // breaks, table cells tabs, list items dashes; scripts, styles and the head go.
+//
+// ONE PASS WITH indexOf, NO BACKTRACKING REGEX. The regex stripper this
+// replaces was quadratic on a page an attacker controls: 160 KB of "<script "
+// (each open tag scanning to the end for its close) took 2.0 s and 40 KB of
+// "<" took 0.8 s (measured 2026-11-15), so an 8 MB page -- the fetch cap --
+// would have held the hub's event loop for over an hour. Every search below
+// starts where the last one ended, so the work is linear in the page, and no
+// cut is needed (a cut would drop the text of a legitimate page whose head is
+// a megabyte of inline scripts).
+const RAW_TEXT = new Set(["script", "style", "noscript", "template", "svg", "head", "iframe"]);
+const BLOCK_END = new Set(["p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "table",
+  "ul", "ol", "dt", "dd", "blockquote", "pre", "header", "footer", "main"]);
+const TAG_NAME = /^<(\/?)([a-z][a-z0-9-]*)/;
+const NAME_CHAR = /[a-z0-9-]/;
+
+// The first `<tag` or `</tag` at or after `from` whose name is exactly `name`
+// (so `</head` never matches `</header`), or -1.
+function findTag(lower, open, from) {
+  let at = lower.indexOf(open, from);
+  while (at >= 0 && NAME_CHAR.test(lower[at + open.length] || "")) at = lower.indexOf(open, at + 1);
+  return at;
+}
+
+// The index just past the `>` of the element's closing tag, or the end of
+// the page when it never closes.
+function pastClose(lower, name, from) {
+  const at = findTag(lower, "</" + name, from);
+  const gt = at < 0 ? -1 : lower.indexOf(">", at);
+  return gt < 0 ? lower.length : gt + 1;
+}
+
+function htmlTitle(s, lower) {
+  const at = findTag(lower, "<title", 0);
+  const gt = at < 0 ? -1 : lower.indexOf(">", at);
+  const end = gt < 0 ? -1 : findTag(lower, "</title", gt);
+  if (end < 0) return null;
+  return decodeEntities(s.slice(gt + 1, end)).replace(/\s+/g, " ").trim() || null;
+}
+
 function htmlToText(html) {
-  const title = decodeEntities((/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html) || [])[1] || "").replace(/\s+/g, " ").trim();
-  const text = decodeEntities(String(html)
-    .replace(/<!--[\s\S]*?-->/g, " ")
-    .replace(/<(script|style|noscript|template|svg|head|iframe)\b[\s\S]*?<\/\1\s*>/gi, " ")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<li\b[^>]*>/gi, "\n- ")
-    .replace(/<(td|th)\b[^>]*>/gi, "\t")
-    .replace(/<\/(p|div|li|tr|h[1-6]|section|article|table|ul|ol|dt|dd|blockquote|pre|header|footer|main)\s*>/gi, "\n")
-    .replace(/<[^>]+>/g, " "))
+  const s = String(html);
+  // ASCII-only lowering keeps every index lined up with s; toLowerCase() can
+  // lengthen a string (U+0130 becomes two code units).
+  const lower = s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
+  const out = [];
+  let i = 0;
+  while (i < s.length) {
+    const lt = s.indexOf("<", i);
+    if (lt < 0) { out.push(s.slice(i)); break; }
+    out.push(s.slice(i, lt));
+    if (s.startsWith("<!--", lt)) {
+      const end = s.indexOf("-->", lt + 4);
+      out.push(" ");
+      i = end < 0 ? s.length : end + 3;
+      continue;
+    }
+    // A "<" that cannot open a tag ("a < b") is text, as a browser shows it.
+    if (!/[a-zA-Z/!?]/.test(s[lt + 1] || "")) { out.push("<"); i = lt + 1; continue; }
+    const gt = s.indexOf(">", lt + 1);
+    if (gt < 0) break;   // a tag still open at the end of the page
+    i = gt + 1;
+    const m = TAG_NAME.exec(lower.slice(lt, Math.min(gt + 1, lt + 40)));
+    if (!m) { out.push(" "); continue; }   // <!doctype>, <?xml?>
+    const [, close, name] = m;
+    if (!close && RAW_TEXT.has(name)) { out.push(" "); i = pastClose(lower, name, i); continue; }
+    if (name === "br") out.push("\n");
+    else if (!close && name === "li") out.push("\n- ");
+    else if (!close && (name === "td" || name === "th")) out.push("\t");
+    else if (close && BLOCK_END.has(name)) out.push("\n");
+    else out.push(" ");
+  }
+  const text = decodeEntities(out.join(""))
     .replace(/[ \t ]+/g, (m) => (m.includes("\t") ? "\t" : " "))
     .replace(/ *\n */g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  return { title: title || null, text };
+  return { title: htmlTitle(s, lower), text };
 }
 
 function decodeBody(body, contentType) {
