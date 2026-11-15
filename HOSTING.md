@@ -108,7 +108,12 @@ heroku config:get BRIDGE_APP_TOKEN -a <app>   # read it out for the app
 
 `BRIDGE_APP_FETCH_DOMAINS` lists the hosts that terms jobs may fetch from,
 exactly as each host appears in the URLs. The app token opens `/app/*` and
-nothing else, so give it to the app and never to the panel. Re-running the
+nothing else, so give it to the app and never to the panel. Two more vars are
+optional: `BRIDGE_APP_SAFARI_FALLBACK=1` lets a terms job read a page the hub
+could not fetch through a background tab of the owner's Safari (off by
+default, because it gives the app token a capped reach into the browser),
+and `BRIDGE_APP_TIME_ZONE` (default `Asia/Kolkata`) is the zone a job's
+"today" is computed in, since a Heroku dyno runs in UTC. Re-running the
 deploy script leaves both vars alone. For routes, limits and privacy rules,
 see [docs/APP-JOBS.md](docs/APP-JOBS.md).
 

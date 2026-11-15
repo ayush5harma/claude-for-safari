@@ -17,6 +17,7 @@ takes longer than that.
 | --- | --- | --- |
 | `BRIDGE_APP_TOKEN` | unset | Turns `/app/*` on. Without it every `/app/*` route answers 404. At least 16 characters and different from `BRIDGE_TOKEN`, or the hub refuses to start. |
 | `BRIDGE_APP_FETCH_DOMAINS` | empty | Hosts a terms job may fetch from, comma- or space-separated, matched exactly against the URL's host (`www.bank.example` does not admit `bank.example`, and a non-default port is part of the host). Empty means terms jobs are refused. |
+| `BRIDGE_APP_TIME_ZONE` | `Asia/Kolkata` | The IANA time zone a job's "today" is computed in: a terms card's `checkedOn` and the date its prompt gives Claude (for `verifiedOn`). The host's own zone is not used, because a Heroku dyno runs in UTC. An unknown zone stops the hub from starting. |
 | `BRIDGE_APP_SAFARI_FALLBACK` | unset (off) | `1` lets a terms job read a source through a background tab of the owner's Safari when the hub's own fetch fails in a way a browser can get past. This gives the app token a bounded reach into the browser; see [Safari fallback](#safari-fallback-off-by-default). Any other value leaves it off. |
 
 Mint the token the same way as `BRIDGE_TOKEN` (`openssl rand -hex 24`). On
@@ -45,7 +46,7 @@ the app needs them in its own environment.
 ## Routes
 
 `GET /app/health` is the app's "test connection". It returns
-`{ ok, types, defaultModel, fetchDomains, safariFallback, running, queued, limits }`.
+`{ ok, types, defaultModel, fetchDomains, safariFallback, timeZone, running, queued, limits }`.
 `safariFallback` is true when `BRIDGE_APP_SAFARI_FALLBACK=1`.
 
 `POST /app/jobs` returns `202 {"jobId": "<uuid>", "status": "queued"|"running"}`.

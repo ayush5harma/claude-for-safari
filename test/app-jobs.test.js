@@ -1057,6 +1057,22 @@ test("a statement job that outlives its timeout fails and its child is killed", 
   assert.ok(await until(() => !alive(stub.calls()[0].pid)));
 });
 
+test("today is computed in BRIDGE_APP_TIME_ZONE, not the host's zone", async () => {
+  // 18:30 UTC is midnight in India: one second either side is a different day there.
+  assert.equal(appJobs.localDate("Asia/Kolkata", new Date("2026-11-14T18:29:59Z")), "2026-11-14");
+  assert.equal(appJobs.localDate("Asia/Kolkata", new Date("2026-11-14T18:30:00Z")), "2026-11-15");
+  assert.equal(appJobs.localDate("UTC", new Date("2026-11-14T18:30:00Z")), "2026-11-14");
+  assert.equal(appJobs.localDate("America/New_York", new Date("2026-01-01T04:59:59Z")), "2025-12-31");
+  const jobs = appJobs.createAppJobs({ cliProbe: false, log: () => {} });
+  assert.equal(jobs.health().timeZone, "Asia/Kolkata", "the default");
+  assert.throws(() => appJobs.createAppJobs({ timeZone: "Mars/Olympus", log: () => {} }), /BRIDGE_APP_TIME_ZONE "Mars\/Olympus" is not an IANA time zone/);
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, BRIDGE_APP_TIME_ZONE: "Mars/Olympus" }, { expectExit: true });
+  const { code } = await hub.exited;
+  await hub.stop();
+  assert.equal(code, 1);
+  assert.match(hub.stderr(), /refusing to start: BRIDGE_APP_TIME_ZONE "Mars\/Olympus" is not an IANA time zone/);
+});
+
 test("the child environment drops every bridge setting and the Codex key", () => {
   const env = appJobs.childEnv({ PATH: "/bin", BRIDGE_TOKEN: "a", BRIDGE_APP_TOKEN: "b", BRIDGE_APP_FETCH_DOMAINS: "c",
     CODEX_API_KEY: "d", CLAUDE_CODE_OAUTH_TOKEN: "kept" });

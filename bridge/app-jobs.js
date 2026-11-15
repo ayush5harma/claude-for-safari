@@ -42,6 +42,10 @@ const DEFAULTS = {
   // the owner's Safari load at most this many allowlisted pages.
   safariPerJob: 5,
   safariPerHour: 20,
+  // The zone a job's "today" is in (checkedOn, the date in the terms prompt).
+  // Not the host's: a Heroku dyno runs in UTC, so for the 5.5 hours after
+  // midnight IST it would date a check the day before.
+  timeZone: "Asia/Kolkata",
 };
 const HOUR_MS = 3600 * 1000;
 const LIMITS = { textChars: 200000, cards: 10, sources: 5, urlChars: 2048, nameChars: 200, currentChars: 200000 };
@@ -751,8 +755,16 @@ function parseJobRequest(body, allow, defaultModel) {
 }
 
 // ── Jobs ─────────────────────────────────────────────────────────────────────
-const localDate = (d = new Date()) =>
-  d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+function localDate(timeZone, d = new Date()) {
+  const parts = {};
+  for (const p of new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d)) {
+    parts[p.type] = p.value;
+  }
+  return parts.year + "-" + parts.month + "-" + parts.day;
+}
+const isTimeZone = (tz) => {
+  try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); return typeof tz === "string" && tz.length > 0; } catch { return false; }
+};
 const secs = (ms) => (ms / 1000).toFixed(1) + "s";
 
 // opts: claudeBin (path or function), env (the child's base environment),
@@ -764,6 +776,8 @@ const secs = (ms) => (ms / 1000).toFixed(1) + "s";
 //     release()    load about:blank in the tab once the job is over
 function createAppJobs(opts = {}) {
   const cfg = { ...DEFAULTS, ...Object.fromEntries(Object.entries(opts).filter(([k]) => k in DEFAULTS && opts[k] !== undefined)) };
+  // Thrown, so the bridge refuses to start rather than date every check wrong.
+  if (!isTimeZone(cfg.timeZone)) throw new Error("BRIDGE_APP_TIME_ZONE " + JSON.stringify(cfg.timeZone) + " is not an IANA time zone");
   const allow = opts.fetchDomains instanceof Set ? opts.fetchDomains : parseDomains(opts.fetchDomains);
   const bin = () => (typeof opts.claudeBin === "function" ? opts.claudeBin() : opts.claudeBin || "claude");
   const env = childEnv(opts.env || process.env);
@@ -854,7 +868,7 @@ function createAppJobs(opts = {}) {
 
   async function runCard(job, card, model) {
     const deadline = Date.now() + cfg.termsCardTimeoutMs;
-    const checkedOn = localDate();
+    const checkedOn = localDate(cfg.timeZone);
     const dir = fs.mkdtempSync(path.join(tmpRoot, "claude-app-job-"));
     job.dir = dir;
     try {
@@ -998,6 +1012,7 @@ function createAppJobs(opts = {}) {
 
   function health() {
     return { ok: true, types: TYPES, defaultModel: cfg.defaultModel, fetchDomains: [...allow], safariFallback: !!safari,
+      timeZone: cfg.timeZone,
       running, queued: queue.length,
       limits: { maxRunning: cfg.maxRunning, maxQueued: cfg.maxQueued, statementTimeoutS: cfg.statementTimeoutMs / 1000,
         termsCardTimeoutS: cfg.termsCardTimeoutMs / 1000, purgeAfterS: cfg.purgeMs / 1000, textChars: LIMITS.textChars,
@@ -1018,6 +1033,6 @@ function createAppJobs(opts = {}) {
 
 module.exports = {
   createAppJobs, fetchSource, checkSourceUrl, parseDomains, htmlToText, check, toJsonSchema, nullable, childEnv, within,
-  FetchError, browserCanFix,
+  FetchError, browserCanFix, localDate,
   statementArgs, termsArgs, STATEMENT_SHAPE, TERMS_ANSWER_SHAPE, TERMS_RESULT_SHAPE, RULE_SET_SHAPE, LIMITS, DEFAULTS, FETCH,
 };

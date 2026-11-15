@@ -1040,6 +1040,7 @@ function runHub() {
       appJobs = appMod.createAppJobs({
         claudeBin,
         fetchDomains: process.env.BRIDGE_APP_FETCH_DOMAINS,
+        timeZone: process.env.BRIDGE_APP_TIME_ZONE || undefined,
         safari: process.env.BRIDGE_APP_SAFARI_FALLBACK === "1"
           ? { available: () => currentInstances(liveInstances()).length > 0, session: safariSession } : null,
       });
