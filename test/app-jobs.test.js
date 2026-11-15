@@ -1092,6 +1092,27 @@ test("two jobs run at once, the queue holds maxQueued, and beyond that is 429", 
   assert.equal(jobs.stats().queued, 1);
 });
 
+test("one terms job runs at a time, so a statement job behind two of them still gets a slot", async (t) => {
+  const stub = makeStub();
+  const jobs = inProcess(stub);
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const slowTerms = () => jobs.submit({ type: "terms-extract", input: { cards: [{ cardKey: "slow-card", issuer: "Example Bank",
+    product: "Example Card", sources: ["https://terms.example/tc.pdf"] }] } }).body.jobId;
+  const a = slowTerms();
+  const b = slowTerms();
+  const c = jobs.submit(statementBody("STUB-SLOW statement")).body.jobId;
+  await until(() => stub.calls().length === 2);
+  await sleep(200);
+  assert.deepEqual([a, b, c].map((id) => jobs.get(id).status), ["running", "queued", "running"]);
+  assert.equal(stub.calls().length, 2);
+  assert.ok(stub.calls().some((x) => x.stdin.includes("STUB-SLOW statement")), "the statement job's child started");
+  assert.equal(jobs.health().limits.maxTermsRunning, 1);
+  // When the running terms job ends, the queued one takes its place.
+  jobs.remove(a);
+  await until(() => jobs.get(b).status === "running");
+  assert.equal(jobs.get(b).status, "running");
+});
+
 test("a statement job that outlives its timeout fails and its child is killed", async (t) => {
   const stub = makeStub();
   const jobs = inProcess(stub, { statementTimeoutMs: 400 });

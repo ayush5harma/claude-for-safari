@@ -280,7 +280,7 @@ allowlist of hosts that serve public terms pages.
 
 | | |
 | --- | --- |
-| Running at once | 2 |
+| Running at once | 2, of which at most 1 terms job (a later statement job starts ahead of a waiting terms job) |
 | Queued | 20 (429 beyond) |
 | Statement job | 240 s, retry included |
 | Terms job | 300 s per card: fetching, the Safari fallback and Claude included |

@@ -31,6 +31,10 @@ const { spawn } = require("node:child_process");
 // ── Limits ───────────────────────────────────────────────────────────────────
 const DEFAULTS = {
   maxRunning: 2,
+  // Of those, terms jobs: a terms job runs up to 300 s per card for 10 cards,
+  // so two of them could hold both slots for most of an hour while a
+  // statement import waits. With one, a statement job always has a slot.
+  maxTermsRunning: 1,
   maxQueued: 20,
   statementTimeoutMs: 240000,
   termsCardTimeoutMs: 300000,
@@ -834,6 +838,7 @@ function createAppJobs(opts = {}) {
   const jobs = new Map();
   const queue = [];
   let running = 0;
+  let termsRunning = 0;
 
   const say = (job, event, extra = "") => log("app-job " + job.id + " " + job.type + " " + event + (extra ? " " + extra : ""));
 
@@ -1005,11 +1010,21 @@ function createAppJobs(opts = {}) {
     }
   }
 
+  // First come, first served, except that a terms job waits while another
+  // runs and the jobs behind it may go first.
   function pump() {
-    while (running < cfg.maxRunning && queue.length) {
-      const job = queue.shift();
+    for (let i = 0; i < queue.length && running < cfg.maxRunning;) {
+      const job = queue[i];
+      const terms = job.type === "terms-extract";
+      if (terms && termsRunning >= cfg.maxTermsRunning) { i += 1; continue; }
+      queue.splice(i, 1);
       running += 1;
-      start(job).finally(() => { running -= 1; pump(); });
+      if (terms) termsRunning += 1;
+      start(job).finally(() => {
+        running -= 1;
+        if (terms) termsRunning -= 1;
+        pump();
+      });
     }
   }
 
@@ -1064,7 +1079,7 @@ function createAppJobs(opts = {}) {
     return { ok: true, types: TYPES, defaultModel: cfg.defaultModel, fetchDomains: [...allow], safariFallback: !!safari,
       timeZone: cfg.timeZone,
       running, queued: queue.length,
-      limits: { maxRunning: cfg.maxRunning, maxQueued: cfg.maxQueued, statementTimeoutS: cfg.statementTimeoutMs / 1000,
+      limits: { maxRunning: cfg.maxRunning, maxTermsRunning: cfg.maxTermsRunning, maxQueued: cfg.maxQueued, statementTimeoutS: cfg.statementTimeoutMs / 1000,
         termsCardTimeoutS: cfg.termsCardTimeoutMs / 1000, purgeAfterS: cfg.purgeMs / 1000, textChars: LIMITS.textChars,
         cards: LIMITS.cards, sourcesPerCard: LIMITS.sources, safariPagesPerJob: cfg.safariPerJob,
         safariPagesPerHour: cfg.safariPerHour } };
