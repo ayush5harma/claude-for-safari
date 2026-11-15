@@ -903,12 +903,14 @@ test("HTML is reduced to text in linear time and keeps its structure", () => {
   // Every unit here made the old regex stripper quadratic: 160 KB of "<script "
   // took 2.0 s and 40 KB of "<" 0.8 s (measured 2026-11-15), so a hostile 8 MB
   // page, the fetch cap, would have held the hub's event loop for over an hour.
+  // The bound is loose on purpose: the test files run in parallel and share
+  // the CPU, and linear stays far under it (0.01-0.45 s each, measured alone).
   for (const unit of ["<script ", "<!--", "<", "<title>", "<p ", "<head>", "&abcdefgh", "</div ", "\t \t\n"]) {
     const html = unit.repeat(Math.ceil((8 * 1024 * 1024) / unit.length));
     const t0 = Date.now();
     appJobs.htmlToText(html);
     const ms = Date.now() - t0;
-    assert.ok(ms < 3000, JSON.stringify(unit) + " x 8 MB took " + ms + " ms");
+    assert.ok(ms < 5000, JSON.stringify(unit) + " x 8 MB took " + ms + " ms");
   }
   const { title, text } = appJobs.htmlToText("<!DOCTYPE html><HTML><Head><TITLE>T &amp; C</TITLE><Style>.x{}</Style></Head>" +
     "<BODY>a < b<br>c<!-- gone --><UL><LI>one</LI><li>two</ul><Table><TR><TD>Base</TD><td>1%</td></TR></Table>" +
@@ -1208,6 +1210,43 @@ test("today is computed in BRIDGE_APP_TIME_ZONE, not the host's zone", async () 
   await hub.stop();
   assert.equal(code, 1);
   assert.match(hub.stderr(), /refusing to start: BRIDGE_APP_TIME_ZONE "Mars\/Olympus" is not an IANA time zone/);
+});
+
+test("SIGTERM to the hub kills a running card's child and removes its temp dir", async (t) => {
+  if (!tls) return t.skip("openssl is not available to mint a test certificate");
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin,
+    BRIDGE_APP_FETCH_DOMAINS: src.host, NODE_EXTRA_CA_CERTS: tls.certFile });
+  t.after(async () => { await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const r = await post(hub.base, { type: "terms-extract", input: { cards: [
+    { cardKey: "slow-card", issuer: "Example Bank", product: "Example Card", sources: [src.url("/tc.pdf")] }] } });
+  assert.equal(r.status, 202);
+  const call = await until(() => stub.calls()[0]);
+  assert.ok(call, "the card's child started");
+  assert.ok(fs.existsSync(call.cwd) && alive(call.pid));
+  hub.proc.kill("SIGTERM");
+  const { signal } = await hub.exited;
+  assert.equal(signal, "SIGTERM", "the hub dies by the signal it was sent");
+  assert.equal(fs.existsSync(call.cwd), false, "the temp dir is gone");
+  assert.ok(await until(() => !alive(call.pid)), "the child is gone");
+});
+
+test("a CLI error in one terms card fails only that card", async (t) => {
+  const stub = makeStub();
+  const jobs = inProcess(stub);
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const id = jobs.submit(termsJob([["error-card", ["/a"]], ["good-card", ["/b"]]])).body.jobId;
+  const job = await doneJob(jobs, id);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.equal(job.error, null);
+  const [bad, good] = job.result.cards;
+  assert.equal(bad.status, "failed");
+  assert.equal(bad.ruleSet, null);
+  assert.deepEqual(bad.notes, ["extraction failed: the claude CLI reported an error: Invalid API key - please run /login"]);
+  assert.deepEqual(bad.sources.map((x) => x.ok), [true], "its source was read; the CLI failed after");
+  assert.equal(good.status, "verified");
+  assert.equal(good.ruleSet.sources[0].url, "https://terms.example/b");
+  assert.equal(stub.calls().length, 2, "the error is not retried");
 });
 
 test("the child environment drops every bridge setting and the Codex key", () => {
