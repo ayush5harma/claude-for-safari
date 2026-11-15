@@ -994,6 +994,12 @@ function runHub() {
     // changing what it shows), re-navigated for the job's later sources, and
     // sent to about:blank when the job ends. The extension has no close op,
     // so the blank tab stays; adding one is a follow-up (docs/APP-JOBS.md).
+    // Before it re-navigates or blanks the tab the bridge lists the tabs, and
+    // a tab the owner has since switched to (it is the one its window shows)
+    // or closed is left alone: the next source opens a fresh background tab
+    // and the blanking is skipped, so the page the owner is reading never
+    // changes under them. The list and the navigate are two calls, so a
+    // switch in between still lands; that window is a few milliseconds.
     // navigate answers before the page has loaded, hence the settle wait
     // before each read.
     const SAFARI_SETTLE_MS = 2500;
@@ -1005,16 +1011,32 @@ function runHub() {
       // the job stopped waiting for at its deadline or a DELETE, so the blank
       // page release() loads is always the tab's last navigation, and a first
       // navigate that answers late still records the tab it opened. argsOf
-      // runs when the call's turn comes; null skips the call.
+      // runs (and may await) when the call's turn comes; null skips the call.
       const call = (tool, argsOf, after = (r) => r) => {
-        const p = chain.then(() => { const args = argsOf(); return args ? routeCall(tool, args) : null; }).then(after);
+        const p = chain.then(async () => { const args = await argsOf(); return args ? routeCall(tool, args) : null; }).then(after);
         chain = p.catch(() => {});
         return p;
+      };
+      // Whether the job's tab can be driven: "ok" (still open, in the
+      // background), "shown" (the owner switched to it) or "gone". A listing
+      // that fails or lacks the tab counts as "gone", never as ok: the tab
+      // would be left alone and the job would open another. In a hub with
+      // several Safari profiles the listing can number a tab no profile has
+      // reached yet under another profile's id; that too only costs an extra
+      // tab, never a touch of one the owner has.
+      const tabState = async () => {
+        const r = await routeCall("tabs", {});
+        const tab = r && Array.isArray(r.result) ? r.result.find((x) => x && x.tabId === tabId) : null;
+        return !tab ? "gone" : tab.active ? "shown" : "ok";
       };
       const read = async (url, { deadline, isCancelled }) => {
         const step = (p) => appMod.within(p, deadline, isCancelled);
         const nav = await step(call("navigate",
-          () => (tabId === null ? { url, newTab: true, active: false } : { url, tabId, newTab: false, active: false }),
+          async () => {
+            // The owner took the tab or closed it: leave it, open another.
+            if (tabId !== null && (await tabState()) !== "ok") tabId = null;
+            return tabId === null ? { url, newTab: true, active: false } : { url, tabId, newTab: false, active: false };
+          },
           (r) => {
             if (tabId === null && r && r.result && typeof r.result.tabId === "number") tabId = r.result.tabId;
             return r;
@@ -1033,7 +1055,8 @@ function runHub() {
         if (!page) throw new Error(last);
         return { url: page.url, title: page.title, text: page.text };
       };
-      const release = () => call("navigate", () => (tabId === null ? null : { url: "about:blank", tabId, newTab: false, active: false }));
+      const release = () => call("navigate", async () =>
+        (tabId !== null && (await tabState()) === "ok" ? { url: "about:blank", tabId, newTab: false, active: false } : null));
       return { read, release };
     };
     try {

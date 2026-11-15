@@ -732,13 +732,35 @@ test("a terms job fetches allowlisted sources into a per-card temp dir, runs Rea
 });
 
 // A fake extension instance: long-polls the hub with BRIDGE_TOKEN, records
-// every call it is handed, and answers navigate and read for tab 7, whose
-// page is whatever it was last navigated to. read(url) supplies the page.
+// every call it is handed, and keeps a few tabs (ids from 7; a navigate with
+// newTab opens the next one, an existing tab shows whatever it was last
+// navigated to). read(url) supplies the page a read of a tab returns. The
+// owner's side: activate(id) makes a tab the one its window shows, close(id)
+// removes it, and `tabs` lists them as the extension reports them.
 function fakeExtension(hub, read) {
   const ctl = new AbortController();
   const served = [];
-  let current = null;
+  const open = new Map();   // tabId -> { url, active }
+  let nextTab = 7;
   const ext = { authorization: "Bearer " + BRIDGE_TOKEN, "x-claude-instance": "fake-ext", "x-claude-version": "0.44" };
+  const answer = (call) => {
+    const a = call.args || {};
+    if (call.tool === "navigate") {
+      if (a.newTab) { const tabId = nextTab++; open.set(tabId, { url: a.url, active: !!a.active }); return { result: { tabId, windowId: 1, url: a.url, opened: "new tab", active: !!a.active } }; }
+      const tab = open.get(a.tabId);
+      if (!tab) return { error: "no tab " + a.tabId };
+      tab.url = a.url;
+      return { result: { tabId: a.tabId, windowId: 1, url: a.url, opened: "current tab", active: tab.active } };
+    }
+    if (call.tool === "read") {
+      const tab = open.get(a.tabId);
+      return tab ? { result: { tabId: a.tabId, ...read(tab.url) } } : { error: "no tab " + a.tabId };
+    }
+    if (call.tool === "tabs") {
+      return { result: [...open].map(([tabId, t]) => ({ tabId, windowId: 1, active: t.active, url: t.url, title: "t", favIconUrl: null, owned: true })) };
+    }
+    return { result: call.tool === "probeActive" ? { tabId: 3, owned: true } : null };
+  };
   (async () => {
     while (!ctl.signal.aborted) {
       let r;
@@ -746,17 +768,15 @@ function fakeExtension(hub, read) {
       if (r.status !== 200) continue;
       const call = await r.json();
       served.push({ tool: call.tool, args: call.args, at: Date.now() });
-      if (call.tool === "navigate") current = call.args.url;
-      const result = call.tool === "navigate" ? { tabId: 7, windowId: 1, url: call.args.url, opened: call.args.newTab ? "new tab" : "current tab", active: false }
-        : call.tool === "read" ? { tabId: 7, ...read(current) }
-          : call.tool === "probeActive" ? { tabId: 3, owned: true } : null;
       await fetch(hub.base + "/result", { method: "POST", headers: { ...ext, "content-type": "application/json" },
-        body: JSON.stringify({ id: call.id, result }) }).catch(() => {});
+        body: JSON.stringify({ id: call.id, ...answer(call) }) }).catch(() => {});
     }
   })();
   return {
     served,
     navigations: () => served.filter((c) => c.tool === "navigate").map((c) => c.args),
+    activate: (id) => { for (const [k, t] of open) t.active = k === id; },
+    close: (id) => { open.delete(id); },
     stop: () => ctl.abort(),
     polling: async () => {
       for (let i = 0; i < 100; i++) {
@@ -825,6 +845,53 @@ test("with the fallback on, a job reads its failed sources through ONE backgroun
     { url: "about:blank", tabId: 7, newTab: false, active: false }]);
   assert.ok(ext.served.filter((c) => c.tool === "read").every((c) => c.args.tabId === 7), "every read is pinned to the job's tab");
   assert.match(stub.calls()[0].files["source-1.txt"], /^Rendered by Safari\./);
+});
+
+test("a job's tab is left alone once the owner has switched to it or closed it", async (t) => {
+  if (!tls) return t.skip("openssl is not available to mint a test certificate");
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin,
+    BRIDGE_APP_FETCH_DOMAINS: src.host, NODE_EXTRA_CA_CERTS: tls.certFile, BRIDGE_APP_SAFARI_FALLBACK: "1" });
+  const spa = src.url("/spa.html"), forbidden = src.url("/forbidden"), reset = src.url("/reset");
+  // The owner switches to the job's tab after the first page and closes the
+  // second tab after the second; the third source must not touch either.
+  const ext = fakeExtension(hub, (url) => {
+    if (url === spa) ext.activate(7);
+    if (url === forbidden) ext.close(8);
+    return renders(url);
+  });
+  t.after(async () => { ext.stop(); await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  await ext.polling();
+  const r = await post(hub.base, { type: "terms-extract", input: { cards: [
+    { cardKey: "spa-card", issuer: "Example Bank", product: "Example Card", sources: [spa, forbidden, reset] }] } });
+  const job = await waitJob(hub.base, (await r.json()).jobId, undefined, 800);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.deepEqual(job.result.cards[0].sources.map((x) => x.fetchedVia), ["safari", "safari", "safari"]);
+  await until(() => ext.navigations().length === 4);
+  const navs = ext.navigations().map(({ url, tabId, newTab, active }) => ({ url, tabId, newTab, active }));
+  assert.deepEqual(navs, [
+    { url: spa, tabId: undefined, newTab: true, active: false },
+    { url: forbidden, tabId: undefined, newTab: true, active: false },
+    { url: reset, tabId: undefined, newTab: true, active: false },
+    { url: "about:blank", tabId: 9, newTab: false, active: false }]);
+  assert.deepEqual(ext.served.filter((c) => c.tool === "read").map((c) => c.args.tabId), [7, 8, 9], "each read is pinned to its own tab");
+});
+
+test("a tab the owner is looking at when the job ends is not blanked", async (t) => {
+  if (!tls) return t.skip("openssl is not available to mint a test certificate");
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin,
+    BRIDGE_APP_FETCH_DOMAINS: src.host, NODE_EXTRA_CA_CERTS: tls.certFile, BRIDGE_APP_SAFARI_FALLBACK: "1" });
+  const ext = fakeExtension(hub, (url) => { ext.activate(7); return renders(url); });
+  t.after(async () => { ext.stop(); await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  await ext.polling();
+  const r = await post(hub.base, { type: "terms-extract", input: { cards: [
+    { cardKey: "spa-card", issuer: "Example Bank", product: "Example Card", sources: [src.url("/spa.html")] }] } });
+  const job = await waitJob(hub.base, (await r.json()).jobId, undefined, 600);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.ok(await until(() => ext.served.some((c) => c.tool === "tabs")), "the release looked before it touched the tab");
+  await sleep(300);
+  assert.deepEqual(ext.navigations().map((n) => n.url), [src.url("/spa.html")], "no about:blank went to the owner's tab");
 });
 
 test("DELETE during the Safari phase frees the slot at once and blanks the tab", async (t) => {

@@ -264,6 +264,13 @@ ends (done, failed, timed out or deleted), the bridge navigates the tab to
 no close operation, so a blank tab stays open in Safari until someone closes
 it. Adding a close operation to the extension is a follow-up.
 
+Before it re-navigates the tab for a later source, or blanks it at the end,
+the bridge lists the open tabs. If the owner has switched to the job's tab
+(it is now the one its window shows) or closed it, the bridge does not touch
+it: the next source opens a fresh background tab, and the blanking is skipped,
+so a page the owner is reading never changes under them. A tab abandoned this
+way is the owner's to close.
+
 The fallback helps for bot walls and pages that render only with JavaScript.
 It does not help for a PDF, because Safari's PDF viewer has no page text to
 read.
