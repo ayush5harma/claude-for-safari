@@ -906,7 +906,10 @@ test("HTML is reduced to text in linear time and keeps its structure", () => {
   // page, the fetch cap, would have held the hub's event loop for over an hour.
   // The bound is loose on purpose: the test files run in parallel and share
   // the CPU, and linear stays far under it (0.01-0.45 s each, measured alone).
-  for (const unit of ["<script ", "<!--", "<", "<title>", "<p ", "<head>", "&abcdefgh", "</div ", "\t \t\n"]) {
+  // The last four are elements that never close, or close with no <body> after:
+  // the cases that must resume past the opening tag without a scan to the end.
+  for (const unit of ["<script ", "<!--", "<", "<title>", "<p ", "<head>", "&abcdefgh", "</div ", "\t \t\n",
+    "<svg>", "<script></scripts", "<head></head>", "<head><body"]) {
     const html = unit.repeat(Math.ceil((8 * 1024 * 1024) / unit.length));
     const t0 = Date.now();
     appJobs.htmlToText(html);
@@ -919,6 +922,27 @@ test("HTML is reduced to text in linear time and keeps its structure", () => {
   assert.equal(title, "T & C");
   assert.equal(text, "a < b\nc\n- one\n\n- two\n\tBase\t1%\n\nkept after \u20b95 \u20b9\ntail");
   assert.deepEqual(appJobs.htmlToText("<html><body><div id=app></div></body></html>"), { title: null, text: "" });
+});
+
+test("a raw-text element that never closes does not swallow the page", () => {
+  // The first linear-time rewrite skipped an unclosed <head> or <svg> to the
+  // end of the page, so a minified page without </head> (legal HTML: the
+  // parser infers it) or with a self-closing <svg class=i /> before the body
+  // came out empty where the regex version kept about 300 characters.
+  const text = (html) => appJobs.htmlToText(html).text;
+  const noHeadClose = "<!DOCTYPE html><html><head><meta charset=utf-8><title>T</title><style>.x{}</style>" +
+    "<script>HEAD-SCRIPT()</script><body><p>Body text survives.</p></body></html>";
+  assert.equal(text(noHeadClose), "Body text survives.");
+  assert.equal(appJobs.htmlToText(noHeadClose).title, "T");
+  assert.equal(text("<html><head><title>T</title><body class=x>No head close, no style.</body>"), "No head close, no style.");
+  assert.equal(text("<html><head><title>T</title></head><body><p>Closed head.</p></body></html>"), "Closed head.",
+    "a head that closes still hides its content");
+  assert.equal(text("<html><head><title>T</title></head><header>Banner</header>"), "Banner", "</head never matches </header");
+  assert.equal(text("<html><body><svg class=i /><p>After a self-closing svg.</p></body></html>"), "After a self-closing svg.");
+  assert.equal(text("<body><svg viewBox='0 0 1 1'/>one<svg />two"), "one two");
+  assert.equal(text("<body><svg><path d='M0'/></svg>kept<svg><p>never closed, still text</p>"),
+    "kept never closed, still text");
+  assert.equal(text("<body><script>no close</p><p>text after an unclosed script</p>"), "no close\ntext after an unclosed script");
 });
 
 test("a terms result links only to the card's requested sources", async (t) => {

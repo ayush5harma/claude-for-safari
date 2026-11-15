@@ -596,11 +596,34 @@ function findTag(lower, open, from) {
   return at;
 }
 
-// The index just past the `>` of the element's closing tag, or the end of
-// the page when it never closes.
-function pastClose(lower, name, from) {
-  const at = findTag(lower, "</" + name, from);
-  const gt = at < 0 ? -1 : lower.indexOf(">", at);
+// findTag with a memory, for one pass over one page. `from` never goes back
+// during the pass, so an answer at or after it still holds ("none" holds for
+// every later start): each stretch of the page is scanned once however many
+// elements ask, which keeps 8 MB of unclosed "<svg>" or "<head></head>" linear.
+function tagFinder(lower) {
+  const memo = new Map();
+  return (open, from) => {
+    const seen = memo.get(open);
+    if (seen !== undefined && (seen < 0 || seen >= from)) return seen;
+    const at = findTag(lower, open, from);
+    memo.set(open, at);
+    return at;
+  };
+}
+
+// Where the text resumes after a raw-text element that opens just before
+// `from`: past the `>` of its closing tag. An element that never closes does
+// NOT swallow the rest of the page: a browser would not show it as one, and a
+// minified page that omits </head> (legal; the parser infers it) came out empty
+// (measured 2026-11-15; the regex version kept ~300 characters). So the text
+// resumes just past the opening tag, and a head that never closes ends where
+// the body starts, at the `<body` itself so its tag is read as a tag.
+function pastClose(find, lower, name, from) {
+  const end = find("</" + name, from);
+  const body = name === "head" ? find("<body", from) : -1;
+  if (body >= 0 && (end < 0 || body < end)) return body;
+  if (end < 0) return from;
+  const gt = lower.indexOf(">", end);
   return gt < 0 ? lower.length : gt + 1;
 }
 
@@ -617,6 +640,7 @@ function htmlToText(html) {
   // ASCII-only lowering keeps every index lined up with s; toLowerCase() can
   // lengthen a string (U+0130 becomes two code units).
   const lower = s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
+  const find = tagFinder(lower);
   const out = [];
   let i = 0;    // start of the text not yet copied out
   let at = 0;   // where the next "<" is looked for
@@ -639,7 +663,12 @@ function htmlToText(html) {
     const m = TAG_NAME.exec(lower.slice(lt, Math.min(gt + 1, lt + 40)));
     if (!m) { out.push(" "); continue; }   // <!doctype>, <?xml?>
     const [, close, name] = m;
-    if (!close && RAW_TEXT.has(name)) { out.push(" "); i = at = pastClose(lower, name, at); continue; }
+    if (!close && RAW_TEXT.has(name)) {
+      out.push(" ");
+      // `<svg class=i />` is closed already.
+      if (s[gt - 1] !== "/") i = at = pastClose(find, lower, name, at);
+      continue;
+    }
     if (name === "br") out.push("\n");
     else if (!close && name === "li") out.push("\n- ");
     else if (!close && (name === "td" || name === "th")) out.push("\t");
