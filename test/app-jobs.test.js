@@ -578,13 +578,14 @@ function drift(shape, value, at = "") {
 const contractProblems = (ruleSet) =>
   [...appJobs.check(RULE_SET_CHECKED, withAppDefaults(RULE_SET_CHECKED, ruleSet)), ...drift(RULE_SET_CHECKED, ruleSet)];
 
-const APP_CATALOG = process.env.APP_CARD_CATALOG || path.join(os.homedir(),
-  ".cache/system-config/hub/wt-cards/Core/Sources/AdvikaCore/Resources/CardRulesCatalog.json");
+// The companion app's catalog lives in another repository, so its path comes only
+// from the environment; CONTRIBUTING.md keeps local paths out of the repo.
+const APP_CATALOG = process.env.APP_CARD_CATALOG || "";
 
 test("every rule set in the app's bundled catalog passes the hub's rule-set checker", (t) => {
-  if (!fs.existsSync(APP_CATALOG)) {
-    return t.skip("the iPhone app's CardRulesCatalog.json is not at " + APP_CATALOG + " (set APP_CARD_CATALOG to its path); " +
-      "this contract test runs only where the app checkout exists, so CI skips it");
+  if (!APP_CATALOG || !fs.existsSync(APP_CATALOG)) {
+    return t.skip("set APP_CARD_CATALOG to the companion app's CardRulesCatalog.json to run this contract test; " +
+      "it runs only where that checkout exists, so CI skips it");
   }
   const catalog = JSON.parse(fs.readFileSync(APP_CATALOG, "utf8"));
   assert.ok(Array.isArray(catalog.ruleSets) && catalog.ruleSets.length > 0, "the catalog holds rule sets");
