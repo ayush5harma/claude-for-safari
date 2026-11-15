@@ -585,6 +585,7 @@ const RAW_TEXT = new Set(["script", "style", "noscript", "template", "svg", "hea
 const BLOCK_END = new Set(["p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "table",
   "ul", "ol", "dt", "dd", "blockquote", "pre", "header", "footer", "main"]);
 const TAG_NAME = /^<(\/?)([a-z][a-z0-9-]*)/;
+const opensTag = (c) => (c >= "a" && c <= "z") || c === "/" || c === "!" || c === "?";
 const NAME_CHAR = /[a-z0-9-]/;
 
 // The first `<tag` or `</tag` at or after `from` whose name is exactly `name`
@@ -617,26 +618,28 @@ function htmlToText(html) {
   // lengthen a string (U+0130 becomes two code units).
   const lower = s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
   const out = [];
-  let i = 0;
-  while (i < s.length) {
-    const lt = s.indexOf("<", i);
+  let i = 0;    // start of the text not yet copied out
+  let at = 0;   // where the next "<" is looked for
+  for (;;) {
+    const lt = s.indexOf("<", at);
     if (lt < 0) { out.push(s.slice(i)); break; }
+    // A "<" that cannot open a tag ("a < b") is text, as a browser shows it,
+    // and stays in the current run rather than becoming a piece of its own.
+    if (!opensTag(lower[lt + 1])) { at = lt + 1; continue; }
     out.push(s.slice(i, lt));
     if (s.startsWith("<!--", lt)) {
       const end = s.indexOf("-->", lt + 4);
       out.push(" ");
-      i = end < 0 ? s.length : end + 3;
+      i = at = end < 0 ? s.length : end + 3;
       continue;
     }
-    // A "<" that cannot open a tag ("a < b") is text, as a browser shows it.
-    if (!/[a-zA-Z/!?]/.test(s[lt + 1] || "")) { out.push("<"); i = lt + 1; continue; }
     const gt = s.indexOf(">", lt + 1);
     if (gt < 0) break;   // a tag still open at the end of the page
-    i = gt + 1;
+    i = at = gt + 1;
     const m = TAG_NAME.exec(lower.slice(lt, Math.min(gt + 1, lt + 40)));
     if (!m) { out.push(" "); continue; }   // <!doctype>, <?xml?>
     const [, close, name] = m;
-    if (!close && RAW_TEXT.has(name)) { out.push(" "); i = pastClose(lower, name, i); continue; }
+    if (!close && RAW_TEXT.has(name)) { out.push(" "); i = at = pastClose(lower, name, at); continue; }
     if (name === "br") out.push("\n");
     else if (!close && name === "li") out.push("\n- ");
     else if (!close && (name === "td" || name === "th")) out.push("\t");
