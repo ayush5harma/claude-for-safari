@@ -1,10 +1,11 @@
 # App jobs (`/app/*`)
 
-The hub can run two kinds of extraction job for a native companion app (for
-example a personal-finance app on a phone): it turns masked credit card
-statement text into structured rows, and it turns a card's published terms
-and conditions into a reward rule set. The app submits a job, polls it, and
-deletes it after reading. The logic lives in `bridge/app-jobs.js`; the bridge
+The hub can run three kinds of job for a native companion app (for example a
+personal-finance app on a phone): it turns masked credit card statement text
+into structured rows, it turns a card's published terms and conditions into a
+reward rule set, and it refreshes a shopping shortlist with current Indian
+prices and sales. The app submits a job, polls it, and deletes it after
+reading. The logic lives in `bridge/app-jobs.js`; the bridge
 loads it only when `BRIDGE_APP_TOKEN` is set.
 
 Jobs are asynchronous because Heroku's router drops a request that stays
@@ -17,7 +18,8 @@ takes longer than that.
 | --- | --- | --- |
 | `BRIDGE_APP_TOKEN` | unset | Turns `/app/*` on. Without it every `/app/*` route answers 404. At least 16 characters and different from `BRIDGE_TOKEN`, or the hub refuses to start. |
 | `BRIDGE_APP_FETCH_DOMAINS` | empty | Hosts a terms job may fetch from, comma- or space-separated, matched exactly against the URL's host (`www.bank.example` does not admit `bank.example`, and a non-default port is part of the host). Empty means terms jobs are refused. |
-| `BRIDGE_APP_TIME_ZONE` | `Asia/Kolkata` | The IANA time zone a job's "today" is computed in: a terms card's `checkedOn` and the date its prompt gives Claude (for `verifiedOn`). The host's own zone is not used, because a Heroku dyno runs in UTC. An unknown zone stops the hub from starting. |
+| `BRIDGE_APP_SHOP_DOMAINS` | empty | Retail hosts a shopping job may fetch from, comma- or space-separated. An entry admits that host and its `www.` form (`amazon.in` admits `amazon.in` and `www.amazon.in`) and nothing else: not other subdomains, not a longer name that ends the same way, not another port. Empty means shopping jobs still run but fetch nothing: Claude answers from its own knowledge and every price is marked unverified. Example: `amazon.in,flipkart.com,croma.com,reliancedigital.in,vijaysales.com,ikea.com,pepperfry.com,urbanladder.com,wakefit.co,godrejinterio.com,durian.in,homecentre.in,featherlitefurniture.com,flexispot.in`. |
+| `BRIDGE_APP_TIME_ZONE` | `Asia/Kolkata` | The IANA time zone a job's "today" is computed in: a terms card's and a shopping result's `checkedOn`, and the date their prompts give Claude (for `verifiedOn`). The host's own zone is not used, because a Heroku dyno runs in UTC. An unknown zone stops the hub from starting. |
 | `BRIDGE_APP_SAFARI_FALLBACK` | unset (off) | `1` lets a terms job read a source through a background tab of the owner's Safari when the hub's own fetch fails in a way a browser can get past. This gives the app token a bounded reach into the browser; see [Safari fallback](#safari-fallback-off-by-default). Any other value leaves it off. |
 
 Mint the token the same way as `BRIDGE_TOKEN` (`openssl rand -hex 24`). On
@@ -46,7 +48,7 @@ the app needs them in its own environment.
 ## Routes
 
 `GET /app/health` is the app's "test connection". It returns
-`{ ok, error, cli, types, defaultModel, fetchDomains, safariFallback, timeZone, running, queued, limits }`.
+`{ ok, error, cli, types, defaultModel, fetchDomains, shopDomains, safariFallback, timeZone, running, queued, limits }`.
 `cli` is `{ state, version, missing }`: what the startup probe of the Claude
 CLI found (see [How a job runs](#how-a-job-runs)). `state` is `checking`, `ok`
 or `unusable`; when it is `unusable`, `ok` is false and `error` says why.
@@ -83,6 +85,26 @@ allowlist, `cardKey` matching `^[a-z0-9][a-z0-9-]{0,39}$` and unique):
 `current` is the card's present rule set or null. Claude keeps the ids of
 rules that have not changed.
 
+A shopping job (`type` is `shopping-refresh`; every field but `prompt` and
+`model` is required, and a field not listed here is a 400):
+
+```json
+{ "type": "shopping-refresh",
+  "input": { "city": "Example City", "month": "November 2026", "currency": "INR",
+             "categories": [ { "category": "Refrigerator",
+                               "constraints": "double door, 250 to 300 litres, inverter, 3 star or better" },
+                             { "category": "Study desk", "constraints": "at least 120 cm wide, with drawers" } ],
+             "prompt": "Prefer well-known brands with local service.",
+             "model": "sonnet" } }
+```
+
+`city` (100 characters), `month` (40), each `category` (100) and each
+`constraints` (500, may be empty or left out) are one-line strings; `currency`
+must be `"INR"`; there are 1 to 12 categories. `prompt` is optional extra
+instructions from the app, at most 4,096 characters (413 beyond), and may span
+lines. It can steer which products Claude picks, but it cannot change the
+output rules or make a price verified.
+
 `GET /app/jobs/<jobId>` returns:
 
 ```json
@@ -92,7 +114,8 @@ rules that have not changed.
 ```
 
 `result` is set only when `status` is `done`, and `error` only when it is
-`failed`. For a terms job, `progress.total` is the number of cards.
+`failed`. For a terms job, `progress.total` is the number of cards. For a
+shopping job it is 3: pages chosen, pages fetched, answer written.
 
 `DELETE /app/jobs/<jobId>` purges the job at once and kills its child if it
 is running. A finished job is purged 15 minutes after it ends either way, so
@@ -106,6 +129,36 @@ A terms job's `result` is a TermsResult:
 Both shapes are defined once in `app-jobs.js` (`STATEMENT_SHAPE`,
 `RULE_SET_SHAPE`, `TERMS_CARD_SHAPE`), and the same definitions generate the
 CLI's `--json-schema` and drive the bridge's own checker.
+
+A shopping job's `result` is a ShoppingResult:
+
+```json
+{ "checkedOn": "2026-11-23",
+  "categories": [ { "category": "Refrigerator",
+                    "options": [ { "name": "Example Brand 260 L double door", "priceINR": 27990,
+                                   "seller": "Example Retailer", "url": "https://www.example-retailer.in/s?k=refrigerator",
+                                   "saleNote": "10% bank offer listed", "verified": true },
+                                 { "name": "Example Brand 280 L double door", "priceINR": null,
+                                   "seller": null, "url": null, "saleNote": null, "verified": false } ],
+                    "recommendation": "Buy the 260 L: it is the cheapest verified option that fits." } ],
+  "notes": "One page could not be read." }
+```
+
+One entry per requested category, in the order asked, spelled as asked. Every
+key is present. An unknown price is `null`, never 0 (a 0 fails the schema
+check and the job retries). `priceINR` is one number, not a range. The shape
+is `SHOPPING_RESULT_SHAPE` in `app-jobs.js`.
+
+`verified` is `true` only when the bridge can vouch for it: the option has a
+price and its `url` is a page the hub itself fetched for this job. Claude is
+told the same, but the bridge enforces it: an option Claude calls verified
+without a price or without a fetched page behind it is changed to `false`,
+and `notes` says how many. With no shopping allowlist, or when no page could
+be read, nothing is verified. A `url` that is not https on the shopping
+allowlist becomes `null`, so a fetched page cannot put its own link in front of
+the owner. `checkedOn` is the hub's date in `BRIDGE_APP_TIME_ZONE`, whatever
+Claude wrote. `notes` carries Claude's own remarks first and then the bridge's
+(pages not fetched or not readable, links removed, options downgraded).
 
 Extraction rules for a StatementExtraction. They live in the fixed system
 prompt (`STATEMENT_SYSTEM`) and the schema, and `test/app-jobs.test.js` pins
@@ -208,6 +261,21 @@ used, because it ignores `CLAUDE_CODE_OAUTH_TOKEN`.
 - **Statement jobs** add `--tools ""` (no built-in tool at all),
   `--max-turns 4`, a fixed `--system-prompt` and `--json-schema`. They run in
   the system temp directory.
+- **Shopping jobs** run Claude twice, with the bridge's own fetching in
+  between. First a planning run (`--tools ""`) is given the city, month,
+  categories and the allowed hosts and proposes up to 3 pages per category,
+  for example the shop's own search URL. The bridge keeps only https URLs on
+  `BRIDGE_APP_SHOP_DOMAINS` (once each, at most 3 per category), fetches them
+  as described under [Fetching sources](#fetching-terms-sources), and writes
+  each page's text, cut at 200,000 bytes, to a `claude-app-job-*` temp
+  directory. Then the answering run reads them with `--tools Read` (up to 12
+  turns plus one per page) and fills the schema. With no allowlist there is
+  no planning run and no page, and when no page could be read there is nothing
+  to read: either way the answering run gets `--tools ""`, so it has no tool
+  to look anything up with. If the planning run cannot produce a valid answer
+  or runs out of time, the job goes on with no pages and `notes` says so; a CLI
+  error fails the job. The temp directory is removed when the job ends,
+  however it ends.
 - **Terms jobs** fetch each source in the bridge first, then add
   `--tools Read --max-turns 24`. Each card runs in its own
   `claude-app-job-*` temp directory, which is removed when the card ends: on
@@ -225,7 +293,12 @@ card's `notes`, and the job still ends `done` with the other cards' results.
 
 ### Fetching terms sources
 
-The bridge fetches each source itself with `node:https`, without keep-alive:
+The bridge fetches each source itself with `node:https`, without keep-alive.
+Shopping jobs use the same fetcher with `BRIDGE_APP_SHOP_DOMAINS` as the
+allowlist, so everything below holds for them too, except the Safari
+fallback, which shopping never uses: a retail page loaded in the owner's
+logged-in profile shows their account, and that would go to Claude with the
+page.
 
 - https only, with no credentials in the URL, and the host must be on the
   allowlist.
@@ -302,7 +375,7 @@ allowlist of hosts that serve public terms pages.
 
 | | |
 | --- | --- |
-| Running at once | 2, of which at most 1 terms job (a later statement job starts ahead of a waiting terms job) |
+| Running at once | 2, of which at most 1 terms or shopping job (a later statement job starts ahead of a waiting one) |
 | Queued | 20 (429 beyond) |
 | Statement job | 240 s, retry included |
 | Terms job | 300 s per card: fetching, the Safari fallback and Claude included |
@@ -311,6 +384,9 @@ allowlist of hosts that serve public terms pages.
 | Request body | 2 MB |
 | Statement text | 200,000 characters |
 | Terms job | 10 cards, 5 sources each, `current` at most 200,000 characters of JSON |
+| Shopping job | 10 min in all, planning included (2 min to choose pages, 4 min to fetch them; pages not yet read after that are skipped) |
+| Shopping request | 12 categories, 3 pages per category, `prompt` at most 4,096 characters |
+| Shopping pages | 120 requested per rolling hour across every job; a job's remaining pages are skipped once it is used up |
 
 Measured on 2026-11-15 with Claude Code 2.1.322 and `sonnet` on a Mac: a
 synthetic one-page statement with ten transactions took 18 s, and one card
@@ -329,6 +405,13 @@ attempt.
   discarded unread, because it can echo its input.
 - The app masks card numbers and personal details before upload. The
   statement prompt tells Claude to keep them masked.
+- A shopping request holds a city, a month, product categories and the
+  buyer's constraints and extra prompt: no statement data. They are held in
+  memory while the job lives, go to the CLI on stdin, are dropped when it
+  finishes, and are never logged (the log line carries the job id, sizes,
+  durations, page counts and status). Search terms built from the categories
+  do reach the retail sites the hub fetches from, from the hub's address, with
+  no cookies or credentials.
 - A terms job's request holds no statement data: only source URLs, the
   card's names and the current rule set. The hub fetches sources itself,
   with no cookies or credentials, so with the Safari fallback off (the

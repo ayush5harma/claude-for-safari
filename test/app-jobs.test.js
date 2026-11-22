@@ -82,6 +82,47 @@ if (!probe) process.stdin.on("end", () => {
     delete bad.kind;
     return emit({ structured_output: bad });
   }
+  // Shopping: the plan run proposes pages on the first allowed host (a hostile
+  // list, a failure or a real path on request); the answer run puts one verified
+  // option on each page it was handed, plus whatever lie the marker asks for.
+  if (stdin.startsWith("Shopping plan request")) {
+    const host = ((stdin.split("Allowed hosts (https only): ")[1] || "").split("\\n")[0].split(", ")[0]) || "shop.example";
+    const u = (h, p) => "https://" + h + p;
+    if (stdin.includes("STUB-PLAN-INVALID")) return emit({ structured_output: { fetches: "nope" } });
+    const fetches = stdin.includes("STUB-PLAN-HOSTILE") ? [
+      { categoryNumber: 1, url: u(host, "/a") }, { categoryNumber: 1, url: "https://evil.example/x" },
+      { categoryNumber: 1, url: "http://" + host + "/insecure" }, { categoryNumber: 1, url: u(host, "/a#again") },
+      { categoryNumber: 1, url: u(host, "/b") }, { categoryNumber: 1, url: u(host, "/c") }, { categoryNumber: 1, url: u(host, "/d") },
+      { categoryNumber: 99, url: u(host, "/e") }, { categoryNumber: 2, url: u("www." + host, "/f") },
+      { categoryNumber: 2, url: "https://user:pw@" + host + "/g" }]
+      : stdin.includes("STUB-PLAN-PAGE") ? [{ categoryNumber: 1, url: u(host, "/page.html") }, { categoryNumber: 2, url: u(host, "/tc.pdf") }]
+      : [{ categoryNumber: 1, url: u(host, "/s?q=one") }, { categoryNumber: 2, url: u(host, "/s?q=two") }];
+    return emit({ structured_output: { fetches } });
+  }
+  if (stdin.startsWith("Shopping refresh request")) {
+    const lines = stdin.split("\\n");
+    const cats = lines.filter((l) => /^\\d+\\. /.test(l)).map((l) => l.replace(/^\\d+\\. /, "").split(" | constraints:")[0]);
+    const pagesFor = (i) => lines.filter((l) => l.startsWith("- source-") && l.endsWith("(for category " + i + ")"))
+      .map((l) => l.split(" from ")[1].split(" (for category")[0]);
+    if (stdin.includes("STUB-SHOP-WRONG-CATEGORIES") && !retry) {
+      return emit({ structured_output: { checkedOn: "1999-01-01", categories: [{ category: "Wrong-9d1c", options: [], recommendation: "x" }], notes: "" } });
+    }
+    const categories = cats.map((c, i) => {
+      const urls = pagesFor(i + 1);
+      const options = urls.map((url, j) => ({ name: c + " option " + (j + 1), priceINR: 1000 * (i + 1) + j, seller: "Example Retailer",
+        url, saleNote: j ? null : "Example sale", verified: true }));
+      const extra = (over) => options.push({ name: "extra", priceINR: 500, seller: null, url: null, saleNote: null, verified: true, ...over });
+      if (stdin.includes("STUB-SHOP-LIES")) {
+        extra({ name: "never fetched", url: "https://shop.example/never-fetched" });
+        extra({ name: "off list", url: "https://evil.example/phish" });
+        extra({ name: "no price", priceINR: null, url: urls[0] || null });
+      }
+      if (!urls.length) extra({ name: "from memory", priceINR: 20000 });
+      if (stdin.includes("STUB-SHOP-ZERO") && !retry) extra({ name: "zero", priceINR: 0, verified: false });
+      return { category: stdin.includes("STUB-SHOP-CASE") ? c.toUpperCase() : c, options, recommendation: "Buy option 1." };
+    });
+    return emit({ structured_output: { checkedOn: "1999-01-01", categories, notes: "Stub notes." } });
+  }
   if (argv[argv.indexOf("--tools") + 1] === "Read") {
     const url = (/ from (https:\\/\\/\\S+)/.exec(stdin) || [])[1] || "https://unknown.invalid/";
     const rs = ruleSet(url);
@@ -254,7 +295,7 @@ test("token separation both ways, and native clients only", async (t) => {
   assert.equal(health.headers.get("cache-control"), "no-store");
   const h = await health.json();
   assert.equal(h.ok, true);
-  assert.deepEqual(h.types, ["statement-extract", "terms-extract"]);
+  assert.deepEqual(h.types, ["statement-extract", "terms-extract", "shopping-refresh"]);
   assert.equal(h.defaultModel, "sonnet");
   assert.equal(h.limits.maxRunning, 2);
   assert.equal(h.limits.maxQueued, 20);
@@ -1385,4 +1426,325 @@ test("the child environment drops every bridge setting and the Codex key", () =>
   const env = appJobs.childEnv({ PATH: "/bin", BRIDGE_TOKEN: "a", BRIDGE_APP_TOKEN: "b", BRIDGE_APP_FETCH_DOMAINS: "c",
     CODEX_API_KEY: "d", CLAUDE_CODE_OAUTH_TOKEN: "kept" });
   assert.deepEqual(env, { PATH: "/bin", CLAUDE_CODE_OAUTH_TOKEN: "kept" });
+});
+
+// ── Shopping jobs ────────────────────────────────────────────────────────────
+// The stub's shopping answers are keyed on markers in the request's `prompt`
+// (STUB-PLAN-*, STUB-SHOP-*); no test here reaches a retail site or a model.
+const SHOP_MARKER = "SHOP-PRIVATE-MARKER-4c2e";
+const shopBody = (over = {}, categories) => ({ type: "shopping-refresh", input: { city: "Example City", month: "November 2026",
+  currency: "INR", categories: categories || [{ category: "Refrigerator", constraints: "double door, 250 to 300 litres" },
+    { category: "Study desk", constraints: "" }], ...over } });
+const argOf = (call, flag) => call.argv[call.argv.indexOf(flag) + 1];
+const finished = (jobs, body) => doneJob(jobs, jobs.submit(body).body.jobId);
+
+// A fetcher for in-process runs: records what the job asked for and under which
+// allowlist, and fails the URLs `fail` returns an error for.
+function shopFetcher(fail = () => null) {
+  const calls = [];
+  return { calls, fetch: async (url, o) => {
+    calls.push({ url, allow: [...o.allow], listName: o.listName });
+    const failure = fail(url);
+    if (failure) throw failure;
+    return { url, ext: ".txt", data: Buffer.from(("Example listing at " + url + ". Price Rs 1,000. ").repeat(20)), title: null };
+  } };
+}
+function shopSetup(t, extra = {}, fail) {
+  const stub = makeStub();
+  const fetcher = shopFetcher(fail);
+  const lines = [];
+  const jobs = inProcess(stub, { shopDomains: "shop.example", fetchSource: fetcher.fetch, log: (l) => lines.push(l), ...extra });
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  return { stub, fetcher, lines, jobs };
+}
+
+test("a shopping request is validated before anything runs: sizes, currency, unknown keys, control characters", async (t) => {
+  const { stub, jobs } = shopSetup(t);
+  const refused = (status, pattern, body) => {
+    const r = jobs.submit(body);
+    assert.equal(r.status, status, JSON.stringify(r.body));
+    assert.match(r.body.error, pattern);
+  };
+  const cats = (n) => Array.from({ length: n }, (_, i) => ({ category: "Item " + i, constraints: "" }));
+  refused(400, /input\.city/, shopBody({ city: "" }));
+  refused(400, /input\.city/, shopBody({ city: "Example\nCity" }));
+  refused(400, /input\.city/, shopBody({ city: "x".repeat(101) }));
+  refused(400, /input\.city/, shopBody({ city: 7 }));
+  refused(400, /input\.month/, shopBody({ month: "x".repeat(41) }));
+  refused(400, /input\.month/, shopBody({ month: undefined }));
+  refused(400, /currency must be "INR"/, shopBody({ currency: "USD" }));
+  refused(400, /currency must be "INR"/, shopBody({ currency: undefined }));
+  refused(400, /1 to 12 categories/, shopBody({ categories: [] }));
+  refused(400, /1 to 12 categories/, shopBody({ categories: cats(13) }));
+  refused(400, /1 to 12 categories/, shopBody({ categories: "Refrigerator" }));
+  refused(400, /categories\[0\] must be an object/, shopBody({ categories: ["Refrigerator"] }));
+  refused(400, /categories\[1\] takes only category and constraints/, shopBody({ categories: [...cats(1), { category: "B", constraint: "typo" }] }));
+  refused(400, /categories\[0\]\.category/, shopBody({ categories: [{ category: "  ", constraints: "" }] }));
+  refused(400, /categories\[0\]\.category/, shopBody({ categories: [{ category: "x".repeat(101), constraints: "" }] }));
+  refused(400, /categories\[0\]\.constraints/, shopBody({ categories: [{ category: "A", constraints: "x".repeat(501) }] }));
+  refused(400, /categories\[0\]\.constraints/, shopBody({ categories: [{ category: "A", constraints: ["not", "a string"] }] }));
+  refused(400, /categories\[0\]\.constraints/, shopBody({ categories: [{ category: "A", constraints: "line\nbreak" }] }));
+  refused(400, /input\.colour is not a field of shopping-refresh/, shopBody({ colour: "red" }));
+  refused(400, /input\.prompt must be a string/, shopBody({ prompt: 5 }));
+  refused(413, /input\.prompt is longer than 4096/, shopBody({ prompt: "x".repeat(4097) }));
+  refused(400, /input\.prompt carries a control character/, shopBody({ prompt: "bell\u0007" }));
+  refused(400, /input\.model/, shopBody({ model: "--dangerously-skip-permissions" }));
+  refused(400, /input must be an object/, { type: "shopping-refresh" });
+  assert.equal(stub.calls().length, 0, "nothing reached the CLI");
+
+  // The limits themselves are accepted: 12 categories without constraints, a 4,096-character prompt with a line break.
+  const job = await finished(jobs, shopBody({ prompt: "x".repeat(4095) + "\n" }, Array.from({ length: 12 }, (_, i) => ({ category: "Item " + i }))));
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.equal(job.result.categories.length, 12);
+});
+
+test("the shopping result schema: an unknown price is null, never 0, and every key is present", () => {
+  const option = (over = {}) => ({ name: "Example", priceINR: 27990, seller: "Example Retailer", url: "https://www.shop.example/p",
+    saleNote: null, verified: true, ...over });
+  const result = (options) => ({ checkedOn: "2026-11-23", categories: [{ category: "Refrigerator", options, recommendation: "Buy it." }], notes: "" });
+  const problems = (v) => appJobs.check(appJobs.SHOPPING_RESULT_SHAPE, v);
+  assert.deepEqual(problems(result([option(), option({ priceINR: null, seller: null, url: null, verified: false })])), []);
+  assert.deepEqual(problems(result([])), [], "no option fitting is an answer");
+  assert.match(problems(result([option({ priceINR: 0 })]))[0], /^categories\[0\]\.options\[0\]\.priceINR: expected number greater than 0$/);
+  assert.match(problems(result([option({ priceINR: "27,990" })]))[0], /priceINR: expected number greater than 0, got string/);
+  assert.match(problems(result([option({ verified: "yes" })]))[0], /verified: expected boolean, got string/);
+  const { verified, ...noVerified } = option();
+  assert.deepEqual(problems(result([noVerified])), ["categories[0].options[0].verified: missing"]);
+  assert.match(problems({ ...result([]), checkedOn: "2026-02-30" })[0], /checkedOn: expected YYYY-MM-DD date/);
+  assert.match(problems({ ...result([]), notes: ["a"] })[0], /notes: expected string, got array/);
+
+  // The CLI is held to the same shape, and a run with nothing to read has no tool.
+  const withPages = appJobs.shoppingArgs("sonnet", 4);
+  const schema = JSON.parse(argOf({ argv: withPages }, "--json-schema"));
+  assert.deepEqual(schema.required, ["checkedOn", "categories", "notes"]);
+  assert.equal(schema.additionalProperties, false);
+  const optionSchema = schema.properties.categories.items.properties.options.items;
+  assert.deepEqual(optionSchema.required, ["name", "priceINR", "seller", "url", "saleNote", "verified"]);
+  assert.deepEqual(optionSchema.properties.priceINR.anyOf.map((x) => x.type), ["number", "null"]);
+  assert.equal(optionSchema.properties.verified.type, "boolean");
+  assert.equal(argOf({ argv: withPages }, "--tools"), "Read");
+  assert.equal(argOf({ argv: withPages }, "--max-turns"), "16");
+  const noPages = appJobs.shoppingArgs("sonnet", 0);
+  assert.equal(argOf({ argv: noPages }, "--tools"), "");
+  assert.equal(argOf({ argv: noPages }, "--max-turns"), "4");
+  for (const argv of [withPages, noPages, appJobs.shopPlanArgs("sonnet")]) {
+    for (const flag of ["--restricted", "--no-session-persistence", "--strict-mcp-config", "--json-schema", "--system-prompt"]) {
+      assert.ok(argv.includes(flag), flag);
+    }
+    assert.equal(argOf({ argv }, "--permission-mode"), "dontAsk");
+    assert.equal(argOf({ argv }, "--mcp-config"), '{"mcpServers":{}}');
+  }
+  assert.equal(argOf({ argv: appJobs.shopPlanArgs("sonnet") }, "--tools"), "", "planning reads nothing");
+  assert.deepEqual(JSON.parse(argOf({ argv: appJobs.shopPlanArgs("sonnet") }, "--json-schema")).required, ["fetches"]);
+});
+
+test("with no shopping allowlist a job fetches nothing, the model gets no tool, and no price is verified", async (t) => {
+  const { stub, fetcher, lines, jobs } = shopSetup(t, { shopDomains: undefined });
+  const job = await finished(jobs, shopBody({ prompt: SHOP_MARKER + " STUB-SHOP-LIES" }));
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.deepEqual(appJobs.check(appJobs.SHOPPING_RESULT_SHAPE, job.result), []);
+  assert.equal(fetcher.calls.length, 0, "the terms allowlist is not the shopping one: nothing was fetched");
+  assert.equal(stub.calls().length, 1, "no planning run either");
+  assert.equal(argOf(stub.calls()[0], "--tools"), "");
+  assert.match(stub.calls()[0].stdin, /Source files: none\./);
+  assert.deepEqual(job.progress, { done: 3, total: 3 });
+  const options = job.result.categories.flatMap((c) => c.options);
+  assert.ok(options.length >= 2);
+  assert.ok(options.every((o) => o.verified === false && o.url === null), JSON.stringify(options));
+  assert.match(job.result.notes, /\(BRIDGE_APP_SHOP_DOMAINS is empty\): no page was fetched and every price is unverified\./);
+  assert.match(job.result.checkedOn, /^\d{4}-\d{2}-\d{2}$/);
+  assert.notEqual(job.result.checkedOn, "1999-01-01", "the bridge's date replaces the model's");
+  assert.ok(lines.some((l) => /shopping-refresh queued categories=2 prompt=/.test(l)));
+  assert.ok(lines.every((l) => !l.includes(SHOP_MARKER) && !l.includes("Example City")), "the request's text is never logged");
+  assert.equal(jobs.health().shopDomains.length, 0);
+});
+
+test("a shopping job fetches only allowlisted https pages, once, three per category, and verifies only what it fetched", async (t) => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-safari-appjobs-root-"));
+  t.after(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
+  const { stub, fetcher, lines, jobs } = shopSetup(t, { tmpRoot });
+  const job = await finished(jobs, shopBody({ prompt: "STUB-PLAN-HOSTILE STUB-SHOP-LIES " + SHOP_MARKER }));
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.deepEqual(appJobs.check(appJobs.SHOPPING_RESULT_SHAPE, job.result), []);
+  // Of the plan's ten pages: another host, plain http, a repeat of /a with a
+  // fragment, a fourth page for category 1, a category that does not exist and
+  // credentials in the URL never reach the fetcher.
+  assert.deepEqual(fetcher.calls.map((c) => c.url), ["https://shop.example/a", "https://shop.example/b", "https://shop.example/c",
+    "https://www.shop.example/f"]);
+  assert.deepEqual(fetcher.calls[0].allow, ["shop.example", "www.shop.example"]);
+  assert.equal(fetcher.calls[0].listName, "BRIDGE_APP_SHOP_DOMAINS");
+  const [plan, answer] = stub.calls();
+  assert.equal(stub.calls().length, 2);
+  assert.match(plan.stdin, /Allowed hosts \(https only\): shop\.example, www\.shop\.example/);
+  assert.equal(argOf(plan, "--tools"), "");
+  assert.equal(argOf(answer, "--tools"), "Read");
+  assert.equal(argOf(answer, "--max-turns"), "16", "12 turns plus one per page");
+  assert.deepEqual(Object.keys(answer.files).sort(), ["source-1.txt", "source-2.txt", "source-3.txt", "source-4.txt"]);
+  assert.match(answer.stdin, /- source-4\.txt from https:\/\/www\.shop\.example\/f \(for category 2\)/);
+
+  const [fridge, desk] = job.result.categories;
+  assert.deepEqual(fridge.options.map((o) => [o.name, o.verified, o.url]), [
+    ["Refrigerator option 1", true, "https://shop.example/a"],
+    ["Refrigerator option 2", true, "https://shop.example/b"],
+    ["Refrigerator option 3", true, "https://shop.example/c"],
+    ["never fetched", false, "https://shop.example/never-fetched"],   // on the list, so its link stays, but no page was read
+    ["off list", false, null],
+    ["no price", false, "https://shop.example/a"]]);
+  assert.deepEqual(desk.options.map((o) => [o.verified, o.url]), [[true, "https://www.shop.example/f"],
+    [false, "https://shop.example/never-fetched"], [false, null], [false, "https://www.shop.example/f"]]);
+  assert.equal(fridge.options[0].priceINR, 1000);
+  assert.equal(fridge.options[5].priceINR, null);
+  assert.equal(JSON.stringify(job.result).includes("evil.example"), false);
+  assert.match(job.result.notes, /^Stub notes\. /);
+  assert.match(job.result.notes, /2 link\(s\) that were not on the shopping allowlist were removed\./);
+  assert.match(job.result.notes, /6 option\(s\) called verified had no price or no fetched page behind them and are marked unverified\./);
+  assert.match(job.result.notes, /6 proposed page\(s\) were not fetched/);
+  assert.deepEqual(job.progress, { done: 3, total: 3 });
+  assert.deepEqual(fs.readdirSync(tmpRoot), [], "the temp dir is gone");
+  assert.ok(lines.some((l) => /shopping-refresh done .* pages=4\/4/.test(l)));
+  assert.ok(lines.every((l) => !l.includes(SHOP_MARKER)));
+});
+
+test("pages that cannot be fetched are noted, and a job with none readable has no tool and no verified price", async (t) => {
+  const some = shopSetup(t, {}, (url) => (url.endsWith("two") ? new appJobs.FetchError("HTTP 404", "http", 404) : null));
+  const job = await finished(some.jobs, shopBody());
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.deepEqual(job.result.categories.map((c) => c.options.map((o) => [o.verified, o.url])),
+    [[[true, "https://shop.example/s?q=one"]], [[false, null]]]);
+  assert.match(job.result.notes, /1 of 2 page\(s\) could not be read\./);
+  const answer = some.stub.calls()[1];
+  assert.equal(argOf(answer, "--tools"), "Read");
+  assert.match(answer.stdin, /Pages that could not be read:\n- https:\/\/shop\.example\/s\?q=two/);
+
+  const none = shopSetup(t, {}, () => new appJobs.FetchError("HTTP 503", "http", 503));
+  const bare = await finished(none.jobs, shopBody({ prompt: "STUB-SHOP-LIES" }));
+  assert.equal(bare.status, "done", JSON.stringify(bare));
+  assert.equal(none.fetcher.calls.length, 2);
+  assert.equal(none.stub.calls().length, 2, "a plan and an answer");
+  assert.equal(argOf(none.stub.calls()[1], "--tools"), "", "nothing to read, so no tool");
+  assert.match(none.stub.calls()[1].stdin, /Source files: none\./);
+  assert.match(bare.result.notes, /2 of 2 page\(s\) could not be read\./);
+  assert.ok(bare.result.categories.flatMap((c) => c.options).every((o) => o.verified === false));
+});
+
+test("the hub's hourly shopping page budget is shared across jobs", async (t) => {
+  const { stub, fetcher, jobs } = shopSetup(t, { shopPerHour: 3 });
+  const first = await finished(jobs, shopBody());
+  assert.match(first.result.notes, /^Stub notes\.$/, "two pages, both read");
+  const second = await finished(jobs, shopBody());
+  assert.equal(second.status, "done", JSON.stringify(second));
+  assert.equal(fetcher.calls.length, 3, "the third page of the hour was the last");
+  assert.match(second.result.notes, /1 of 2 page\(s\) could not be read\./);
+  assert.equal(stub.calls().filter((c) => argOf(c, "--tools") === "Read").length, 2);
+});
+
+test("an answer that skips or renames a category is retried with an index-only error; a name's case is forgiven", async (t) => {
+  const { stub, jobs } = shopSetup(t, { shopDomains: undefined });
+  const job = await finished(jobs, shopBody({ prompt: "STUB-SHOP-WRONG-CATEGORIES STUB-SHOP-CASE" }));
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.equal(stub.calls().length, 2);
+  assert.match(stub.calls()[1].stdin, /categories: expected 2 entries, one per requested category in the order listed, got 1/);
+  assert.ok(!stub.calls()[1].stdin.includes("Wrong-9d1c"), "the retry names a count, never the answer's text");
+  assert.deepEqual(job.result.categories.map((c) => c.category), ["Refrigerator", "Study desk"], "respelled as requested");
+
+  const zero = await finished(jobs, shopBody({ prompt: "STUB-SHOP-ZERO" }));
+  assert.equal(zero.status, "done", JSON.stringify(zero));
+  assert.match(stub.calls()[3].stdin, /categories\[0\]\.options\[\d+\]\.priceINR: expected number greater than 0/);
+  assert.ok(zero.result.categories.flatMap((c) => c.options).every((o) => o.priceINR !== 0));
+});
+
+test("a planning run that cannot answer costs the job its pages, not the job", async (t) => {
+  const { stub, fetcher, jobs } = shopSetup(t);
+  const job = await finished(jobs, shopBody({ prompt: "STUB-PLAN-INVALID" }));
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.equal(fetcher.calls.length, 0);
+  assert.equal(stub.calls().length, 3, "the plan and its one retry, then the answer");
+  assert.equal(argOf(stub.calls()[2], "--tools"), "");
+  assert.match(job.result.notes, /Choosing pages to read failed \(the answer did not match the schema after one retry: fetches: expected array, got string\), so no page was read\./);
+  assert.ok(job.result.categories.flatMap((c) => c.options).every((o) => o.verified === false));
+});
+
+test("shopping and terms jobs share the one long-job slot, so a statement job behind them still runs", async (t) => {
+  const stub = makeStub();
+  const jobs = inProcess(stub);
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const a = jobs.submit(shopBody({ prompt: "STUB-SLOW" })).body.jobId;
+  const b = jobs.submit(termsJob([["slow-card", ["/a"]]])).body.jobId;
+  const c = jobs.submit(statementBody("STUB-SLOW statement")).body.jobId;
+  await until(() => stub.calls().length === 2);
+  await sleep(200);
+  assert.deepEqual([a, b, c].map((id) => jobs.get(id).status), ["running", "queued", "running"]);
+  assert.equal(stub.calls().length, 2);
+  jobs.remove(a);
+  await until(() => jobs.get(b).status === "running");
+  assert.equal(jobs.get(b).status, "running", "the terms job takes the slot the shopping job freed");
+});
+
+test("DELETE during a shopping job's fetch phase frees the slot, aborts the fetch and removes the temp dir", async (t) => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "claude-safari-appjobs-root-"));
+  t.after(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
+  let signal = null;
+  const { jobs } = shopSetup(t, { tmpRoot, fetchSource: (url, o) => { signal = o.signal; return new Promise(() => {}); } });
+  const id = jobs.submit(shopBody()).body.jobId;
+  await until(() => signal);
+  assert.equal(fs.readdirSync(tmpRoot).length, 1, "the job's temp dir exists while it fetches");
+  assert.equal(jobs.remove(id), true);
+  assert.equal(signal.aborted, true);
+  assert.ok(await until(() => jobs.stats().running === 0, 1000), "the slot is free");
+  assert.deepEqual(fs.readdirSync(tmpRoot), []);
+});
+
+test("a shopping allowlist entry admits the host and its www form only", () => {
+  const allow = appJobs.parseShopDomains("amazon.in, Flipkart.com www.croma.com\n");
+  assert.deepEqual([...allow].sort(), ["amazon.in", "flipkart.com", "www.amazon.in", "www.croma.com", "www.flipkart.com"]);
+  const check = (u) => appJobs.checkSourceUrl(u, allow, "BRIDGE_APP_SHOP_DOMAINS");
+  for (const u of ["https://amazon.in/s?k=x", "https://www.amazon.in/s?k=x", "https://www.flipkart.com/search?q=x", "https://www.croma.com/p"]) {
+    assert.equal(check(u).error, undefined, u);
+  }
+  for (const u of ["https://evil-amazon.in/", "https://evil.amazon.in/", "https://amazon.in.evil.example/", "https://croma.com/",
+    "https://amazon.in:8443/", "http://amazon.in/", "https://user:pw@amazon.in/"]) {
+    assert.ok(check(u).error, u);
+  }
+  assert.equal(check("https://evil.example/").error, "host evil.example is not on BRIDGE_APP_SHOP_DOMAINS");
+  assert.equal(appJobs.checkSourceUrl("https://evil.example/", allow).error, "host evil.example is not on BRIDGE_APP_FETCH_DOMAINS", "terms jobs keep their message");
+  assert.equal(appJobs.parseShopDomains(undefined).size, 0);
+});
+
+test("the fetcher re-checks a shopping fetch's redirects and names the shopping list", async (t) => {
+  if (!tls) return t.skip("openssl is not available to mint a test certificate");
+  const get = (p, allow) => appJobs.fetchSource(src.url(p), { allow: new Set(allow), listName: "BRIDGE_APP_SHOP_DOMAINS", ca: tls.cert });
+  await assert.rejects(get("/redirect-out", [src.host]), /redirected to host not-allowed\.example is not on BRIDGE_APP_SHOP_DOMAINS/);
+  await assert.rejects(get("/tc.pdf", ["other.example"]), /host 127\.0\.0\.1:\d+ is not on BRIDGE_APP_SHOP_DOMAINS/);
+  assert.equal((await get("/tc.pdf", [src.host])).ext, ".pdf");
+});
+
+test("a shopping job over HTTP reads an allowlisted page and a PDF through the real fetcher", async (t) => {
+  if (!tls) return t.skip("openssl is not available to mint a test certificate");
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin,
+    BRIDGE_APP_SHOP_DOMAINS: src.host, NODE_EXTRA_CA_CERTS: tls.certFile });
+  t.after(async () => { await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const health = await (await fetch(hub.base + "/app/health", { headers: appHeaders })).json();
+  assert.ok(health.types.includes("shopping-refresh"));
+  assert.deepEqual(health.shopDomains, [src.host, "www." + src.host]);
+  assert.deepEqual(health.fetchDomains, [], "the two allowlists are separate");
+  assert.equal(health.limits.shopCategories, 12);
+  assert.equal(health.limits.shopPagesPerCategory, 3);
+  assert.equal((await post(hub.base, shopBody({ currency: "USD" }))).status, 400);
+  assert.equal((await post(hub.base, shopBody({ prompt: "x".repeat(4097) }))).status, 413);
+
+  const r = await post(hub.base, shopBody({ prompt: "STUB-PLAN-PAGE" }));
+  assert.equal(r.status, 202);
+  const { jobId } = await r.json();
+  const job = await waitJob(hub.base, jobId);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.equal(job.type, "shopping-refresh");
+  assert.deepEqual(appJobs.check(appJobs.SHOPPING_RESULT_SHAPE, job.result), []);
+  const answer = stub.calls().find((c) => argOf(c, "--tools") === "Read");
+  assert.deepEqual(Object.keys(answer.files).sort(), ["source-1.txt", "source-2.pdf"]);
+  assert.match(answer.files["source-1.txt"], /Earn 5% on bills/);
+  assert.ok(!answer.files["source-1.txt"].includes("SCRIPT-BODY-MUST-GO"));
+  assert.deepEqual(job.result.categories.flatMap((c) => c.options.map((o) => [o.verified, o.url])),
+    [[true, src.url("/page.html")], [true, src.url("/tc.pdf")]]);
+  assert.equal((await fetch(hub.base + "/app/jobs/" + jobId, { method: "DELETE", headers: appHeaders })).status, 200);
 });
