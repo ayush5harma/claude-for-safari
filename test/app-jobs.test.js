@@ -82,6 +82,21 @@ if (!probe) process.stdin.on("end", () => {
     delete bad.kind;
     return emit({ structured_output: bad });
   }
+  // Assistant: the question carries the marker. The default answer is a plain one with two valid actions.
+  if (stdin.startsWith("Assistant request")) {
+    const good = { answer: "Synthetic answer.", actions: [
+      { kind: "createReminder", why: "Asked for it.", title: "Synthetic reminder", due: "2026-12-01T09:30" },
+      { kind: "addTodo", why: "Asked for it.", title: "Synthetic to-do" }] };
+    if (stdin.includes("STUB-ASSIST-FENCED")) return emit({ result: "Here it is:\\n\`\`\`json\\n" + JSON.stringify(good) + "\\n\`\`\`" });
+    if (stdin.includes("STUB-ASSIST-MIXED")) {
+      return emit({ structured_output: { answer: "x".repeat(2500), actions: [good.actions[0],
+        { kind: "completeTodo", why: "Not on this request's list.", todoID: "todo-1" },
+        { kind: "deleteEverything", why: "Hostile." }, { kind: "addTodo", why: "No title." }, good.actions[1]] } });
+    }
+    if (stdin.includes("STUB-ASSIST-NO-ANSWER")) return emit({ structured_output: { answer: "  ", actions: [] } });
+    if (stdin.includes("STUB-ASSIST-RETRY") && !retry) return emit({ structured_output: { actions: [] } });
+    return emit({ structured_output: good });
+  }
   // Shopping: the plan run proposes pages on the first allowed host (a hostile
   // list, a failure or a real path on request); the answer run puts one verified
   // option on each page it was handed, plus whatever lie the marker asks for.
@@ -295,7 +310,7 @@ test("token separation both ways, and native clients only", async (t) => {
   assert.equal(health.headers.get("cache-control"), "no-store");
   const h = await health.json();
   assert.equal(h.ok, true);
-  assert.deepEqual(h.types, ["statement-extract", "terms-extract", "shopping-refresh"]);
+  assert.deepEqual(h.types, ["statement-extract", "terms-extract", "shopping-refresh", "assistant"]);
   assert.equal(h.defaultModel, "sonnet");
   assert.equal(h.limits.maxRunning, 2);
   assert.equal(h.limits.maxQueued, 20);
@@ -1995,4 +2010,161 @@ test("the assistant prompt carries the section and the allowed kinds, and holds 
   for (const flag of ["--restricted", "--no-session-persistence", "--strict-mcp-config", "--json-schema", "--system-prompt"]) assert.ok(argv.includes(flag), flag);
   const schema = JSON.parse(argOf({ argv }, "--json-schema"));
   assert.deepEqual(schema.properties.actions.items.anyOf.map((x) => x.properties.kind.enum[0]), ["completeTodo", "addMoveInItem"]);
+});
+
+// ── Assistant jobs, run ──────────────────────────────────────────────────────
+const ASSIST_QUESTION = "PRIVATE-QUESTION-MARKER-8b1d";
+const ASSIST_CONTEXT = "PRIVATE-CONTEXT-MARKER-5e7a";
+const assistantBody = (over = {}) => ({ type: "assistant", input: assistantInput({ question: "Remind me to call. " + ASSIST_QUESTION,
+  context: "Digest. " + ASSIST_CONTEXT, ...over }) });
+const GOOD_RESULT = { answer: "Synthetic answer.", dropped: 0, actions: [
+  { kind: "createReminder", why: "Asked for it.", title: "Synthetic reminder", due: "2026-12-01T09:30" },
+  { kind: "addTodo", why: "Asked for it.", title: "Synthetic to-do" }] };
+function assistantSetup(t, extra = {}) {
+  const stub = makeStub();
+  const lines = [];
+  const jobs = inProcess(stub, { log: (l) => lines.push(l), ...extra });
+  t.after(() => { jobs.close(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  return { stub, lines, jobs };
+}
+
+test("an assistant job runs with no tool, its words on stdin only, and answers in the contract's shape", async (t) => {
+  const { stub, lines, jobs } = assistantSetup(t);
+  const sent = jobs.submit(assistantBody());
+  assert.equal(sent.status, 202, JSON.stringify(sent));
+  const job = await doneJob(jobs, sent.body.jobId);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.equal(job.type, "assistant");
+  assert.deepEqual(job.progress, { done: 1, total: 1 });
+  assert.deepEqual(job.result, GOOD_RESULT);
+
+  assert.equal(stub.calls().length, 1);
+  const call = stub.calls()[0];
+  assert.equal(argOf(call, "--tools"), "", "no built-in tool");
+  assert.equal(argOf(call, "--model"), "sonnet");
+  assert.equal(argOf(call, "--max-turns"), "4");
+  assert.ok(call.argv.includes("--restricted") && call.argv.includes("--json-schema"));
+  assert.ok(!call.argv.join(" ").includes(ASSIST_QUESTION) && !call.argv.join(" ").includes(ASSIST_CONTEXT), "the client's words are not in argv");
+  assert.match(call.stdin, /^Assistant request\nSection: finance/);
+  assert.ok(call.stdin.includes(ASSIST_QUESTION) && call.stdin.includes(ASSIST_CONTEXT));
+  assert.match(call.stdin, /Allowed action kinds: createReminder, addTodo\n/);
+  for (const k of ["BRIDGE_TOKEN", "BRIDGE_APP_TOKEN"]) assert.ok(!call.envKeys.includes(k), k + " stripped");
+  const schema = JSON.parse(argOf(call, "--json-schema"));
+  assert.deepEqual(schema.properties.actions.items.anyOf.map((x) => x.properties.kind.enum[0]), ["createReminder", "addTodo"]);
+
+  // The log says what ran and how big, never what was asked or answered.
+  assert.ok(lines.some((l) => /assistant queued section=finance question=\d+ context=\d+ actions=2$/.test(l)), lines.join("\n"));
+  assert.ok(lines.some((l) => /assistant done .* attempts=1 out=\d+$/.test(l)));
+  assert.ok(!lines.join("\n").includes(ASSIST_QUESTION) && !lines.join("\n").includes(ASSIST_CONTEXT) && !lines.join("\n").includes("Synthetic answer"));
+});
+
+test("an assistant job returns only what the request allowed, clamped, with the dropped count", async (t) => {
+  const { jobs } = assistantSetup(t);
+  const job = await doneJob(jobs, jobs.submit(assistantBody({ question: "STUB-ASSIST-MIXED" })).body.jobId);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.equal(job.result.answer.length, 2000);
+  assert.deepEqual(job.result.actions.map((a) => a.kind), ["createReminder", "addTodo"]);
+  assert.equal(job.result.dropped, 3, "a kind off the request's list, an unknown kind, and an action with no title");
+});
+
+test("an assistant job tolerates a fenced JSON answer and retries a reply with no answer once", async (t) => {
+  const fenced = assistantSetup(t);
+  const a = await doneJob(fenced.jobs, fenced.jobs.submit(assistantBody({ question: "STUB-ASSIST-FENCED" })).body.jobId);
+  assert.deepEqual(a.result, GOOD_RESULT);
+
+  const retried = assistantSetup(t);
+  const b = await doneJob(retried.jobs, retried.jobs.submit(assistantBody({ question: "STUB-ASSIST-RETRY" })).body.jobId);
+  assert.deepEqual(b.result, GOOD_RESULT);
+  const calls = retried.stub.calls();
+  assert.equal(calls.length, 2);
+  assert.ok(!calls[0].stdin.includes("did not match the schema"));
+  assert.match(calls[1].stdin, /did not match the schema[\s\S]*- answer: expected a non-empty string, got undefined/);
+  assert.ok(calls[1].stdin.startsWith(calls[0].stdin), "the retry is the same request with the errors appended");
+});
+
+test("an assistant job whose reply never has an answer fails with invalid-output after one retry", async (t) => {
+  const { stub, lines, jobs } = assistantSetup(t);
+  const job = await doneJob(jobs, jobs.submit(assistantBody({ question: "STUB-ASSIST-NO-ANSWER" })).body.jobId);
+  assert.equal(job.status, "failed");
+  assert.equal(job.result, null);
+  assert.equal(job.error, "the answer did not match the schema after one retry: answer: expected a non-empty string, got string");
+  assert.equal(stub.calls().length, 2);
+  assert.ok(lines.some((l) => /assistant failed .* attempts=2 .* reason=invalid-output$/.test(l)));
+
+  // Garbage of another shape (a statement where an answer should be) fails the same way, naming a path and a type.
+  const other = await doneJob(jobs, jobs.submit(assistantBody({ question: "STUB-ALWAYS-INVALID" })).body.jobId);
+  assert.equal(other.status, "failed");
+  assert.match(other.error, /after one retry: answer: expected a non-empty string, got undefined$/);
+});
+
+test("an assistant job reports a CLI error without retrying and honours its deadline", async (t) => {
+  const { stub, jobs } = assistantSetup(t, { assistantTimeoutMs: 400 });
+  const cli = await doneJob(jobs, jobs.submit(assistantBody({ question: "STUB-IS-ERROR" })).body.jobId);
+  assert.equal(cli.status, "failed");
+  assert.equal(cli.error, "the claude CLI reported an error: Invalid API key - please run /login");
+  assert.equal(stub.calls().length, 1, "not retried");
+
+  const slow = await doneJob(jobs, jobs.submit(assistantBody({ question: "STUB-SLOW" })).body.jobId);
+  assert.equal(slow.status, "failed");
+  assert.equal(slow.error, "timed out after 0.4 s");
+  assert.ok(await until(() => !alive(stub.calls()[1].pid)), "the child was killed");
+});
+
+test("an assistant job's clock runs from submission: one that waited out its time in the queue never starts the CLI", async (t) => {
+  const { stub, jobs } = assistantSetup(t, { statementTimeoutMs: 700, assistantTimeoutMs: 300 });
+  jobs.submit(statementBody("STUB-SLOW one"));
+  jobs.submit(statementBody("STUB-SLOW two"));
+  const queued = jobs.submit(assistantBody()).body.jobId;
+  await until(() => stub.calls().length === 2);
+  assert.equal(jobs.get(queued).status, "queued", "both slots are taken");
+  const job = await doneJob(jobs, queued);
+  assert.equal(job.status, "failed");
+  assert.equal(job.error, "timed out after 0.3 s");
+  assert.equal(stub.calls().length, 2, "no CLI run was spent on it");
+});
+
+test("an assistant job is not a long job: it runs beside a terms job that holds the long-job slot", async (t) => {
+  const { stub, jobs } = assistantSetup(t);
+  const a = jobs.submit(termsJob([["slow-card", ["/a"]]])).body.jobId;
+  const b = jobs.submit(termsJob([["slow-card", ["/b"]]])).body.jobId;
+  const c = jobs.submit(assistantBody()).body.jobId;
+  const answered = await doneJob(jobs, c);
+  assert.equal(answered.status, "done", JSON.stringify(answered));
+  assert.deepEqual([a, b].map((id) => jobs.get(id).status), ["running", "queued"], "the second terms job still waits for the long-job slot");
+  assert.equal(jobs.stats().running, 1);
+  assert.equal(stub.calls().length, 2);
+});
+
+test("over HTTP an assistant request is validated, run and listed in /app/health", async (t) => {
+  const stub = makeStub();
+  const hub = await startHub({ BRIDGE_TOKEN, BRIDGE_APP_TOKEN: APP_TOKEN, CLAUDE_BIN: stub.bin });
+  t.after(async () => { await hub.stop(); fs.rmSync(stub.dir, { recursive: true, force: true }); });
+  const health = await (await fetch(hub.base + "/app/health", { headers: appHeaders })).json();
+  assert.ok(health.types.includes("assistant"), JSON.stringify(health.types));
+  assert.equal(health.limits.assistantTimeoutS, 100);
+  assert.equal(health.limits.assistantQuestionChars, 2000);
+  assert.equal(health.limits.assistantContextChars, 12000);
+  assert.equal(health.limits.assistantActions, 8);
+
+  const refused = async (status, pattern, body) => {
+    const r = await post(hub.base, body);
+    assert.equal(r.status, status);
+    assert.match((await r.json()).error, pattern);
+  };
+  await refused(400, /input\.section must be one of/, assistantBody({ section: "nope" }));
+  await refused(400, /input\.actions\[0\] is not an action kind/, assistantBody({ actions: ["rm -rf"] }));
+  await refused(400, /input\.today must be a YYYY-MM-DD date/, assistantBody({ today: "yesterday" }));
+  await refused(413, /input\.question is longer than 2000 characters/, assistantBody({ question: "q".repeat(2001) }));
+  await refused(413, /input\.context is longer than 12000 characters/, assistantBody({ context: "c".repeat(12001) }));
+  await refused(400, /input must be an object/, { type: "assistant" });
+  assert.equal(stub.calls().length, 0, "nothing reached the CLI");
+
+  const r = await post(hub.base, assistantBody());
+  assert.equal(r.status, 202);
+  const { jobId } = await r.json();
+  const job = await waitJob(hub.base, jobId);
+  assert.equal(job.status, "done", JSON.stringify(job));
+  assert.equal(job.type, "assistant");
+  assert.deepEqual(job.result, GOOD_RESULT);
+  assert.equal((await fetch(hub.base + "/app/jobs/" + jobId, { method: "DELETE", headers: appHeaders })).status, 200);
 });

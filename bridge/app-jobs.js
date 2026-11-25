@@ -1,10 +1,12 @@
 // App jobs: the hub's /app/* surface for a native companion app (docs/APP-JOBS.md).
 //
-// Three job types, all run as `claude -p` children:
+// Four job types, all run as `claude -p` children:
 //   statement-extract  masked statement text in, StatementExtraction out
 //   terms-extract      allowlisted public T&C sources in, one CardRuleSet per card out
 //   shopping-refresh   a shortlist of product categories in, current Indian prices
 //                      and sales out, read from allowlisted retail pages
+//   assistant          one question about one section of the app, with a text
+//                      digest of its data, in; an answer and proposed changes out
 //
 // Loaded by claude-safari-bridge.js only when BRIDGE_APP_TOKEN is set, so a
 // deployment that ships the bridge file alone keeps working until it turns
@@ -61,6 +63,12 @@ const DEFAULTS = {
   shopPlanMs: 2 * 60 * 1000,
   shopFetchMs: 4 * 60 * 1000,
   shopPerHour: 120,
+  // An assistant job is a person waiting at a sheet in the app, which stops
+  // waiting after 120 s. The clock starts when the job is submitted, not when
+  // it gets a slot, and ends 20 s early so the app can still read a late
+  // answer: a job that spent its time in the queue fails at once instead of
+  // holding a slot for an answer nobody is waiting for.
+  assistantTimeoutMs: 100 * 1000,
 };
 const HOUR_MS = 3600 * 1000;
 const LIMITS = { textChars: 200000, cards: 10, sources: 5, urlChars: 2048, nameChars: 200, currentChars: 200000 };
@@ -73,7 +81,10 @@ const SHOP_DOMAINS_VAR = "BRIDGE_APP_SHOP_DOMAINS";
 const MAX_STDOUT = 16 * 1024 * 1024;
 const KILL_GRACE_MS = 2000;
 const MAX_ERRORS = 20;
-const TYPES = ["statement-extract", "terms-extract", "shopping-refresh"];
+const TYPES = ["statement-extract", "terms-extract", "shopping-refresh", "assistant"];
+// The long jobs, which share maxTermsRunning slots. A statement or assistant
+// job is short, so one of them always has a slot.
+const HEAVY_TYPES = new Set(["terms-extract", "shopping-refresh"]);
 const SHOP_KEYS = new Set(["city", "month", "currency", "categories", "prompt", "model"]);
 // The same shape check /chat applies to a model name: it reaches argv, so the
 // first character must not be a hyphen (see the sessionId note in the bridge).
@@ -1243,6 +1254,7 @@ function parseJobRequest(body, allow, defaultModel) {
   if (!TYPES.includes(body.type)) return bad("type must be one of " + TYPES.join(", "));
   if (typeName(body.input) !== "object") return bad("input must be an object");
   if (body.type === "statement-extract") return parseStatement(body.input, defaultModel);
+  if (body.type === "assistant") return parseAssistant(body.input, defaultModel);
   return body.type === "terms-extract" ? parseTerms(body.input, allow, defaultModel) : parseShopping(body.input, defaultModel);
 }
 
@@ -1286,7 +1298,7 @@ function createAppJobs(opts = {}) {
   const jobs = new Map();
   const queue = [];
   let running = 0;
-  let heavyRunning = 0;   // terms and shopping jobs, which share maxTermsRunning
+  let heavyRunning = 0;   // HEAVY_TYPES jobs, which share maxTermsRunning
   let closing = false;
   let cli = { state: opts.cliProbe === false ? "skipped" : "checking", version: null, missing: [], error: null };
   const cliReady = () => cli.state === "ok" || cli.state === "skipped";
@@ -1544,13 +1556,28 @@ function createAppJobs(opts = {}) {
     }
   }
 
+  // One run, no tool, no page: the answer comes from the digest in the request.
+  // The checker's errors are retried like a schema miss, so a reply with no
+  // usable answer fails the job only after the one retry.
+  async function runAssistant(job) {
+    const { input } = job;
+    const kinds = new Set(input.actions);
+    let checked = null;
+    await extract(job, { args: assistantArgs(input.model, input.actions), stdin: assistantStdin(input), cwd: tmpRoot, shape: {},
+      also: (v) => { const r = normalizeAssistant(v, kinds); checked = r.result || null; return r.errors; },
+      deadline: job.createdAt + cfg.assistantTimeoutMs, limitMs: cfg.assistantTimeoutMs });
+    job.progress.done = 1;
+    return checked;
+  }
+
   async function start(job) {
     job.status = "running";
     job.startedAt = Date.now();
     say(job, "running");
     let reason = null;
     try {
-      const result = await { "statement-extract": runStatement, "terms-extract": runTerms, "shopping-refresh": runShopping }[job.type](job);
+      const result = await { "statement-extract": runStatement, "terms-extract": runTerms, "shopping-refresh": runShopping,
+        assistant: runAssistant }[job.type](job);
       if (job.cancelled) return;
       job.result = result;
       job.status = "done";
@@ -1584,12 +1611,14 @@ function createAppJobs(opts = {}) {
 
   // First come, first served, except that a terms or shopping job (the long
   // ones, which share one slot) waits while another runs and the jobs behind
-  // it may go first.
+  // it may go first. An assistant job is not one of them, but it is not ahead
+  // of anything either: it waits its turn, and its own clock (assistantTimeoutMs)
+  // runs from submission.
   function pump() {
     if (!cliReady()) return;
     for (let i = 0; i < queue.length && running < cfg.maxRunning;) {
       const job = queue[i];
-      const heavy = job.type !== "statement-extract";
+      const heavy = HEAVY_TYPES.has(job.type);
       if (heavy && heavyRunning >= cfg.maxTermsRunning) { i += 1; continue; }
       queue.splice(i, 1);
       running += 1;
@@ -1632,7 +1661,9 @@ function createAppJobs(opts = {}) {
     queue.push(job);
     say(job, "queued", job.type === "statement-extract" ? "in=" + parsed.input.text.length
       : job.type === "shopping-refresh" ? "categories=" + parsed.input.categories.length + " prompt=" + parsed.input.prompt.length
-        : "cards=" + parsed.input.cards.length + " sources=" + parsed.input.cards.reduce((n, c) => n + c.sources.length, 0));
+        : job.type === "assistant" ? "section=" + parsed.input.section + " question=" + parsed.input.question.length +
+          " context=" + parsed.input.context.length + " actions=" + parsed.input.actions.length
+          : "cards=" + parsed.input.cards.length + " sources=" + parsed.input.cards.reduce((n, c) => n + c.sources.length, 0));
     pump();
     return { status: 202, body: { jobId: job.id, status: job.status } };
   }
@@ -1675,7 +1706,9 @@ function createAppJobs(opts = {}) {
         termsCardTimeoutS: cfg.termsCardTimeoutMs / 1000, purgeAfterS: cfg.purgeMs / 1000, textChars: LIMITS.textChars,
         cards: LIMITS.cards, sourcesPerCard: LIMITS.sources, safariPagesPerJob: cfg.safariPerJob,
         safariPagesPerHour: cfg.safariPerHour, shopTimeoutS: cfg.shopTimeoutMs / 1000, shopCategories: SHOP_LIMITS.categories,
-        shopPagesPerCategory: SHOP_LIMITS.pagesPerCategory, shopPagesPerHour: cfg.shopPerHour } };
+        shopPagesPerCategory: SHOP_LIMITS.pagesPerCategory, shopPagesPerHour: cfg.shopPerHour,
+        assistantTimeoutS: cfg.assistantTimeoutMs / 1000, assistantQuestionChars: ASSISTANT_LIMITS.questionChars,
+        assistantContextChars: ASSISTANT_LIMITS.contextChars, assistantActions: ASSISTANT_LIMITS.actions } };
   }
 
   // For a hub that is stopping: the jobs' own finally blocks will not run once
