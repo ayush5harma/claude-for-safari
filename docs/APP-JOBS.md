@@ -1,11 +1,12 @@
 # App jobs (`/app/*`)
 
-The hub can run three kinds of job for a native companion app (for example a
+The hub can run four kinds of job for a native companion app (for example a
 personal-finance app on a phone): it turns masked credit card statement text
 into structured rows, it turns a card's published terms and conditions into a
-reward rule set, and it refreshes a shopping shortlist with current Indian
-prices and sales. The app submits a job, polls it, and deletes it after
-reading. The logic lives in `bridge/app-jobs.js`; the bridge
+reward rule set, it refreshes a shopping shortlist with current Indian
+prices and sales, and it answers a question about one section of the app and
+proposes changes to its data. The app submits a job, polls it, and deletes it
+after reading. The logic lives in `bridge/app-jobs.js`; the bridge
 loads it only when `BRIDGE_APP_TOKEN` is set.
 
 Jobs are asynchronous because Heroku's router drops a request that stays
@@ -53,6 +54,9 @@ the app needs them in its own environment.
 CLI found (see [How a job runs](#how-a-job-runs)). `state` is `checking`, `ok`
 or `unusable`; when it is `unusable`, `ok` is false and `error` says why.
 `safariFallback` is true when `BRIDGE_APP_SAFARI_FALLBACK=1`.
+`types` lists the job types this hub runs (`statement-extract`, `terms-extract`,
+`shopping-refresh`, `assistant`), so the app can tell whether the hub it is
+talking to is new enough for a feature before it submits one.
 
 `POST /app/jobs` returns `202 {"jobId": "<uuid>", "status": "queued"|"running"}`.
 Validation failures return 400 with an `error` string. An oversized body or
@@ -105,6 +109,31 @@ instructions from the app, at most 4,096 characters (413 beyond), and may span
 lines. It can steer which products Claude picks, but it cannot change the
 output rules or make a price verified.
 
+An assistant job (`type` is `assistant`; every field but `context` and `model`
+is required, and a field not listed here is a 400):
+
+```json
+{ "type": "assistant",
+  "input": { "section": "finance",
+             "question": "Remind me on the 10th to pay the card bill.",
+             "today": "2026-11-26",
+             "context": "Plain-text digest of the section's data, identifiers masked.",
+             "actions": ["createReminder", "addTodo"],
+             "model": "sonnet" } }
+```
+
+`section` is one of `summary`, `home`, `finance`, `health`, `moveIn`.
+`question` is 1 to 2,000 characters (413 beyond) and `today` a real
+`YYYY-MM-DD` date, the owner's day. `context` is 0 to 12,000 characters (413
+beyond) and may be left out: it is a plain-text digest the app builds, and
+the only thing Claude may answer from. `actions` is a non-empty list of the
+kinds the app is willing to apply, from `createReminder`,
+`rescheduleReminder`, `completeReminder`, `appendReminderNote`, `createEvent`,
+`moveEvent`, `addTodo`, `rescheduleTodo`, `completeTodo`, `addMoveInItem` and
+`markInterestPaid`; a kind that is not in this list is a 400 naming its
+position (`input.actions[1] is not an action kind: use ...`), a repeat is
+ignored.
+
 `GET /app/jobs/<jobId>` returns:
 
 ```json
@@ -115,7 +144,8 @@ output rules or make a price verified.
 
 `result` is set only when `status` is `done`, and `error` only when it is
 `failed`. For a terms job, `progress.total` is the number of cards. For a
-shopping job it is 3: pages chosen, pages fetched, answer written.
+shopping job it is 3: pages chosen, pages fetched, answer written. For an
+assistant job it is 1, as for a statement.
 
 `DELETE /app/jobs/<jobId>` purges the job at once and kills its child if it
 is running. A finished job is purged 15 minutes after it ends either way, so
@@ -159,6 +189,67 @@ allowlist becomes `null`, so a fetched page cannot put its own link in front of
 the owner. `checkedOn` is the hub's date in `BRIDGE_APP_TIME_ZONE`, whatever
 Claude wrote. `notes` carries Claude's own remarks first and then the bridge's
 (pages not fetched or not readable, links removed, options downgraded).
+
+An assistant job's `result` is an AssistantResult:
+
+```json
+{ "answer": "The card bill is due on the 12th; the context shows no other payment this month.",
+  "actions": [ { "kind": "createReminder", "why": "You asked to be reminded to pay the card bill.",
+                 "title": "Pay the card bill", "due": "2026-12-10T09:00" } ],
+  "dropped": 0 }
+```
+
+`answer` is plain text, 1 to 2,000 characters. `actions` holds 0 to 8 objects,
+each `{ kind, why }` (`why` is one line, at most 200 characters) plus the fields
+its kind takes; an optional field that is not set is left out, not `null`:
+
+| Kind | Fields |
+| --- | --- |
+| `createReminder` | `title`, `due?`, `notes?` |
+| `rescheduleReminder` | `reminderID`, `due` |
+| `completeReminder` | `reminderID` |
+| `appendReminderNote` | `reminderID`, `notes` |
+| `createEvent` | `title`, `start`, `end`, `notes?` |
+| `moveEvent` | `eventID`, `start`, `end` |
+| `addTodo` | `title`, `due?`, `notes?` |
+| `rescheduleTodo` | `todoID`, `due` |
+| `completeTodo` | `todoID` |
+| `addMoveInItem` | `itemName`, `category`, `budgetINR?`, `needs?` |
+| `markInterestPaid` | `interestID`, `paidOn` |
+
+A date is `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM` (no seconds, no zone: Asia/Kolkata),
+and it must be a real date and time. `budgetINR` is a number of rupees, 0 or
+more. An id is a non-empty string of at most 200 characters, passed on as the
+context wrote it.
+
+The hub checks shapes and limits and nothing else; it cannot know whether an
+id exists or an end falls after its start, so the app validates again against
+its own data and shows only what passes. What the hub does to Claude's reply
+(`normalizeAssistant` in `app-jobs.js`):
+
+- An action whose `kind` was not in the request's `actions`, or is not a kind
+  at all, is dropped. So is one with a missing or malformed required field, a
+  malformed optional field that is present (a bad `due` is never turned into
+  "no due date"), or no `why`. A field the kind does not take is left out.
+- Text is cut to its limit with an ellipsis: `answer` 2,000, `why` and `title`
+  and `itemName` 200 (folded to one line), `notes` 1,000, `category` 100,
+  `needs` 500. An id is never cut: one that is too long drops its action.
+- More than 8 valid actions are cut to 8.
+- `dropped` is how many of Claude's proposed actions are not in `actions` for
+  any of these reasons. It is always present (0 when nothing was removed), so the
+  app can tell the owner that something was left out.
+- A reply with no usable answer (an empty or missing `answer`, or `actions`
+  that is not an array) is retried once like a schema miss, and then fails the
+  job: `status` is `failed`, `result` is `null` and `error` is
+  `the answer did not match the schema after one retry: answer: expected a non-empty string, got undefined`.
+  A reply that is JSON wrapped in prose or a code fence is read like any other.
+
+Claude is told to answer only from the context and say when it does not know, to
+propose a change only when the question asks for one, to copy ids exactly as the
+context writes them, and to leave an action out when the context has no id for
+the item. The same table of kinds and fields generates the CLI's
+`--json-schema` (one object per allowed kind), the prompt's list of fields
+and the checker, so they cannot disagree.
 
 Extraction rules for a StatementExtraction. They live in the fixed system
 prompt (`STATEMENT_SYSTEM`) and the schema, and `test/app-jobs.test.js` pins
@@ -261,6 +352,16 @@ used, because it ignores `CLAUDE_CODE_OAUTH_TOKEN`.
 - **Statement jobs** add `--tools ""` (no built-in tool at all),
   `--max-turns 4`, a fixed `--system-prompt` and `--json-schema`. They run in
   the system temp directory.
+- **Assistant jobs** add `--tools ""`, `--max-turns 4`, a `--system-prompt` the
+  hub writes and a `--json-schema` for the kinds the request allowed, and run
+  in the system temp directory. The system prompt holds every rule: answer from
+  the context only, propose changes only on request, the allowed kinds and their
+  fields, the date format and Asia/Kolkata. The section, today's date (with its
+  weekday), the allowed kinds, the context and the question go on stdin as
+  data. The context sits between two lines carrying a token minted for that job,
+  so text inside it cannot close the block and pose as the question, and the
+  prompt calls it untrusted. The client cannot add an instruction, a kind
+  or a field beyond those; it only supplies the question and the context.
 - **Shopping jobs** run Claude twice, with the bridge's own fetching in
   between. First a planning run (`--tools ""`) is given the city, month,
   categories and the allowed hosts and proposes up to 3 pages per category,
@@ -375,9 +476,10 @@ allowlist of hosts that serve public terms pages.
 
 | | |
 | --- | --- |
-| Running at once | 2, of which at most 1 terms or shopping job (a later statement job starts ahead of a waiting one) |
+| Running at once | 2, of which at most 1 terms or shopping job (a later statement or assistant job starts ahead of a waiting one) |
 | Queued | 20 (429 beyond) |
 | Statement job | 240 s, retry included |
+| Assistant job | 100 s from submission, queue time and the retry included (the app stops waiting at 120 s); a job that waited that long in the queue fails without a CLI run |
 | Terms job | 300 s per card: fetching, the Safari fallback and Claude included |
 | Safari fallback | off by default; 5 pages per job, 20 per hour across jobs |
 | Purge | 15 min after a job finishes |
@@ -387,6 +489,7 @@ allowlist of hosts that serve public terms pages.
 | Shopping job | 10 min in all, planning included (2 min to choose pages, 4 min to fetch them; pages not yet read after that are skipped) |
 | Shopping request | 12 categories, 3 pages per category, `prompt` at most 4,096 characters |
 | Shopping pages | 120 requested per rolling hour across every job; a job's remaining pages are skipped once it is used up |
+| Assistant request | `question` 2,000 characters, `context` 12,000 (413 beyond), at most 8 actions in the result |
 
 Measured on 2026-11-15 with Claude Code 2.1.322 and `sonnet` on a Mac: a
 synthetic one-page statement with ten transactions took 18 s, and one card
@@ -412,6 +515,14 @@ attempt.
   durations, page counts and status). Search terms built from the categories
   do reach the retail sites the hub fetches from, from the hub's address, with
   no cookies or credentials.
+- An assistant request holds the owner's question and a digest of the app's
+  data, whatever the app chooses to put in it (it masks identifiers to their
+  last four characters before upload). It is held in memory while the job lives,
+  goes to the CLI on stdin, is dropped when the job finishes and is never
+  logged: the log line carries the job id, the section, the sizes of the
+  question and the context, the number of allowed kinds, durations, attempts,
+  the output size and the status. The answer stays in the job until it is
+  deleted or purged.
 - A terms job's request holds no statement data: only source URLs, the
   card's names and the current rule set. The hub fetches sources itself,
   with no cookies or credentials, so with the Safari fallback off (the
