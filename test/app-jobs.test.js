@@ -1748,3 +1748,155 @@ test("a shopping job over HTTP reads an allowlisted page and a PDF through the r
     [[true, src.url("/page.html")], [true, src.url("/tc.pdf")]]);
   assert.equal((await fetch(hub.base + "/app/jobs/" + jobId, { method: "DELETE", headers: appHeaders })).status, 200);
 });
+
+// ── Assistant jobs ───────────────────────────────────────────────────────────
+// Every question, context and answer here is synthetic; nothing reaches a model.
+const ALL_KINDS = new Set(appJobs.ASSISTANT_KINDS);
+const normalize = (value, kinds = ALL_KINDS) => appJobs.normalizeAssistant(value, kinds);
+const reply = (actions, answer = "Synthetic answer.") => ({ answer, actions });
+
+// One valid action per kind, with every optional field present.
+const GOOD_ACTIONS = [
+  { kind: "createReminder", why: "Asked for a reminder.", title: "Call the plumber", due: "2026-12-01T09:30", notes: "Ask about the tap." },
+  { kind: "rescheduleReminder", why: "Moved as asked.", reminderID: "rem-0001", due: "2026-12-02" },
+  { kind: "completeReminder", why: "Done.", reminderID: "rem-0002" },
+  { kind: "appendReminderNote", why: "Adds a detail.", reminderID: "rem-0003", notes: "Bring the receipt." },
+  { kind: "createEvent", why: "Asked for a block.", title: "Site visit", start: "2026-12-03T10:00", end: "2026-12-03T11:00", notes: "Meet at the gate." },
+  { kind: "moveEvent", why: "Moved as asked.", eventID: "evt-0001", start: "2026-12-04T10:00", end: "2026-12-04T11:00" },
+  { kind: "addTodo", why: "Asked for a to-do.", title: "Order the sofa", due: "2026-12-05", notes: "Compare two shops." },
+  { kind: "rescheduleTodo", why: "Moved as asked.", todoID: "todo-0001", due: "2026-12-06" },
+  { kind: "completeTodo", why: "Done.", todoID: "todo-0002" },
+  { kind: "addMoveInItem", why: "Asked to add it.", itemName: "Study desk", category: "Furniture", budgetINR: 12000, needs: "Fits a 120 cm wall." },
+  { kind: "markInterestPaid", why: "Paid as stated.", interestID: "int-0001", paidOn: "2026-11-10" },
+];
+
+test("assistant output: every action kind passes with its exact fields and nothing is dropped", () => {
+  assert.deepEqual(appJobs.ASSISTANT_KINDS, GOOD_ACTIONS.map((a) => a.kind), "the table lists the contract's kinds");
+  const out = normalize(reply(GOOD_ACTIONS));
+  assert.deepEqual(out.errors, []);
+  assert.deepEqual(out.result, { answer: "Synthetic answer.", actions: GOOD_ACTIONS.slice(0, 8), dropped: 3 },
+    "all eleven are valid, but eight is the most the app is handed");
+  for (const a of GOOD_ACTIONS) {
+    const one = normalize(reply([a]));
+    assert.deepEqual(one.result.actions, [a], a.kind);
+    assert.equal(one.result.dropped, 0, a.kind);
+  }
+});
+
+test("assistant output: optional fields may be absent or null, and a field the kind does not take is left out", () => {
+  const out = normalize(reply([
+    { kind: "createReminder", why: "Asked.", title: "Call", due: null, notes: null, reminderID: "stray", extra: { nested: true } },
+    { kind: "addMoveInItem", why: "Asked.", itemName: "Desk", category: "Furniture" },
+  ])).result;
+  assert.deepEqual(out.actions, [{ kind: "createReminder", why: "Asked.", title: "Call" },
+    { kind: "addMoveInItem", why: "Asked.", itemName: "Desk", category: "Furniture" }]);
+  assert.equal(out.dropped, 0);
+});
+
+test("assistant output: an unknown or disallowed kind is dropped and counted", () => {
+  const allowed = new Set(["createReminder", "addTodo"]);
+  const out = normalize(reply([
+    { kind: "createReminder", why: "Asked.", title: "Keep" },
+    { kind: "deleteEverything", why: "Hostile.", target: "all" },
+    { kind: "completeTodo", why: "Not on this request's list.", todoID: "todo-0001" },
+    { kind: 7, why: "Not a string.", title: "x" },
+    { kind: "constructor", why: "Not an own kind.", title: "x" },
+    { kind: "addTodo", why: "Asked.", title: "Keep too" },
+  ]), allowed).result;
+  assert.deepEqual(out.actions.map((a) => a.title), ["Keep", "Keep too"]);
+  assert.equal(out.dropped, 4);
+});
+
+test("assistant output: an action with a missing or malformed required field is dropped", () => {
+  const bad = [
+    { kind: "createReminder", why: "No title." },
+    { kind: "createReminder", why: "Blank title.", title: "   " },
+    { kind: "createReminder", why: "Title is a number.", title: 5 },
+    { kind: "createReminder", why: "Bad due.", title: "x", due: "tomorrow" },
+    { kind: "createReminder", why: "Impossible date.", title: "x", due: "2026-02-30" },
+    { kind: "createReminder", why: "Impossible time.", title: "x", due: "2026-12-01T25:00" },
+    { kind: "createReminder", why: "Seconds are not in the contract.", title: "x", due: "2026-12-01T09:30:00" },
+    { kind: "createReminder", why: "Notes is not a string.", title: "x", notes: ["a"] },
+    { kind: "rescheduleReminder", why: "No id.", due: "2026-12-02" },
+    { kind: "rescheduleReminder", why: "No due.", reminderID: "rem-0001" },
+    { kind: "completeReminder", why: "Empty id.", reminderID: "" },
+    { kind: "completeReminder", why: "An id too long to be one.", reminderID: "r".repeat(201) },
+    { kind: "completeTodo", why: "Id is a number.", todoID: 12 },
+    { kind: "createEvent", why: "No end.", title: "x", start: "2026-12-03T10:00" },
+    { kind: "moveEvent", why: "No start.", eventID: "evt-0001", end: "2026-12-03T10:00" },
+    { kind: "addMoveInItem", why: "No category.", itemName: "Desk" },
+    { kind: "addMoveInItem", why: "Budget is text.", itemName: "Desk", category: "Furniture", budgetINR: "12,000" },
+    { kind: "addMoveInItem", why: "Negative budget.", itemName: "Desk", category: "Furniture", budgetINR: -1 },
+    { kind: "addMoveInItem", why: "Needs is a number.", itemName: "Desk", category: "Furniture", budgetINR: null, needs: 5 },
+    { kind: "markInterestPaid", why: "No date.", interestID: "int-0001" },
+    { kind: "createReminder", title: "No why." },
+    { kind: "createReminder", why: "  ", title: "Blank why." },
+    "a string", null, 12, ["createReminder"],
+  ];
+  const out = normalize(reply([...bad, { kind: "completeTodo", why: "Fine.", todoID: "todo-0001" }])).result;
+  assert.deepEqual(out.actions, [{ kind: "completeTodo", why: "Fine.", todoID: "todo-0001" }]);
+  assert.equal(out.dropped, bad.length);
+});
+
+test("assistant output: long text is clamped, a one-line field is folded, an id is never cut", () => {
+  const out = normalize(reply([
+    { kind: "createReminder", why: "w ".repeat(300), title: "T\n\n  itle  " + "x".repeat(300), notes: "n".repeat(2000) + "\nsecond line" },
+    { kind: "addMoveInItem", why: "Asked.", itemName: "Desk", category: "c".repeat(150), needs: "line one\nline two" },
+  ], "a".repeat(5000))).result;
+  assert.equal(out.answer.length, 2000);
+  assert.ok(out.answer.endsWith("…"));
+  const [a, b] = out.actions;
+  assert.equal(a.why.length, 200);
+  assert.ok(a.why.endsWith("…") && !a.why.includes("  "));
+  assert.equal(a.title.length, 200);
+  assert.ok(a.title.startsWith("T itle xxx"));
+  assert.equal(a.notes.length, 1000);
+  assert.equal(b.category.length, 100);
+  assert.equal(b.needs, "line one\nline two", "free text keeps its line breaks");
+  // A cut never leaves half of a surrogate pair.
+  const emoji = normalize(reply([], "😀".repeat(1500))).result.answer;
+  assert.ok(emoji.length <= 2000 && !/[\ud800-\udbff]…$/.test(emoji) && emoji.endsWith("…"));
+  assert.equal(normalize(reply([], "  fine  ")).result.answer, "fine");
+});
+
+test("assistant output: more than eight valid actions are cut to eight and the rest counted as dropped", () => {
+  const many = Array.from({ length: 11 }, (_, i) => ({ kind: "addTodo", why: "Asked.", title: "Item " + i }));
+  const out = normalize(reply([{ kind: "nope" }, ...many])).result;
+  assert.equal(out.actions.length, 8);
+  assert.equal(out.actions[7].title, "Item 7");
+  assert.equal(out.dropped, 4, "one unknown kind and three beyond the eighth");
+});
+
+test("assistant output: no usable answer is an error, and a missing or null actions list is an empty one", () => {
+  const e = (v) => normalize(v).errors;
+  assert.deepEqual(e({ actions: [] }), ["answer: expected a non-empty string, got undefined"]);
+  assert.deepEqual(e({ answer: "   ", actions: [] }), ["answer: expected a non-empty string, got string"]);
+  assert.deepEqual(e({ answer: { text: "x" }, actions: [] }), ["answer: expected a non-empty string, got object"]);
+  assert.deepEqual(e("just prose"), ["answer: expected a non-empty string, got string"]);
+  assert.deepEqual(e(["answer"]), ["answer: expected a non-empty string, got array"]);
+  assert.deepEqual(e({ answer: "x", actions: "createReminder" }), ["actions: expected array, got string"]);
+  assert.deepEqual(e({ answer: "x", actions: { kind: "addTodo" } }), ["actions: expected array, got object"]);
+  assert.deepEqual(e({ answer: 5, actions: 5 }).length, 2);
+  assert.deepEqual(normalize({ answer: "x" }).result, { answer: "x", actions: [], dropped: 0 });
+  assert.deepEqual(normalize({ answer: "x", actions: null }).result, { answer: "x", actions: [], dropped: 0 });
+  assert.ok(!JSON.stringify(e({ answer: 5 })).includes("5"), "errors name a path and a type, never a value");
+});
+
+test("the assistant's JSON schema has one object per allowed kind, with that kind's exact fields", () => {
+  const schema = appJobs.assistantJsonSchema(["createReminder", "markInterestPaid"]);
+  assert.deepEqual(schema.required, ["answer", "actions"]);
+  assert.equal(schema.additionalProperties, false);
+  const [reminder, interest] = schema.properties.actions.items.anyOf;
+  assert.deepEqual(reminder.required, ["kind", "why", "title"]);
+  assert.deepEqual(Object.keys(reminder.properties), ["kind", "why", "title", "due", "notes"]);
+  assert.deepEqual(reminder.properties.kind.enum, ["createReminder"]);
+  assert.equal(reminder.additionalProperties, false);
+  assert.deepEqual(interest.required, ["kind", "why", "interestID", "paidOn"]);
+  assert.equal(interest.properties.paidOn.type, "string");
+  assert.equal(schema.properties.actions.items.anyOf.length, 2, "a kind the request did not allow is not offered");
+  const full = appJobs.assistantJsonSchema(appJobs.ASSISTANT_KINDS);
+  assert.equal(full.properties.actions.items.anyOf.length, 11);
+  assert.equal(full.properties.actions.items.anyOf.find((x) => x.properties.kind.enum[0] === "addMoveInItem").properties.budgetINR.type, "number");
+  // Every constraint the schema leaves to the checker is one a schema can state without maxLength or maxItems.
+  assert.ok(!/maxLength|maxItems|minItems|minLength|"const"/.test(JSON.stringify(full)));
+});

@@ -936,6 +936,111 @@ function pinShopping(answer, categories, fetched, allow) {
   return { categories: out, notes };
 }
 
+// ── Assistant answers ────────────────────────────────────────────────────────
+// What the app may be handed back: an answer and up to eight proposed changes.
+// The model's word is never passed through as it came. An action of a kind the
+// request did not allow, or one with a missing or malformed field, is dropped
+// and counted; a text is cut to its limit; a field the kind does not take is
+// left out. The app validates again against its own data (ids that exist,
+// dates that are real, an end after its start) and shows only what passes,
+// so this checks shapes and limits, not facts.
+//
+// A field's type: text is cut to max (line: true also folds it to one line), an
+// id is kept whole or the action is dropped (a cut id would name another
+// item), when is "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM", amount is rupees.
+const ASSISTANT_LIMITS = { questionChars: 2000, contextChars: 12000, answerChars: 2000, actions: 8, whyChars: 200, idChars: 200 };
+const ASSISTANT_SECTIONS = ["summary", "home", "finance", "health", "moveIn"];
+const ASSISTANT_ZONE = "Asia/Kolkata";
+const ASSISTANT_FIELDS = {
+  title: { type: "text", max: 200, line: true }, notes: { type: "text", max: 1000 },
+  itemName: { type: "text", max: 200, line: true }, category: { type: "text", max: 100, line: true }, needs: { type: "text", max: 500 },
+  reminderID: { type: "id" }, eventID: { type: "id" }, todoID: { type: "id" }, interestID: { type: "id" },
+  due: { type: "when" }, start: { type: "when" }, end: { type: "when" }, paidOn: { type: "when" },
+  budgetINR: { type: "amount" },
+};
+const ASSISTANT_WHY = { type: "text", max: ASSISTANT_LIMITS.whyChars, line: true };
+const ASSISTANT_ACTIONS = {
+  createReminder: { required: ["title"], optional: ["due", "notes"] },
+  rescheduleReminder: { required: ["reminderID", "due"], optional: [] },
+  completeReminder: { required: ["reminderID"], optional: [] },
+  appendReminderNote: { required: ["reminderID", "notes"], optional: [] },
+  createEvent: { required: ["title", "start", "end"], optional: ["notes"] },
+  moveEvent: { required: ["eventID", "start", "end"], optional: [] },
+  addTodo: { required: ["title"], optional: ["due", "notes"] },
+  rescheduleTodo: { required: ["todoID", "due"], optional: [] },
+  completeTodo: { required: ["todoID"], optional: [] },
+  addMoveInItem: { required: ["itemName", "category"], optional: ["budgetINR", "needs"] },
+  markInterestPaid: { required: ["interestID", "paidOn"], optional: [] },
+};
+const ASSISTANT_KINDS = Object.keys(ASSISTANT_ACTIONS);
+
+const isWhen = (v) => typeof v === "string" &&
+  (isDate(v) || (/^\d{4}-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d$/.test(v) && isDate(v.slice(0, 10))));
+
+// Cut to max characters with an ellipsis, never through a surrogate pair.
+const clampText = (s, max) => (s.length <= max ? s : s.slice(0, max - 1).replace(/[\ud800-\udbff]$/, "") + "…");
+
+// One field's value as the app may receive it, or undefined when it is unusable.
+function assistantField(spec, v) {
+  if (spec.type === "when") return isWhen(v) ? v : undefined;
+  if (spec.type === "amount") return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+  if (typeof v !== "string") return undefined;
+  const t = (spec.line ? v.replace(/\s+/g, " ") : v).trim();
+  if (!t) return undefined;
+  if (spec.type === "id") return t.length <= ASSISTANT_LIMITS.idChars ? t : undefined;
+  return clampText(t, spec.max);
+}
+
+// The action, in the app's shape, or null when it cannot be one.
+function assistantAction(raw, kinds) {
+  if (typeName(raw) !== "object" || !kinds.has(raw.kind)) return null;
+  const spec = ASSISTANT_ACTIONS[raw.kind];
+  const why = assistantField(ASSISTANT_WHY, raw.why);
+  if (why === undefined) return null;
+  const out = { kind: raw.kind, why };
+  for (const f of [...spec.required, ...spec.optional]) {
+    const missing = raw[f] === undefined || raw[f] === null;
+    if (missing && !spec.required.includes(f)) continue;
+    const v = missing ? undefined : assistantField(ASSISTANT_FIELDS[f], raw[f]);
+    if (v === undefined) return null;
+    out[f] = v;
+  }
+  return out;
+}
+
+// { result: { answer, actions, dropped } } or { errors } for a reply that has
+// no usable answer (retried like a schema miss). kinds is the Set the request
+// allowed. dropped counts every action the model proposed that is not in
+// actions: unknown or disallowed kinds, bad fields, and any beyond the eighth.
+function normalizeAssistant(value, kinds) {
+  const errors = [];
+  const answer = typeName(value) === "object" && typeof value.answer === "string" ? value.answer.trim() : "";
+  if (!answer) errors.push("answer: expected a non-empty string, got " + (typeName(value) === "object" ? typeName(value.answer) : typeName(value)));
+  const proposed = typeName(value) !== "object" || value.actions === undefined || value.actions === null ? [] : value.actions;
+  if (!Array.isArray(proposed)) errors.push("actions: expected array, got " + typeName(proposed));
+  if (errors.length) return { errors };
+  const actions = proposed.map((a) => assistantAction(a, kinds)).filter(Boolean).slice(0, ASSISTANT_LIMITS.actions);
+  return { errors: [], result: { answer: clampText(answer, ASSISTANT_LIMITS.answerChars), actions, dropped: proposed.length - actions.length } };
+}
+
+// The CLI's --json-schema for the answer, from the same table as the checker:
+// one object per allowed kind, so the model is steered to the fields that kind
+// takes. Optional fields are left out rather than null. Only constructs the
+// other schemas here already use (enum, anyOf, additionalProperties false).
+function assistantJsonSchema(kinds) {
+  const leaf = { text: { type: "string" }, id: { type: "string" }, amount: { type: "number", description: "rupees" },
+    when: { type: "string", description: "YYYY-MM-DD, or YYYY-MM-DDTHH:MM in " + ASSISTANT_ZONE } };
+  const action = (kind) => {
+    const spec = ASSISTANT_ACTIONS[kind];
+    const properties = { kind: { type: "string", enum: [kind] }, why: { type: "string", description: "one short line" } };
+    for (const f of [...spec.required, ...spec.optional]) properties[f] = { ...leaf[ASSISTANT_FIELDS[f].type] };
+    return { type: "object", properties, required: ["kind", "why", ...spec.required], additionalProperties: false };
+  };
+  return { type: "object", required: ["answer", "actions"], additionalProperties: false, properties: {
+    answer: { type: "string", description: "plain text, at most " + ASSISTANT_LIMITS.answerChars + " characters" },
+    actions: { type: "array", description: "at most " + ASSISTANT_LIMITS.actions + " actions", items: { anyOf: kinds.map(action) } } } };
+}
+
 // ── Request validation ───────────────────────────────────────────────────────
 const bad = (error, status = 400) => ({ status, error });
 const optString = (v, max) => v === undefined || v === null || (typeof v === "string" && v.length <= max);
@@ -1518,6 +1623,7 @@ function createAppJobs(opts = {}) {
 module.exports = {
   createAppJobs, fetchSource, checkSourceUrl, parseDomains, parseShopDomains, htmlToText, check, toJsonSchema, nullable, childEnv, within,
   FetchError, browserCanFix, localDate, pinSourceUrls, pinShopping, strict,
+  normalizeAssistant, assistantJsonSchema, ASSISTANT_KINDS, ASSISTANT_ACTIONS, ASSISTANT_LIMITS,
   statementArgs, termsArgs, shopPlanArgs, shoppingArgs, STATEMENT_SHAPE, TERMS_ANSWER_SHAPE, TERMS_RESULT_SHAPE, RULE_SET_SHAPE,
   SHOPPING_RESULT_SHAPE, SHOP_PLAN_SHAPE, LIMITS, SHOP_LIMITS, DEFAULTS, FETCH,
 };
