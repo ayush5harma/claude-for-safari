@@ -45,8 +45,18 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, execFile } = require("node:child_process");
 
-// BRIDGE_PORT wins; bare PORT is what a PaaS (Heroku) injects for its router.
-const PORT = Number(process.env.BRIDGE_PORT || process.env.PORT) || 29170;
+// BRIDGE_PORT wins in both modes. Bare PORT is what a PaaS (Heroku) injects
+// for its router, so only the hub reads it: the MCP child inherits whatever
+// shell Claude Code was started in, and a dev shell's PORT (a Rails repo's
+// :3003, 2026-11-18) sent it to a hub of its own that no extension polls.
+// The hub exports the port it chose as BRIDGE_PORT, so the MCP children of
+// its chat turns still find it on a PaaS.
+const DEFAULT_PORT = 29170;
+const resolvePort = (env, serve) =>
+  Number(env.BRIDGE_PORT || (serve ? env.PORT : "")) || DEFAULT_PORT;
+const SERVE = process.argv.includes("--serve");
+const PORT = resolvePort(process.env, SERVE);
+if (SERVE && require.main === module) process.env.BRIDGE_PORT = String(PORT);
 const BIND = process.env.BRIDGE_BIND || "127.0.0.1";
 const TOKEN = process.env.BRIDGE_TOKEN || "";
 const HUB = `http://127.0.0.1:${PORT}`;
@@ -1474,7 +1484,9 @@ async function hubUp() {
 
 async function ensureHub() {
   if (await hubUp()) return;
-  spawn(process.execPath, [__filename, "--serve"], { detached: true, stdio: "ignore" }).unref();
+  // BRIDGE_PORT pinned: the hub would otherwise bind an inherited bare PORT.
+  spawn(process.execPath, [__filename, "--serve"],
+    { detached: true, stdio: "ignore", env: { ...process.env, BRIDGE_PORT: String(PORT) } }).unref();
   for (let i = 0; i < 10; i++) {
     await new Promise((r) => setTimeout(r, 200));
     if (await hubUp()) return;
@@ -1561,11 +1573,12 @@ function runMcp() {
 }
 
 if (require.main === module) {
-  if (process.argv.includes("--serve")) runHub();
+  if (SERVE) runHub();
   else runMcp();
 } else {
   // The pure routing pieces, for test/hub-routing.test.js.
   module.exports = { TAB_SLOT, SLOT_BASE, encodeTabId, decodeTabId, mergeTabListings, pickActiveSlot,
     cmpVersion, currentInstances, describeInstance, parseCodexOutput,
-    cleanProfile, sameProfile, pinRoute, checkUpload, resolveUploadPaths, UPLOAD_MAX_BYTES, TOOLS, callTool };
+    cleanProfile, sameProfile, pinRoute, checkUpload, resolveUploadPaths, UPLOAD_MAX_BYTES, TOOLS, callTool,
+    resolvePort, DEFAULT_PORT };
 }
