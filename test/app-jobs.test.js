@@ -1995,6 +1995,9 @@ test("the assistant prompt carries the section and the allowed kinds, and holds 
   assert.match(system, /At most 8 actions/);
   assert.match(system, /YYYY-MM-DD, or YYYY-MM-DDTHH:MM .* in Asia\/Kolkata/);
   assert.match(system, /copied exactly as the context writes it/);
+  // A proposal is not a change: the answer must not report as done what the owner has not applied.
+  assert.match(system, /Nothing you propose has happened yet/);
+  assert.match(system, /never as done/);
   assert.match(system, /one JSON object, \{"answer": \.\.\., "actions": \[\.\.\.\]\}, and nothing else/);
   // Only the allowed kinds are described, each with its table's fields.
   assert.match(system, /completeTodo \{todoID\}; addMoveInItem \{itemName, category, budgetINR\?, needs\?\}\./);

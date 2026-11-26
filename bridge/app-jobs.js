@@ -1076,6 +1076,10 @@ const assistantSystem = (kinds) => [
   "answer is plain text (no markdown, no tables), at most " + ASSISTANT_LIMITS.answerChars + " characters, short and direct.",
   "actions: propose a change only when the question asks for one (create, add, move, reschedule, complete, mark paid). " +
     "A question that only asks for information gets an empty array, and you never propose a change on your own initiative.",
+  // Measured 26 Nov 2026 on the hosted hub: without this line the answer read "I moved the follow-up to Monday" while
+  // the move was only a proposal the owner had not applied.
+  "Nothing you propose has happened yet: the owner reviews each action in the app and applies it or not. " +
+    "So the answer describes proposed changes as proposals (\"I can move it to Monday 30 Nov; apply the card to do it\"), never as done.",
   "Only these kinds, each an object with kind, why (one short line: what the change is and why) and the fields shown, a ? marking an optional field: " +
     kinds.map(actionSignature).join("; ") + ".",
   "At most " + ASSISTANT_LIMITS.actions + " actions. An id field (reminderID, eventID, todoID, interestID) is copied exactly as the context writes it; " +
