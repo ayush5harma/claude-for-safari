@@ -12,8 +12,8 @@
 //
 // appstored sends no credentials, so the route is public. What fences it:
 //   - a secret path segment, compared in constant time (sha256 of both sides,
-//     so a wrong length leaks nothing either); a wrong or missing one is the
-//     same 404 as any unknown path, whatever the method;
+//     so a wrong length leaks nothing either); a wrong or missing one is a
+//     404, whatever the method;
 //   - every query value is validated before anything is written, and `url`
 //     may only name the phone itself: an https IPv4 literal in 10/8,
 //     172.16/12, 192.168/16, 100.64/10 or 127/8, an explicit port, and the
