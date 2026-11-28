@@ -123,6 +123,32 @@ version and the result. Re-running the
 deploy script leaves both vars alone. For routes, limits and privacy rules,
 see [docs/APP-JOBS.md](docs/APP-JOBS.md).
 
+**Optional: Eider install manifest.** iOS 27.3 refuses an itms-services
+manifest that the iPhone serves itself ("The manifest URL isn't external",
+measured 2026-11-28 for `https://127.0.0.1` and for the phone's Wi-Fi IP), but
+installs from a manifest served by another host whose IPA URL points back at
+the phone. The hub can be that host:
+
+```sh
+heroku config:set EIDER_MANIFEST_SECRET="$(openssl rand -hex 16)" -a <app>
+```
+
+Then `GET /eider/manifest/<secret>.plist?bundle=<id>&version=<v>&title=<t>&url=<ipa url>`
+returns the standard manifest as `text/xml`. It is the hub's one public route:
+iOS's appstored fetches it with no credentials, so there is no Bearer token,
+only the path secret, compared in constant time. A wrong or missing secret is
+a 404. Every value is validated (400 otherwise): `bundle` matches
+`^[A-Za-z0-9.-]{1,255}$`; `version` and `title` are 1-200 printable
+characters, URL-encoded (`+` reads as a space); and `url` must be
+`https://<IPv4>:<port>/<32 lowercase hex>/app.ipa` with the address in 10/8,
+172.16/12, 192.168/16, 100.64/10 or 127/8. That last rule means the manifest
+can only point at an IPA the phone serves itself, never at an internet IPA.
+The hub logs only the bundle id. Heroku's router log still records each
+request path with its query, secret included, so treat `heroku logs` like the
+secret. The secret must be 32-128 lowercase hex characters, or the hub refuses
+to start. Unset, the route does not exist. To rotate the secret, set a new
+value, which restarts the dyno.
+
 For this fleet, use the same Heroku URL and token on macOS, iPhone and iPad so
 the provider behavior is consistent. Everyone else can still leave the URL
 empty for the local Mac bridge, use the mesh route above, or deploy this hub to
