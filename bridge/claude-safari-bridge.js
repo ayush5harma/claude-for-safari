@@ -36,6 +36,10 @@
 //     nothing outside /app/*. Its one reach into the browser is the terms
 //     jobs' Safari fallback, off unless BRIDGE_APP_SAFARI_FALLBACK=1 and then
 //     fenced (see THE SAFARI FALLBACK below).
+//   - /eider/manifest/<secret>.plist (bridge/eider-manifest.js) exists only
+//     when EIDER_MANIFEST_SECRET is set. It is the one public route: no
+//     Bearer token, gated by its path secret, and it only writes an install
+//     manifest for an IPA the iPhone serves itself on a private IPv4 address.
 
 "use strict";
 const http = require("node:http");
@@ -79,6 +83,10 @@ const CODEX_REQUIRE_API_KEY = process.env.BRIDGE_CODEX_REQUIRE_API_KEY === "1";
 const APP_TOKEN = process.env.BRIDGE_APP_TOKEN || "";
 delete process.env.BRIDGE_APP_TOKEN;
 const APP_TOKEN_MIN = 16;
+// The Eider install manifest's path secret (bridge/eider-manifest.js), taken
+// out of the ambient environment for the same reason as the app token.
+const EIDER_MANIFEST_SECRET = process.env.EIDER_MANIFEST_SECRET || "";
+delete process.env.EIDER_MANIFEST_SECRET;
 // A statement is at most 200,000 characters; JSON escaping can grow that
 // several-fold for non-ASCII text, and nothing else in an app request is large.
 const APP_BODY_MAX = 2 * 1024 * 1024;
@@ -1094,6 +1102,21 @@ function runHub() {
       });
     }
   }
+  // ── Eider install manifest (/eider/manifest/*; bridge/eider-manifest.js) ──
+  // Public by necessity (iOS's appstored fetches it with no credentials) and
+  // fenced by its own path secret and strict validation, so it is routed
+  // BEFORE the Bearer gate and owns only its own prefix. Off, and the prefix
+  // falls through to the gate like any other path, unless the secret is set.
+  let eiderManifest = null;
+  if (EIDER_MANIFEST_SECRET) {
+    try {
+      eiderManifest = require(path.join(__dirname, "eider-manifest.js"))
+        .createEiderManifest(EIDER_MANIFEST_SECRET, { log: (line) => process.stderr.write(line + "\n") });
+    } catch (e) {
+      process.stderr.write("claude-safari-bridge: refusing to start: " + e.message + "\n");
+      process.exit(1);
+    }
+  }
   // App responses carry statement-derived data: no cache may keep them.
   const appJson = (res, code, obj) => {
     res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" });
@@ -1140,6 +1163,7 @@ function runHub() {
     try {
       const pathname = String(req.url || "").split("?")[0];
       if (pathname === "/app" || pathname.startsWith("/app/")) return await handleApp(req, res, pathname);
+      if (eiderManifest && eiderManifest.owns(pathname)) return eiderManifest.serve(req, res);
       // The app token opens /app/* and nothing else -- also on a loopback hub
       // with no BRIDGE_TOKEN, where tokenOk alone would let it through.
       if (APP_TOKEN && bearerIs(req, APP_TOKEN)) return json(res, 401, { error: "unauthorized" });
